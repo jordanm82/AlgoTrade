@@ -405,8 +405,9 @@ class LiveDaemon:
     # ------------------------------------------------------------------
 
     def _position_size(self, leverage: int = 1) -> float:
-        """Calculate position size: 10% of current equity * leverage."""
-        return self._equity * POSITION_SIZE_PCT * leverage
+        """Calculate position size (margin): 10% of current equity.
+        Leverage amplifies P&L but the margin (capital at risk) stays at 10%."""
+        return self._equity * POSITION_SIZE_PCT
 
     def _has_position(self, pos_key: str) -> bool:
         """Check if we already have a position with this key."""
