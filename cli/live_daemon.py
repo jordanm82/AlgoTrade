@@ -643,15 +643,15 @@ class LiveDaemon:
 
                     # Pick the soonest-expiring open market
                     ticker = all_markets[0].get("ticker", "")
+                    # Use market orders for 15-min contracts (limit orders expire unfilled)
                     result = self.kalshi_client.place_order(
                         ticker=ticker,
                         side=side,
                         count=count,
-                        price_cents=approx_cents,
-                        order_type="limit",
+                        order_type="market",
                     )
                     order_id = result.get("order", {}).get("order_id", "?")
-                    pred["reason"] = f"placed {side.upper()} x{count} @ {approx_cents}c (#{order_id})"
+                    pred["reason"] = f"placed {side.upper()} x{count} MARKET (#{order_id})"
                     print(colored(
                         f"  [KALSHI BET] {pred['asset']} {signal.direction} "
                         f"conf={signal.confidence} | {side.upper()} x{count} @ {approx_cents}c",
