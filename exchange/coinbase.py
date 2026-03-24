@@ -14,7 +14,7 @@ class CoinbaseExecutor:
         resp = self.client.market_order_buy(
             client_order_id=self._order_id(),
             product_id=symbol,
-            quote_size=str(usd_amount),
+            quote_size=f"{usd_amount:.2f}",
         )
         return resp.to_dict() if hasattr(resp, "to_dict") else resp
 
@@ -23,7 +23,7 @@ class CoinbaseExecutor:
         resp = self.client.market_order_sell(
             client_order_id=self._order_id(),
             product_id=symbol,
-            base_size=str(base_size),
+            base_size=f"{base_size:.8f}",
         )
         return resp.to_dict() if hasattr(resp, "to_dict") else resp
 
