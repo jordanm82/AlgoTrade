@@ -591,7 +591,7 @@ class LiveDaemon:
             "trades_today": self._trades_today,
             "signals_today": self._signals_today,
             "pnl_today": self._pnl_today,
-            "halted": self.risk.is_halted(self.tracker.total_exposure()),
+            "halted": self.risk.is_halted(self._equity),
         }
         self.store.save_snapshot(snapshot)
 
@@ -604,7 +604,7 @@ class LiveDaemon:
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
         n_pos = len(self.tracker.open_positions())
         exposure = self.tracker.total_exposure()
-        halted = self.risk.is_halted(exposure)
+        halted = self.risk.is_halted(self._equity)
 
         mode_tag = colored("[DRY-RUN]", "magenta") if self.dry_run else colored("[LIVE]", "green")
         halt_tag = colored(" HALTED", "red") if halted else ""
@@ -651,9 +651,8 @@ class LiveDaemon:
         print(f"\n[CYCLE] {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC — fetching 15m candles...")
         self._fetch_all()
 
-        # Check if trading is halted
-        exposure = self.tracker.total_exposure()
-        if self.risk.is_halted(exposure):
+        # Check if trading is halted (use full equity, not just exposure)
+        if self.risk.is_halted(self._equity):
             print(colored("[HALT] Daily drawdown limit reached — skipping signal generation", "red"))
             return []
 
