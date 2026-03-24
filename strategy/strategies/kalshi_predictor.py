@@ -1,15 +1,24 @@
 # strategy/strategies/kalshi_predictor.py
 """Multi-signal confidence scorer for Kalshi crypto prediction markets.
 
-Combines RSI, Bollinger Bands, MACD, volume, momentum, and multi-timeframe
-signals into a single confidence score (0-100). Only bets when confidence
-exceeds a configurable threshold.
+Combines RSI, Bollinger Bands, MACD, volume, momentum, multi-timeframe
+signals, AND leading indicators (order book imbalance, trade flow,
+large-trade bias, spread, cross-asset momentum) into a single confidence
+score (0-100). Only bets when confidence exceeds a configurable threshold.
 
 Supported assets: BTC, ETH, SOL, XRP (any with Kalshi contracts).
 """
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
+
+
+# Maximum raw score from lagging signals (components 1-6)
+_MAX_LAGGING = 100
+# Maximum raw score from leading signals (components 7-11)
+_MAX_LEADING = 65
+# Combined max before normalization
+_MAX_RAW = _MAX_LAGGING + _MAX_LEADING  # 165
 
 
 @dataclass
@@ -25,13 +34,20 @@ class KalshiSignal:
 class KalshiPredictor:
     """Scores confidence for short-term crypto direction predictions."""
 
-    def score(self, df: pd.DataFrame) -> KalshiSignal | None:
+    def score(self, df: pd.DataFrame, market_data: dict | None = None) -> KalshiSignal | None:
         """Score confidence for the next 15-minute direction.
+
+        Args:
+            df: OHLCV DataFrame with indicator columns.
+            market_data: Optional dict with leading indicator data from
+                ``data.market_data.get_all_signals()``.  Expected keys:
+                ``order_book`` and ``trade_flow``.  May also include a
+                ``cross_asset`` dict with ``market_direction`` float.
 
         Returns a KalshiSignal if any directional confidence exists,
         or None if the market is neutral.
 
-        The confidence score (0-100) is built from these components:
+        Lagging components (from OHLCV candles):
 
         1. RSI Signal (0-30 points):
            - RSI < 25: +30 (strong oversold -> UP)
@@ -66,6 +82,31 @@ class KalshiPredictor:
         6. Multi-Candle RSI Trend (0-10 points):
            - RSI increasing for 3+ candles from oversold: +10 (UP -- early bounce)
            - RSI decreasing for 3+ candles from overbought: +10 (DOWN -- early drop)
+
+        Leading components (from real-time microstructure):
+
+        7. Order Book Imbalance (0-20 points):
+           - imbalance > +0.3: +20 (strong buy pressure -> UP)
+           - imbalance > +0.15: +10
+           - imbalance < -0.3: +20 (strong sell pressure -> DOWN)
+           - imbalance < -0.15: +10
+
+        8. Trade Flow (0-20 points):
+           - net_flow > +0.2 AND buy_ratio > 0.55: +20 (aggressive buying -> UP)
+           - net_flow > +0.1: +10
+           - net_flow < -0.2 AND buy_ratio < 0.45: +20 (aggressive selling -> DOWN)
+           - net_flow < -0.1: +10
+
+        9. Large Trade Bias (0-10 points):
+           - large_trade_bias > +0.3: +10 (whales buying -> UP)
+           - large_trade_bias < -0.3: +10 (whales selling -> DOWN)
+
+        10. Spread Signal (0-5 points):
+            - spread_pct > 0.1%: +5 (wide spread = big move coming, confirms direction)
+
+        11. Cross-Asset (0-10 points):
+            - BTC down >1% and asset is an alt: +10 DOWN (BTC dragging alts)
+            - BTC up >1% and asset is an alt: +10 UP
         """
         if df is None or len(df) < 20:
             return None
@@ -188,15 +229,97 @@ class KalshiPredictor:
         down_score += rsi_trend_down
         components["rsi_trend"] = {"up": rsi_trend_up, "down": rsi_trend_down}
 
-        # Determine direction and confidence
+        # --- Leading indicator components (only when market_data provided) ---
+        has_leading = market_data is not None
+        ob = (market_data or {}).get("order_book", {})
+        tf = (market_data or {}).get("trade_flow", {})
+        cross = (market_data or {}).get("cross_asset", {})
+
+        # 7. Order Book Imbalance (0-20)
+        ob_up = 0
+        ob_down = 0
+        imbalance = ob.get("imbalance", 0)
+        if imbalance > 0.3:
+            ob_up = 20
+        elif imbalance > 0.15:
+            ob_up = 10
+        elif imbalance < -0.3:
+            ob_down = 20
+        elif imbalance < -0.15:
+            ob_down = 10
+        up_score += ob_up
+        down_score += ob_down
+        components["order_book"] = {"up": ob_up, "down": ob_down, "imbalance": imbalance}
+
+        # 8. Trade Flow (0-20)
+        tf_up = 0
+        tf_down = 0
+        net_flow = tf.get("net_flow", 0)
+        buy_ratio = tf.get("buy_ratio", 0.5)
+        if net_flow > 0.2 and buy_ratio > 0.55:
+            tf_up = 20
+        elif net_flow > 0.1:
+            tf_up = 10
+        elif net_flow < -0.2 and buy_ratio < 0.45:
+            tf_down = 20
+        elif net_flow < -0.1:
+            tf_down = 10
+        up_score += tf_up
+        down_score += tf_down
+        components["trade_flow"] = {"up": tf_up, "down": tf_down, "net_flow": net_flow}
+
+        # 9. Large Trade Bias (0-10)
+        lt_up = 0
+        lt_down = 0
+        large_bias = tf.get("large_trade_bias", 0)
+        if large_bias > 0.3:
+            lt_up = 10
+        elif large_bias < -0.3:
+            lt_down = 10
+        up_score += lt_up
+        down_score += lt_down
+        components["large_trade"] = {"up": lt_up, "down": lt_down, "bias": large_bias}
+
+        # 10. Spread Signal (0-5) — wide spread confirms the dominant direction
+        spread_score = 0
+        spread_pct = ob.get("spread_pct", 0)
+        if spread_pct > 0.1:
+            spread_score = 5
+        if up_score > down_score:
+            up_score += spread_score
+        else:
+            down_score += spread_score
+        components["spread"] = {"score": spread_score, "spread_pct": spread_pct}
+
+        # 11. Cross-Asset / BTC leader signal (0-10)
+        ca_up = 0
+        ca_down = 0
+        btc_dir = cross.get("market_direction", 0)
+        # Only apply cross-asset signal to alts (non-BTC)
+        is_alt = True  # caller can set asset; we assume alt unless overridden
+        if btc_dir < -1 and is_alt:
+            ca_down = 10
+        elif btc_dir > 1 and is_alt:
+            ca_up = 10
+        up_score += ca_up
+        down_score += ca_down
+        components["cross_asset"] = {"up": ca_up, "down": ca_down, "btc_dir": btc_dir}
+
+        # --- Determine direction and confidence ---
+        # When leading indicators are present the raw max is higher (~165),
+        # so we normalize to keep the 0-100 scale.
+        max_possible = _MAX_RAW if has_leading else _MAX_LAGGING
+
         if up_score > down_score and up_score > 0:
+            confidence = min(100, int(up_score * 100 / max_possible))
             return KalshiSignal(
-                asset="", direction="UP", confidence=min(100, up_score),
+                asset="", direction="UP", confidence=confidence,
                 components=components, price=close, rsi=rsi,
             )
         elif down_score > up_score and down_score > 0:
+            confidence = min(100, int(down_score * 100 / max_possible))
             return KalshiSignal(
-                asset="", direction="DOWN", confidence=min(100, down_score),
+                asset="", direction="DOWN", confidence=confidence,
                 components=components, price=close, rsi=rsi,
             )
         return None

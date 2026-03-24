@@ -257,3 +257,166 @@ class TestKalshiPredictor:
         assert sig.price == 87000.0
         assert sig.rsi == 28.0
         assert "rsi" in sig.components
+
+
+# ---------------------------------------------------------------------------
+# Enhanced predictor tests — leading indicators
+# ---------------------------------------------------------------------------
+
+class TestKalshiPredictorEnhanced:
+    """Tests for leading indicator integration in the predictor."""
+
+    def test_order_book_buy_pressure_boosts_up(self):
+        """Strong order book buy imbalance adds UP points."""
+        df = _make_df(rsi=32.0)  # mild oversold = 10 UP pts from RSI
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0.4, "spread_pct": 0.05},
+            "trade_flow": {"net_flow": 0, "buy_ratio": 0.5, "large_trade_bias": 0},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.components["order_book"]["up"] == 20
+
+    def test_order_book_sell_pressure_boosts_down(self):
+        """Strong order book sell imbalance adds DOWN points."""
+        df = _make_df(rsi=68.0)  # mild overbought = 10 DOWN pts
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": -0.35, "spread_pct": 0.05},
+            "trade_flow": {"net_flow": 0, "buy_ratio": 0.5, "large_trade_bias": 0},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "DOWN"
+        assert signal.components["order_book"]["down"] == 20
+
+    def test_trade_flow_aggressive_buying(self):
+        """Aggressive buying (net_flow > 0.2 and buy_ratio > 0.55) gives 20 UP."""
+        df = _make_df(rsi=33.0)  # oversold
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0, "spread_pct": 0.01},
+            "trade_flow": {"net_flow": 0.25, "buy_ratio": 0.6, "large_trade_bias": 0},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.components["trade_flow"]["up"] == 20
+
+    def test_trade_flow_aggressive_selling(self):
+        """Aggressive selling (net_flow < -0.2 and buy_ratio < 0.45) gives 20 DOWN."""
+        df = _make_df(rsi=67.0)
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0, "spread_pct": 0.01},
+            "trade_flow": {"net_flow": -0.25, "buy_ratio": 0.38, "large_trade_bias": 0},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "DOWN"
+        assert signal.components["trade_flow"]["down"] == 20
+
+    def test_large_trade_bias_whales_buying(self):
+        """Whale buying (large_trade_bias > 0.3) gives 10 UP."""
+        df = _make_df(rsi=33.0)
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0, "spread_pct": 0.01},
+            "trade_flow": {"net_flow": 0, "buy_ratio": 0.5, "large_trade_bias": 0.5},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.components["large_trade"]["up"] == 10
+
+    def test_wide_spread_confirms_direction(self):
+        """Wide spread (> 0.1%) adds 5 to dominant direction."""
+        df = _make_df(rsi=22.0)  # strong oversold
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0, "spread_pct": 0.15},
+            "trade_flow": {"net_flow": 0, "buy_ratio": 0.5, "large_trade_bias": 0},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.components["spread"]["score"] == 5
+
+    def test_cross_asset_btc_dragging_alts_down(self):
+        """BTC down >1% adds 10 DOWN for alts."""
+        df = _make_df(rsi=50.0, close=87000.0)  # neutral lagging
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0, "spread_pct": 0.01},
+            "trade_flow": {"net_flow": 0, "buy_ratio": 0.5, "large_trade_bias": 0},
+            "cross_asset": {"market_direction": -2.5},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "DOWN"
+        assert signal.components["cross_asset"]["down"] == 10
+
+    def test_cross_asset_btc_lifting_alts_up(self):
+        """BTC up >1% adds 10 UP for alts."""
+        df = _make_df(rsi=50.0, close=87000.0)
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0, "spread_pct": 0.01},
+            "trade_flow": {"net_flow": 0, "buy_ratio": 0.5, "large_trade_bias": 0},
+            "cross_asset": {"market_direction": 2.0},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.components["cross_asset"]["up"] == 10
+
+    def test_no_market_data_backward_compatible(self):
+        """Calling score() without market_data still works identically."""
+        df = _make_df(rsi=22.0, close=86400.0, bb_lower=86500.0)
+        predictor = KalshiPredictor()
+        signal_old = predictor.score(df)
+        signal_new = predictor.score(df, market_data=None)
+        assert signal_old is not None
+        assert signal_new is not None
+        assert signal_old.direction == signal_new.direction
+        assert signal_old.confidence == signal_new.confidence
+
+    def test_enhanced_confidence_normalized(self):
+        """With leading data, confidence is normalized to 0-100 scale."""
+        df = _make_df(
+            rsi=22.0, close=86400.0, bb_lower=86500.0,
+            macd_hist=5.0, volume=2500.0, vol_sma_20=1000.0,
+            close_trend=[86200.0, 86300.0, 86350.0, 86400.0],
+            macd_hist_trend=[2.0, 3.0, 4.0, 5.0],
+            rsi_trend=[18.0, 19.0, 20.0, 22.0],
+        )
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0.5, "spread_pct": 0.15},
+            "trade_flow": {"net_flow": 0.3, "buy_ratio": 0.65, "large_trade_bias": 0.5},
+            "cross_asset": {"market_direction": 2.0},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.confidence <= 100
+        # All components fire: lagging 100 + leading 65 = 165 raw
+        # Normalized: 165 * 100 / 165 = 100
+        assert signal.confidence == 100
+
+    def test_leading_only_signal_works(self):
+        """With neutral lagging but strong leading data, still produces signal."""
+        df = _make_df(rsi=50.0, close=87000.0)  # completely neutral lagging
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0.5, "spread_pct": 0.2},
+            "trade_flow": {"net_flow": 0.3, "buy_ratio": 0.65, "large_trade_bias": 0.5},
+            "cross_asset": {"market_direction": 2.0},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "UP"
+        # Order book 20 + trade flow 20 + large trade 10 + spread 5 + cross 10 = 65
+        # Normalized: 65 * 100 / 165 = 39
+        assert signal.confidence >= 30
