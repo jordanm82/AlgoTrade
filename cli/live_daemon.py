@@ -91,7 +91,7 @@ class LiveDaemon:
         from strategy.strategies.kalshi_predictor import KalshiPredictor
         self.kalshi_predictor = KalshiPredictor()
         self.kalshi_client = None  # lazy init
-        self.kalshi_threshold = 40  # minimum confidence to bet
+        self.kalshi_threshold = 30  # minimum confidence to bet (lowered from 40 — conf 25-35 with flow confirmation is the sweet spot)
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
 
     # ------------------------------------------------------------------
