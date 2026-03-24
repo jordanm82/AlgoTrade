@@ -520,10 +520,10 @@ class LiveDaemon:
     # ------------------------------------------------------------------
 
     KALSHI_PAIRS = {
-        "BTC/USDT": "KXBTC",
-        "ETH/USDT": "KXETH",
-        "SOL/USDT": "KXSOL",
-        "XRP/USDT": "KXXRP",
+        "BTC/USDT": "KXBTC15M",
+        "ETH/USDT": "KXETH15M",
+        "SOL/USDT": "KXSOL15M",
+        "XRP/USDT": "KXXRP15M",
     }
 
     def _init_kalshi_client(self):
@@ -627,16 +627,22 @@ class LiveDaemon:
                     bet_cents = max(500, int(balance_cents * 0.05))
                     count = max(1, bet_cents // approx_cents)
 
-                    # Find markets for this series
-                    markets = self.kalshi_client.get_markets(series_ticker=series_ticker)
-                    if not markets:
+                    # Find the next 15-min market for this series
+                    events = self.kalshi_client._get("/trade-api/v2/events", {
+                        "series_ticker": series_ticker, "status": "open",
+                        "limit": 3, "with_nested_markets": "true",
+                    })
+                    all_markets = []
+                    for evt in events.get("events", []):
+                        all_markets.extend(evt.get("markets", []))
+                    if not all_markets:
                         pred["reason"] = f"no {series_ticker} markets found"
                         print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
                         predictions.append(pred)
                         continue
 
-                    # Pick the first open market
-                    ticker = markets[0].get("ticker", "")
+                    # Pick the soonest-expiring open market
+                    ticker = all_markets[0].get("ticker", "")
                     result = self.kalshi_client.place_order(
                         ticker=ticker,
                         side=side,
