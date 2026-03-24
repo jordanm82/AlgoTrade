@@ -19,7 +19,7 @@ MAX_POSITION_PCT = 0.10
 MAX_CONCURRENT = 3
 MAX_LEVERAGE = 3
 MAX_DAILY_DRAWDOWN_PCT = 0.05
-MIN_BALANCE_USD = 100.0
+MIN_BALANCE_USD = 10.0  # lowered from $100 — starting capital is $100, need room to trade
 
 # Stop-loss
 DEFAULT_ATR_MULTIPLIER = 2.0
