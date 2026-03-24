@@ -1,19 +1,18 @@
 # exchange/kalshi.py
 """Kalshi prediction market client for BTC contracts."""
 import base64
-import hashlib
 import json
 import time
 from pathlib import Path
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, utils
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
 
-BASE_URL = "https://trading-api.kalshi.com"
-DEMO_URL = "https://demo-trading-api.kalshi.com"
+BASE_URL = "https://api.elections.kalshi.com"
+DEMO_URL = "https://demo-api.kalshi.co"
 
 
 class KalshiClient:
@@ -33,17 +32,26 @@ class KalshiClient:
         return serialization.load_pem_private_key(raw, password=None)
 
     def _sign(self, method: str, path: str) -> tuple[str, str]:
-        """Sign a request. Returns (timestamp_ms, signature_b64)."""
+        """Sign a request. Returns (timestamp_ms, signature_b64).
+
+        Per official Kalshi spec (kalshi-starter-code-python):
+        - Message = timestamp_ms + HTTP_METHOD + path (no delimiters, no body)
+        - Algorithm = RSA-PSS with SHA-256
+        - Salt length = PSS.DIGEST_LENGTH (not MAX_LENGTH)
+        - Sign raw message bytes (not pre-hashed)
+        - Query params stripped from path before signing
+        """
         ts = str(int(time.time() * 1000))
-        message = f"{ts}\n{method}\n{path}"
-        msg_hash = hashlib.sha256(message.encode()).digest()
+        # Strip query parameters from path before signing
+        path_clean = path.split("?")[0]
+        message = f"{ts}{method}{path_clean}".encode("utf-8")
         signature = self._private_key.sign(
-            msg_hash,
+            message,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
+                salt_length=padding.PSS.DIGEST_LENGTH,
             ),
-            utils.Prehashed(hashes.SHA256()),
+            hashes.SHA256(),
         )
         return ts, base64.b64encode(signature).decode()
 
