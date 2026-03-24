@@ -27,7 +27,7 @@ class TestRiskManager:
         assert "leverage" in reason.lower()
 
     def test_rejects_below_min_balance(self):
-        rm = RiskManager(portfolio_value=50.0)
+        rm = RiskManager(portfolio_value=5.0)
         ok, reason = rm.check_entry(size_usd=10.0, leverage=1, current_positions=0)
         assert ok is False
         assert "minimum balance" in reason.lower()
