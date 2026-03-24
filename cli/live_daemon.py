@@ -643,8 +643,10 @@ class LiveDaemon:
 
                     # Pick the soonest-expiring open market
                     ticker = all_markets[0].get("ticker", "")
-                    # Kalshi requires a price — use aggressive limit (99c YES / 99c NO) for instant fill
-                    fill_price = 99 if side == "yes" else 99
+                    # Price based on our confidence: pay slightly above 50c for edge
+                    # Higher confidence → willing to pay more (but still below our estimated probability)
+                    # conf=30 → pay 55c, conf=50 → pay 60c, conf=70 → pay 65c
+                    fill_price = min(70, max(51, int(50 + signal.confidence * 0.3)))
                     result = self.kalshi_client.place_order(
                         ticker=ticker,
                         side=side,
