@@ -22,11 +22,15 @@ from pathlib import Path
 import pandas as pd
 from termcolor import colored
 
-from config.production import (
-    BB_GRID_CONFIG, LEVERAGE_PAIRS, MAX_CONCURRENT_POSITIONS,
-    MONITORED_PAIRS_15M, PAIR_TO_COINBASE, POSITION_SIZE_PCT,
-    RSI_MR_CONFIG, STOP_LOSS_PCT, MAX_LEVERAGE,
+from config.pair_config import (
+    ALL_PAIRS, COINBASE_MAP, PAIR_CONFIG, get_pair_config,
 )
+from config.production import (
+    MAX_CONCURRENT_POSITIONS, POSITION_SIZE_PCT, STOP_LOSS_PCT, MAX_LEVERAGE,
+)
+
+# Derive leverage pairs from per-pair config
+LEVERAGE_PAIRS = [sym for sym, cfg in PAIR_CONFIG.items() if cfg["leverage"] > 1]
 from cli.live_daemon import LiveDaemon
 
 LOG_FILE = Path("data/store/dashboard.log")
@@ -96,7 +100,7 @@ class Dashboard:
 
     def _fetch_live_prices(self):
         """Fetch fresh ticker prices for all pairs (fast, ~1 API call each)."""
-        for sym in MONITORED_PAIRS_15M:
+        for sym in ALL_PAIRS:
             try:
                 ticker = self.daemon.fetcher.ticker(sym)
                 self._live_prices[sym] = float(ticker.get("last", 0))
@@ -132,13 +136,9 @@ class Dashboard:
             f"  MAX CYCLES: {self.max_cycles}  (~{self.max_cycles * 15} minutes)",
             "=" * 78,
             "",
-            "  STRATEGIES:",
-            "    1. BB Grid Long+Short (buy<BB_lower+RSI<35, sell>BB_mid)",
-            "       - 2x leverage: ATOM, FIL, DOT",
-            "       - 1x leverage: UNI, LTC, SHIB",
-            "",
-            "    2. RSI Mean Reversion Long+Short (buy RSI<30, sell RSI>65)",
-            "       - 1x leverage: ATOM, FIL",
+            "  STRATEGIES (per-pair optimized thresholds):",
+            "    1. BB Grid Long+Short — per-pair RSI buy/short thresholds",
+            "    2. RSI Mean Reversion Long+Short — per-pair oversold/overbought",
             "",
             "  RISK CONTROLS:",
             f"    - Position size: {POSITION_SIZE_PCT:.0%} of equity (compounding)",
@@ -148,12 +148,12 @@ class Dashboard:
             "    - Daily drawdown halt: 5%",
             "",
             "  MONITORED PAIRS:",
-            f"    {'  '.join(MONITORED_PAIRS_15M)}",
+            f"    {'  '.join(ALL_PAIRS)}",
             "",
             "  BACKTEST PERFORMANCE (6 months, Sep 2025 - Mar 2026):",
-            "    ATOM BB Grid 2x:  87.7% WR | +437% return | 487 trades",
-            "    FIL  BB Grid 2x:  71.2% WR | +309% return | 472 trades",
-            "    ATOM RSI MR:      84.5% WR |  +70% return | 290 trades",
+            "    ATOM BB Grid 2x:  88.2% WR | +592% return | 551 trades",
+            "    FIL  BB Grid 2x:  71.5% WR | +325% return | 492 trades",
+            "    DOT  BB Grid 2x:  76.2% WR | +101% return | 564 trades",
             "",
             "=" * 78,
         ]
@@ -206,7 +206,7 @@ class Dashboard:
         # Pairs table with LIVE prices
         lines.append(f"  {'PAIR':<12} {'PRICE':>10} {'RSI':>6} {'BB_LOW':>10} {'BB_MID':>10} {'BB_UP':>10} {'REGIME':<13} {'SIGNAL':<16}")
         lines.append(f"  {'-'*91}")
-        for sym in MONITORED_PAIRS_15M:
+        for sym in ALL_PAIRS:
             df = self.daemon._dataframes.get(sym)
             if df is None or len(df) == 0:
                 lines.append(f"  {sym:<12} {'--':>10}")
@@ -221,17 +221,18 @@ class Dashboard:
             bb_u = float(last.get("bb_upper", 0)) if pd.notna(last.get("bb_upper")) else 0
             regime = self._market_regime(df)
 
+            pcfg = get_pair_config(sym)
             sig_str = ""
-            if price < bb_l and rsi < 35:
+            if price < bb_l and rsi < pcfg["bb_rsi_buy"]:
                 sig_str = "** BB+RSI BUY **"
-            elif price > bb_u and rsi > 65:
+            elif price > bb_u and rsi > pcfg["bb_rsi_short"]:
                 sig_str = "** BB+RSI SHORT **"
-            elif rsi < 30:
+            elif rsi < pcfg["rsi_mr_oversold"]:
                 sig_str = "! RSI OVERSOLD"
-            elif rsi > 70:
+            elif rsi > pcfg["rsi_mr_overbought"]:
                 sig_str = "! RSI OVERBOUGHT"
 
-            lev_tag = " [2x]" if sym in LEVERAGE_PAIRS else ""
+            lev_tag = f" [{pcfg['leverage']}x]" if pcfg["leverage"] > 1 else ""
             price_str = self._fmt_price(price)
             bb_l_str = self._fmt_price(bb_l)
             bb_m_str = self._fmt_price(bb_m)
@@ -399,9 +400,9 @@ class Dashboard:
                 # Fetch fresh prices from exchange
                 self._fetch_live_prices()
                 # Update position prices + enforce stops
-                for sym in MONITORED_PAIRS_15M:
+                for sym in ALL_PAIRS:
                     if sym in self._live_prices:
-                        coinbase_sym = PAIR_TO_COINBASE.get(sym, "")
+                        coinbase_sym = COINBASE_MAP.get(sym, "")
                         # Update any positions that match this pair
                         for pos in self.daemon.tracker.open_positions():
                             if coinbase_sym in pos["symbol"]:

@@ -16,16 +16,20 @@ from datetime import datetime, timezone
 import pandas as pd
 from termcolor import colored
 
+from config.pair_config import (
+    ALL_PAIRS,
+    COINBASE_MAP,
+    PAIR_CONFIG,
+    get_pair_config,
+)
 from config.production import (
-    BB_GRID_CONFIG,
-    LEVERAGE_PAIRS,
     MAX_CONCURRENT_POSITIONS,
-    MONITORED_PAIRS_15M,
-    PAIR_TO_COINBASE,
     POSITION_SIZE_PCT,
-    RSI_MR_CONFIG,
     STOP_LOSS_PCT,
 )
+
+# Derive leverage pairs from per-pair config (any pair with leverage > 1)
+LEVERAGE_PAIRS = [sym for sym, cfg in PAIR_CONFIG.items() if cfg["leverage"] > 1]
 from config.settings import CDP_KEY_FILE, DATA_DIR
 from data.fetcher import DataFetcher
 from data.indicators import add_indicators
@@ -33,9 +37,6 @@ from data.store import DataStore
 from exchange.coinbase import CoinbaseExecutor
 from exchange.positions import PositionTracker
 from risk.manager import RiskManager
-
-# Pairs eligible for RSI Mean Reversion strategy
-RSI_MR_PAIRS = ["ATOM/USDT", "FIL/USDT"]
 
 # Pairs eligible for funding rate arbitrage (Coinbase perps)
 FUNDING_ARB_PERPS = {
@@ -102,7 +103,7 @@ class LiveDaemon:
 
     def _fetch_all(self):
         """Fetch 15m data for all monitored pairs."""
-        for symbol in MONITORED_PAIRS_15M:
+        for symbol in ALL_PAIRS:
             df = self._fetch_pair(symbol)
             if df is not None:
                 self._dataframes[symbol] = df
@@ -113,6 +114,10 @@ class LiveDaemon:
 
     def _bb_grid_signals(self, symbol: str, df: pd.DataFrame) -> list[dict]:
         """Check BB Grid Long+Short signals on a single pair."""
+        cfg = get_pair_config(symbol)
+        if "bb_grid" not in cfg.get("enabled_strategies", []):
+            return []
+
         if len(df) < 25:
             return []
 
@@ -134,11 +139,11 @@ class LiveDaemon:
         atr = float(atr)
 
         signals = []
-        buy_thresh = BB_GRID_CONFIG["rsi_buy_threshold"]
-        short_thresh = BB_GRID_CONFIG["rsi_short_threshold"]
-        leverage = 2 if symbol in LEVERAGE_PAIRS else 1
+        buy_thresh = cfg["bb_rsi_buy"]
+        short_thresh = cfg["bb_rsi_short"]
+        leverage = cfg["leverage"]
 
-        coinbase_sym = PAIR_TO_COINBASE[symbol]
+        coinbase_sym = COINBASE_MAP[symbol]
 
         # BUY signal: close < BB lower AND RSI < threshold
         if close < bb_lower and rsi < buy_thresh:
@@ -207,8 +212,9 @@ class LiveDaemon:
         return signals
 
     def _rsi_mr_signals(self, symbol: str, df: pd.DataFrame) -> list[dict]:
-        """Check RSI Mean Reversion signals for ATOM and FIL."""
-        if symbol not in RSI_MR_PAIRS:
+        """Check RSI Mean Reversion signals using per-pair thresholds."""
+        cfg = get_pair_config(symbol)
+        if "rsi_mr" not in cfg.get("enabled_strategies", []):
             return []
         if len(df) < 25:
             return []
@@ -225,16 +231,17 @@ class LiveDaemon:
         atr = float(atr)
 
         signals = []
-        coinbase_sym = PAIR_TO_COINBASE[symbol]
+        coinbase_sym = COINBASE_MAP[symbol]
+        leverage = cfg["leverage"]
 
-        # BUY: RSI < oversold (30)
-        if rsi < RSI_MR_CONFIG["oversold"]:
+        # BUY: RSI < oversold
+        if rsi < cfg["rsi_mr_oversold"]:
             signals.append({
                 "symbol": symbol,
                 "coinbase_symbol": coinbase_sym,
                 "action": "BUY",
-                "strategy": "rsi_mr_1x",
-                "leverage": 1,
+                "strategy": f"rsi_mr_{leverage}x",
+                "leverage": leverage,
                 "price": close,
                 "rsi": rsi,
                 "stop": close * (1 - STOP_LOSS_PCT),
@@ -242,28 +249,28 @@ class LiveDaemon:
                 "atr": atr,
             })
 
-        # SELL (exit long): RSI > exit_long (65)
-        if rsi > RSI_MR_CONFIG["exit_long"]:
+        # SELL (exit long): RSI > exit_long
+        if rsi > cfg["rsi_mr_exit_long"]:
             pos_key = f"{coinbase_sym}:rsi_mr:long"
             if pos_key in [p["symbol"] for p in self.tracker.open_positions()]:
                 signals.append({
                     "symbol": symbol,
                     "coinbase_symbol": coinbase_sym,
                     "action": "CLOSE_LONG",
-                    "strategy": "rsi_mr_1x",
+                    "strategy": f"rsi_mr_{leverage}x",
                     "pos_key": pos_key,
                     "price": close,
                     "rsi": rsi,
                 })
 
-        # SHORT: RSI > overbought (70)
-        if rsi > RSI_MR_CONFIG["overbought"]:
+        # SHORT: RSI > overbought
+        if rsi > cfg["rsi_mr_overbought"]:
             signals.append({
                 "symbol": symbol,
                 "coinbase_symbol": coinbase_sym,
                 "action": "SHORT",
-                "strategy": "rsi_mr_1x",
-                "leverage": 1,
+                "strategy": f"rsi_mr_{leverage}x",
+                "leverage": leverage,
                 "price": close,
                 "rsi": rsi,
                 "stop": close * (1 + STOP_LOSS_PCT),
@@ -271,15 +278,15 @@ class LiveDaemon:
                 "atr": atr,
             })
 
-        # COVER (exit short): RSI < exit_short (35)
-        if rsi < RSI_MR_CONFIG["exit_short"]:
+        # COVER (exit short): RSI < exit_short
+        if rsi < cfg["rsi_mr_exit_short"]:
             pos_key = f"{coinbase_sym}:rsi_mr:short"
             if pos_key in [p["symbol"] for p in self.tracker.open_positions()]:
                 signals.append({
                     "symbol": symbol,
                     "coinbase_symbol": coinbase_sym,
                     "action": "CLOSE_SHORT",
-                    "strategy": "rsi_mr_1x",
+                    "strategy": f"rsi_mr_{leverage}x",
                     "pos_key": pos_key,
                     "price": close,
                     "rsi": rsi,
@@ -789,15 +796,15 @@ class LiveDaemon:
         mode = "DRY-RUN" if self.dry_run else "LIVE"
         print(colored(f"{'='*70}", "cyan"))
         print(colored(f"  Production Trading Daemon — {mode} MODE", "cyan"))
-        print(colored(f"  Strategies: BB Grid (2x on ATOM/FIL/DOT, 1x others) + RSI MR", "cyan"))
-        print(colored(f"  Pairs: {', '.join(MONITORED_PAIRS_15M)}", "cyan"))
+        print(colored(f"  Strategies: BB Grid + RSI MR (per-pair config)", "cyan"))
+        print(colored(f"  Pairs: {', '.join(ALL_PAIRS)}", "cyan"))
         print(colored(f"  Timeframe: 15m | Equity: ${self._equity:,.2f}", "cyan"))
         print(colored(f"  Stop-loss: {STOP_LOSS_PCT:.0%} | Position size: {POSITION_SIZE_PCT:.0%}", "cyan"))
         print(colored(f"{'='*70}", "cyan"))
 
         print("\n[STARTUP] Fetching initial 15m data for all pairs...")
         self._fetch_all()
-        print(f"[STARTUP] Loaded data for {len(self._dataframes)}/{len(MONITORED_PAIRS_15M)} pairs")
+        print(f"[STARTUP] Loaded data for {len(self._dataframes)}/{len(ALL_PAIRS)} pairs")
         for sym, df in self._dataframes.items():
             last = df.iloc[-1]
             rsi = last.get("rsi", 0)
