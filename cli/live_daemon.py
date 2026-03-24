@@ -480,7 +480,15 @@ class LiveDaemon:
         """Run Kalshi predictions for BTC/ETH/SOL/XRP and optionally place bets."""
         predictions = []
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
+            # Kalshi pairs may not be in our Coinbase trading set — fetch independently
             df = self._dataframes.get(symbol)
+            if df is None or len(df) < 20:
+                try:
+                    df = self._fetch_pair(symbol)
+                    if df is not None:
+                        self._dataframes[symbol] = df
+                except Exception:
+                    pass
             if df is None or len(df) < 20:
                 predictions.append({
                     "symbol": symbol, "asset": symbol.split("/")[0],
