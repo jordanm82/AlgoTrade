@@ -1,5 +1,9 @@
+import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from pathlib import Path
+
+POSITIONS_FILE = Path("data/store/positions.json")
 
 
 @dataclass
@@ -98,6 +102,56 @@ class PositionTracker:
         self._positions: dict[str, Position] = {}
         self._closed: list[dict] = []
 
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save_state(self):
+        """Save all open positions to disk."""
+        state = {
+            "positions": {k: v.to_dict() for k, v in self._positions.items()},
+            "closed": self._closed[-50:],  # keep last 50 closed trades
+        }
+        POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+
+    def load_state(self):
+        """Load positions from disk."""
+        if not POSITIONS_FILE.exists():
+            return
+        try:
+            with open(POSITIONS_FILE) as f:
+                state = json.load(f)
+            for key, pdata in state.get("positions", {}).items():
+                self._positions[key] = Position(
+                    symbol=pdata["symbol"],
+                    side=pdata["side"],
+                    size_usd=pdata["size_usd"],
+                    entry_price=pdata["entry_price"],
+                    stop_price=pdata["stop_price"],
+                    take_profit=pdata["take_profit"],
+                    opened_at=pdata.get("opened_at", ""),
+                    current_price=pdata.get("current_price", pdata["entry_price"]),
+                    unrealized_pnl=pdata.get("unrealized_pnl", 0),
+                )
+                # Restore TP tracking fields if they exist
+                pos = self._positions[key]
+                pos.original_size_usd = pdata.get("original_size_usd", pdata["size_usd"])
+                pos.tp_10_hit = pdata.get("tp_10_hit", False)
+                pos.tp_20_hit = pdata.get("tp_20_hit", False)
+                pos.trailing_stop = pdata.get("trailing_stop", 0)
+                pos.peak_price = pdata.get("peak_price", pdata["entry_price"])
+                pos.units = pdata.get("units", pdata["size_usd"] / pdata["entry_price"] if pdata["entry_price"] > 0 else 0)
+            self._closed = state.get("closed", [])
+            print(f"[STARTUP] Loaded {len(self._positions)} positions from disk")
+        except Exception as e:
+            print(f"[WARN] Failed to load positions: {e}")
+
+    # ------------------------------------------------------------------
+    # Core operations
+    # ------------------------------------------------------------------
+
     def open(self, symbol: str, side: str, size_usd: float,
              entry_price: float, stop_price: float, take_profit: float):
         units = size_usd / entry_price if entry_price > 0 else 0.0
@@ -108,6 +162,7 @@ class PositionTracker:
             units=units, original_size_usd=size_usd,
             peak_price=entry_price,
         )
+        self.save_state()
 
     def close(self, symbol: str, exit_price: float) -> dict:
         pos = self._positions.pop(symbol)
@@ -117,6 +172,7 @@ class PositionTracker:
         record["pnl_usd"] = pos.unrealized_pnl
         record["closed_at"] = datetime.now(timezone.utc).isoformat()
         self._closed.append(record)
+        self.save_state()
         return record
 
     def can_open(self) -> bool:

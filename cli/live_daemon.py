@@ -62,6 +62,7 @@ class LiveDaemon:
         self.fetcher = DataFetcher()
         self.store = DataStore(DATA_DIR)
         self.tracker = PositionTracker(max_concurrent=MAX_CONCURRENT_POSITIONS)
+        self.tracker.load_state()  # restore positions from previous session
         self._running = False
 
         # Dataframes keyed by binance symbol (e.g. "ATOM/USDT")
@@ -93,6 +94,58 @@ class LiveDaemon:
         self.kalshi_client = None  # lazy init
         self.kalshi_threshold = 30  # minimum confidence to bet (lowered from 40 — conf 25-35 with flow confirmation is the sweet spot)
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
+
+    # ------------------------------------------------------------------
+    # Position sync from exchanges
+    # ------------------------------------------------------------------
+
+    def _sync_positions_from_exchange(self):
+        """On startup, check Coinbase for any token balances we're not tracking
+        and Kalshi for open positions.  This catches positions from previous
+        sessions that weren't saved."""
+        if self.dry_run or not self.executor:
+            return
+
+        # --- Coinbase spot balances ---
+        try:
+            balances = self.executor.get_balances()
+            for currency, value in balances.items():
+                if currency == "USD" or value < 1.0:  # skip USD and dust
+                    continue
+                # Check if we have a tracked position for this currency
+                coinbase_sym = f"{currency}-USD"
+                tracked = any(coinbase_sym in p["symbol"] for p in self.tracker.open_positions())
+                if not tracked and value >= 1.0:
+                    # Found an untracked position -- add it with estimated entry
+                    print(colored(f"  [SYNC] Found untracked {currency}: ${value:.2f} — adding to tracker", "yellow"))
+                    # Use current price as entry (we don't know the real entry)
+                    binance_sym = f"{currency}/USDT"
+                    ticker = self.fetcher.ticker(binance_sym)
+                    price = ticker.get("last", 0)
+                    if price > 0:
+                        pos_key = f"{coinbase_sym}:synced:long"
+                        self.tracker.open(pos_key, "BUY", value, price, price * 0.97, price * 1.10)
+        except Exception as e:
+            print(colored(f"  [WARN] Coinbase sync failed: {e}", "yellow"))
+
+        # --- Kalshi open positions ---
+        try:
+            self._init_kalshi_client()
+            if self.kalshi_client is not None:
+                positions = self.kalshi_client.get_positions()
+                if positions:
+                    print(colored(f"  [SYNC] Found {len(positions)} open Kalshi positions", "yellow"))
+                    for pos in positions:
+                        ticker = pos.get("ticker", pos.get("market_ticker", "unknown"))
+                        side = "yes" if pos.get("total_traded", 0) > 0 or pos.get("position", 0) > 0 else "no"
+                        contracts = abs(pos.get("total_traded", 0) or pos.get("position", 0))
+                        cost_cents = abs(pos.get("realized_pnl", 0) + pos.get("market_exposure", 0))
+                        print(colored(
+                            f"  [SYNC] Kalshi: {ticker} | {side} x{contracts} | cost={cost_cents}c",
+                            "yellow",
+                        ))
+        except Exception as e:
+            print(colored(f"  [WARN] Kalshi sync failed: {e}", "yellow"))
 
     # ------------------------------------------------------------------
     # Data
@@ -930,6 +983,7 @@ class LiveDaemon:
                         "pnl": (pos.current_price - pos.entry_price) / pos.entry_price * usd_to_sell,
                         "source": "profit_taking",
                     })
+                    self.tracker.save_state()  # persist after reduce_size
 
                 elif action["action"] == "trailing_stop":
                     reason = action["reason"]
@@ -1082,6 +1136,9 @@ class LiveDaemon:
             rsi = last.get("rsi", 0)
             close = float(last["close"])
             print(f"  {sym}: ${close:.4f} | RSI={rsi:.1f} | {len(df)} candles")
+
+        # Sync positions from exchanges (belt + suspenders)
+        self._sync_positions_from_exchange()
 
     def signal_cycle(self):
         """Full signal cycle: fetch data, generate signals, execute."""

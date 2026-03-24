@@ -1,5 +1,17 @@
+import json
+from pathlib import Path
+
 import pytest
+from exchange import positions as positions_module
 from exchange.positions import Position, PositionTracker
+
+
+@pytest.fixture(autouse=True)
+def _isolate_positions_file(tmp_path, monkeypatch):
+    """Redirect POSITIONS_FILE to a temp directory so tests don't
+    write to the real data/store/ and don't interfere with each other."""
+    tmp_file = tmp_path / "positions.json"
+    monkeypatch.setattr(positions_module, "POSITIONS_FILE", tmp_file)
 
 
 class TestPositionTracker:
@@ -177,3 +189,95 @@ class TestProfitTaking:
             current_price=0.0,
         )
         assert pos2.check_profit_taking() == []
+
+
+class TestPositionPersistence:
+    """Tests for save_state / load_state round-tripping."""
+
+    def test_save_and_load_basic(self):
+        """Positions saved to disk should be fully restored on load."""
+        tracker = PositionTracker()
+        tracker.open("BTC-USD:bb_grid:long", "BUY", 1000.0, 50000.0, 48000.0, 55000.0)
+        tracker.open("ETH-USD:rsi_mr:short", "SELL", 500.0, 3000.0, 3200.0, 2500.0)
+        tracker.update_price("BTC-USD:bb_grid:long", 51000.0)
+
+        # Load into a fresh tracker
+        tracker2 = PositionTracker()
+        tracker2.load_state()
+        positions = tracker2.open_positions()
+        assert len(positions) == 2
+        syms = {p["symbol"] for p in positions}
+        assert "BTC-USD:bb_grid:long" in syms
+        assert "ETH-USD:rsi_mr:short" in syms
+
+        # Check that numeric fields round-tripped correctly
+        btc = next(p for p in positions if "BTC" in p["symbol"])
+        assert btc["entry_price"] == 50000.0
+        assert btc["size_usd"] == 1000.0
+
+    def test_save_and_load_preserves_tp_fields(self):
+        """TP tracking fields (tp_10_hit, trailing_stop, peak_price) persist."""
+        tracker = PositionTracker()
+        tracker.open("BTC-USD:bb_grid:long", "BUY", 1000.0, 100.0, 90.0, 150.0)
+        pos = tracker._positions["BTC-USD:bb_grid:long"]
+        pos.update(112.0)
+        pos.check_profit_taking()  # triggers tp_10_hit
+        assert pos.tp_10_hit is True
+        tracker.save_state()
+
+        tracker2 = PositionTracker()
+        tracker2.load_state()
+        pos2 = tracker2._positions["BTC-USD:bb_grid:long"]
+        assert pos2.tp_10_hit is True
+        assert pos2.peak_price == pytest.approx(112.0)
+        assert pos2.trailing_stop == pytest.approx(112.0 * 0.95)
+        assert pos2.original_size_usd == 1000.0
+
+    def test_close_persists_and_clears(self):
+        """Closing a position removes it from saved state and adds to closed list."""
+        tracker = PositionTracker()
+        tracker.open("BTC-USD:bb_grid:long", "BUY", 1000.0, 50000.0, 48000.0, 55000.0)
+        tracker.close("BTC-USD:bb_grid:long", 51000.0)
+
+        tracker2 = PositionTracker()
+        tracker2.load_state()
+        assert len(tracker2.open_positions()) == 0
+        assert len(tracker2.closed_trades()) == 1
+
+    def test_load_missing_file_is_noop(self, tmp_path, monkeypatch):
+        """Loading when file doesn't exist should silently do nothing."""
+        monkeypatch.setattr(positions_module, "POSITIONS_FILE", tmp_path / "nope.json")
+        tracker = PositionTracker()
+        tracker.load_state()  # should not raise
+        assert len(tracker.open_positions()) == 0
+
+    def test_load_corrupt_file_is_noop(self, tmp_path, monkeypatch):
+        """Loading a corrupt JSON file should warn but not crash."""
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("{invalid json!!!")
+        monkeypatch.setattr(positions_module, "POSITIONS_FILE", bad_file)
+        tracker = PositionTracker()
+        tracker.load_state()  # should not raise
+        assert len(tracker.open_positions()) == 0
+
+    def test_closed_list_capped_at_50(self):
+        """Saved state should keep at most 50 closed trades."""
+        tracker = PositionTracker(max_concurrent=100)
+        for i in range(60):
+            key = f"TOK{i}-USD:test:long"
+            tracker.open(key, "BUY", 100.0, 10.0, 9.0, 12.0)
+        for i in range(60):
+            key = f"TOK{i}-USD:test:long"
+            tracker.close(key, 11.0)
+
+        # Read the saved file directly
+        data = json.loads(positions_module.POSITIONS_FILE.read_text())
+        assert len(data["closed"]) == 50
+
+    def test_save_state_creates_parent_dirs(self, tmp_path, monkeypatch):
+        """save_state should create parent directories if they don't exist."""
+        deep_file = tmp_path / "a" / "b" / "positions.json"
+        monkeypatch.setattr(positions_module, "POSITIONS_FILE", deep_file)
+        tracker = PositionTracker()
+        tracker.open("BTC-USD:test:long", "BUY", 500.0, 40000.0, 38000.0, 45000.0)
+        assert deep_file.exists()
