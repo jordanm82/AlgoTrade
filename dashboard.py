@@ -305,6 +305,34 @@ class Dashboard:
                 sign = "+" if pnl_t >= 0 else ""
                 lines.append(f"    {sym:<25} {side:<6} ${sign}{pnl_t:.2f}")
 
+        # Kalshi predictions
+        kalshi_preds = getattr(self.daemon, "kalshi_predictions", [])
+        if kalshi_preds:
+            lines.append("")
+            lines.append("  KALSHI PREDICTIONS:")
+            for pred in kalshi_preds:
+                asset = pred.get("asset", "?")
+                direction = pred.get("direction", "--")
+                conf = pred.get("confidence", 0)
+                ob = pred.get("ob", 0)
+                flow = pred.get("flow", 0)
+                reason = pred.get("reason", "")
+                threshold = getattr(self.daemon, "kalshi_threshold", 40)
+                if direction == "--" or conf == 0:
+                    lines.append(f"    {asset:<5} {'--':<5} conf={conf:<3}")
+                elif conf < threshold:
+                    lines.append(
+                        f"    {asset:<5} {direction:<5} conf={conf:<3} |  "
+                        f"enhanced: OB={ob:+.2f} flow={flow:+.2f}  |  "
+                        f"below threshold ({threshold})"
+                    )
+                else:
+                    lines.append(
+                        f"    {asset:<5} {direction:<5} conf={conf:<3} |  "
+                        f"enhanced: OB={ob:+.2f} flow={flow:+.2f}  |  "
+                        f"{reason}"
+                    )
+
         # Footer
         remaining = self.max_cycles - self._cycle_count
         if is_signal_cycle:

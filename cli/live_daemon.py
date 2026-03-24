@@ -87,6 +87,13 @@ class LiveDaemon:
         self._signals_today = 0
         self._pnl_today = 0.0
 
+        # Kalshi predictor + client
+        from strategy.strategies.kalshi_predictor import KalshiPredictor
+        self.kalshi_predictor = KalshiPredictor()
+        self.kalshi_client = None  # lazy init
+        self.kalshi_threshold = 40  # minimum confidence to bet
+        self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
+
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
@@ -401,6 +408,185 @@ class LiveDaemon:
         return all_signals
 
     # ------------------------------------------------------------------
+    # Leading indicator gate
+    # ------------------------------------------------------------------
+
+    def _check_leading_indicators(self, symbol: str, direction: str) -> tuple[bool, str]:
+        """Check order book + trade flow before executing a trade.
+        Returns (should_trade, reason).
+
+        Rules:
+        - If order book imbalance strongly contradicts direction (>0.3 against), SKIP
+        - If trade flow strongly contradicts (net_flow >0.2 against AND buy_ratio against), SKIP
+        - If both order book AND trade flow confirm direction, log as HIGH CONFLUENCE
+        """
+        try:
+            from data.market_data import get_order_book_imbalance, get_trade_flow
+            ob = get_order_book_imbalance(symbol)
+            tf = get_trade_flow(symbol, limit=100)
+
+            imbalance = ob["imbalance"]
+            net_flow = tf["net_flow"]
+
+            if direction == "BUY":
+                # Skip if strong sell pressure
+                if imbalance < -0.3 and net_flow < -0.15:
+                    return False, f"BLOCKED: sell pressure (OB={imbalance:+.2f}, flow={net_flow:+.2f})"
+                if net_flow < -0.3:
+                    return False, f"BLOCKED: heavy selling (flow={net_flow:+.2f})"
+                if imbalance > 0.15 and net_flow > 0.1:
+                    return True, f"CONFIRMED: buy pressure (OB={imbalance:+.2f}, flow={net_flow:+.2f})"
+            elif direction == "SHORT" or direction == "SELL":
+                # Skip if strong buy pressure
+                if imbalance > 0.3 and net_flow > 0.15:
+                    return False, f"BLOCKED: buy pressure (OB={imbalance:+.2f}, flow={net_flow:+.2f})"
+                if net_flow > 0.3:
+                    return False, f"BLOCKED: heavy buying (flow={net_flow:+.2f})"
+                if imbalance < -0.15 and net_flow < -0.1:
+                    return True, f"CONFIRMED: sell pressure (OB={imbalance:+.2f}, flow={net_flow:+.2f})"
+
+            return True, "NEUTRAL"  # no strong signal either way, proceed
+        except Exception as e:
+            return True, f"SKIP_CHECK: {e}"  # if data fetch fails, proceed anyway
+
+    # ------------------------------------------------------------------
+    # Kalshi prediction cycle
+    # ------------------------------------------------------------------
+
+    KALSHI_PAIRS = {
+        "BTC/USDT": "KXBTC",
+        "ETH/USDT": "KXETH",
+        "SOL/USDT": "KXSOL",
+        "XRP/USDT": "KXXRP",
+    }
+
+    def _init_kalshi_client(self):
+        """Lazy-initialize the Kalshi client."""
+        if self.kalshi_client is not None:
+            return
+        try:
+            from exchange.kalshi import KalshiClient
+            from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
+            demo = self.dry_run  # demo=True for dry-run, demo=False for live
+            self.kalshi_client = KalshiClient(
+                api_key_id=KALSHI_API_KEY_ID,
+                private_key_path=str(KALSHI_KEY_FILE),
+                demo=demo,
+            )
+        except Exception as e:
+            print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
+
+    def _kalshi_cycle(self):
+        """Run Kalshi predictions for BTC/ETH/SOL/XRP and optionally place bets."""
+        predictions = []
+        for symbol, series_ticker in self.KALSHI_PAIRS.items():
+            df = self._dataframes.get(symbol)
+            if df is None or len(df) < 20:
+                predictions.append({
+                    "symbol": symbol, "asset": symbol.split("/")[0],
+                    "direction": "--", "confidence": 0,
+                    "reason": "no data", "ob": 0, "flow": 0,
+                })
+                continue
+
+            # Get leading indicator data for enhanced prediction
+            market_data = None
+            try:
+                from data.market_data import get_order_book_imbalance, get_trade_flow
+                ob = get_order_book_imbalance(symbol)
+                tf = get_trade_flow(symbol, limit=100)
+                market_data = {"order_book": ob, "trade_flow": tf}
+            except Exception:
+                pass
+
+            signal = self.kalshi_predictor.score(df, market_data=market_data)
+            if signal is None:
+                predictions.append({
+                    "symbol": symbol, "asset": symbol.split("/")[0],
+                    "direction": "--", "confidence": 0,
+                    "reason": "neutral", "ob": 0, "flow": 0,
+                })
+                continue
+
+            ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
+            net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
+
+            pred = {
+                "symbol": symbol,
+                "asset": symbol.split("/")[0],
+                "direction": signal.direction,
+                "confidence": signal.confidence,
+                "ob": ob_imb,
+                "flow": net_flow,
+                "reason": "",
+            }
+
+            if signal.confidence < self.kalshi_threshold:
+                pred["reason"] = f"below threshold ({self.kalshi_threshold})"
+                predictions.append(pred)
+                continue
+
+            # Determine bet side and approximate price
+            side = "yes" if signal.direction == "UP" else "no"
+            approx_cents = max(5, min(95, int(50 + (signal.confidence - 50) * 0.5)))
+            pred["reason"] = f"would bet {side.upper()} @ ~{approx_cents}c"
+
+            if self.dry_run:
+                print(colored(
+                    f"  [KALSHI DRY] {pred['asset']} {signal.direction} "
+                    f"conf={signal.confidence} | "
+                    f"OB={ob_imb:+.2f} flow={net_flow:+.2f} | "
+                    f"bet {side.upper()} @ ~{approx_cents}c",
+                    "magenta",
+                ))
+            else:
+                # Live: place the bet
+                self._init_kalshi_client()
+                if self.kalshi_client is None:
+                    pred["reason"] = "client init failed"
+                    predictions.append(pred)
+                    continue
+                try:
+                    # Get balance and compute bet size (5% of balance, min $5)
+                    balance_resp = self.kalshi_client.get_balance()
+                    balance_cents = balance_resp.get("balance", 0)
+                    bet_cents = max(500, int(balance_cents * 0.05))
+                    count = max(1, bet_cents // approx_cents)
+
+                    # Find markets for this series
+                    markets = self.kalshi_client.get_markets(series_ticker=series_ticker)
+                    if not markets:
+                        pred["reason"] = f"no {series_ticker} markets found"
+                        print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
+                        predictions.append(pred)
+                        continue
+
+                    # Pick the first open market
+                    ticker = markets[0].get("ticker", "")
+                    result = self.kalshi_client.place_order(
+                        ticker=ticker,
+                        side=side,
+                        count=count,
+                        price_cents=approx_cents,
+                        order_type="limit",
+                    )
+                    order_id = result.get("order", {}).get("order_id", "?")
+                    pred["reason"] = f"placed {side.upper()} x{count} @ {approx_cents}c (#{order_id})"
+                    print(colored(
+                        f"  [KALSHI BET] {pred['asset']} {signal.direction} "
+                        f"conf={signal.confidence} | {side.upper()} x{count} @ {approx_cents}c",
+                        "magenta",
+                    ))
+                except Exception as e:
+                    pred["reason"] = f"order failed: {e}"
+                    print(colored(f"  [KALSHI ERR] {pred['asset']}: {e}", "red"))
+
+            predictions.append(pred)
+
+        self.kalshi_predictions = predictions
+        return predictions
+
+    # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
 
@@ -444,6 +630,18 @@ class LiveDaemon:
             )
             if not ok:
                 print(colored(f"  [RISK] {symbol} BUY blocked: {reason}", "yellow"))
+                return
+
+            # Leading indicator gate
+            should_trade, li_reason = self._check_leading_indicators(symbol, "BUY")
+            if "CONFIRMED" in li_reason:
+                print(colored(f"  [LEAD] {symbol} BUY {li_reason}", "green"))
+            elif "BLOCKED" in li_reason:
+                print(colored(f"  [LEAD] {symbol} BUY {li_reason}", "red"))
+            else:
+                print(colored(f"  [LEAD] {symbol} BUY {li_reason}", "yellow"))
+            time.sleep(0.2)  # rate limit: 2 extra API calls
+            if not should_trade:
                 return
 
             self._signals_today += 1
@@ -509,6 +707,18 @@ class LiveDaemon:
             )
             if not ok:
                 print(colored(f"  [RISK] {symbol} SHORT blocked: {reason}", "yellow"))
+                return
+
+            # Leading indicator gate
+            should_trade, li_reason = self._check_leading_indicators(symbol, "SHORT")
+            if "CONFIRMED" in li_reason:
+                print(colored(f"  [LEAD] {symbol} SHORT {li_reason}", "green"))
+            elif "BLOCKED" in li_reason:
+                print(colored(f"  [LEAD] {symbol} SHORT {li_reason}", "red"))
+            else:
+                print(colored(f"  [LEAD] {symbol} SHORT {li_reason}", "yellow"))
+            time.sleep(0.2)  # rate limit: 2 extra API calls
+            if not should_trade:
                 return
 
             self._signals_today += 1
@@ -837,6 +1047,12 @@ class LiveDaemon:
                 self._execute_signal(sig)
         else:
             print("[CYCLE] No signals")
+
+        # Kalshi prediction cycle
+        try:
+            self._kalshi_cycle()
+        except Exception as e:
+            print(colored(f"  [KALSHI ERR] cycle failed: {e}", "yellow"))
 
         self._update_equity()
         self._save_snapshot(signals)

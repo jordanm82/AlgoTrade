@@ -143,6 +143,41 @@ After each session, check:
 - `data/store/backtest_6month_results.csv` — original backtest validation
 - `data/store/multi_strategy_results.csv` — strategy comparison data
 
+## Leading Indicator Gate
+
+Every BUY and SHORT signal is validated against real-time order book imbalance and trade flow data before execution. The gate (`_check_leading_indicators` in `cli/live_daemon.py`) fetches two microstructure signals from BinanceUS:
+
+1. **Order book imbalance** (-1 to +1): bid volume vs ask volume in the top 20 levels.
+2. **Trade flow** (-1 to +1): net buying vs selling in the last 100 trades.
+
+**Rules:**
+- BUY is **BLOCKED** if imbalance < -0.3 AND net_flow < -0.15 (strong sell pressure), or if net_flow < -0.3 (heavy selling).
+- SHORT is **BLOCKED** if imbalance > 0.3 AND net_flow > 0.15 (strong buy pressure), or if net_flow > 0.3 (heavy buying).
+- If both indicators confirm the signal direction, it logs as **CONFIRMED** (high confluence).
+- Close signals (CLOSE_LONG, CLOSE_SHORT) are never blocked -- always let exits execute.
+- If the data fetch fails, the trade proceeds anyway (fail-open).
+
+The gate adds ~0.2s delay per signal for rate limiting (2 extra API calls to BinanceUS).
+
+## Kalshi Prediction Markets
+
+The daemon runs a Kalshi prediction cycle at the end of each 15-minute signal cycle. It scores BTC, ETH, SOL, and XRP using the `KalshiPredictor` (lagging OHLCV indicators + leading microstructure data) and optionally places bets on Kalshi.
+
+**Configuration:**
+- Confidence threshold: 40 (minimum to place a bet)
+- Bet sizing: 5% of Kalshi account balance per bet, minimum $5
+- Series tickers: KXBTC, KXETH, KXSOL, KXXRP
+- Mode: demo=True in dry-run, demo=False in live
+- API key ID: `config.settings.KALSHI_API_KEY_ID`
+- Private key: `KalshiPrimaryKey.txt` (contains API key header + RSA private key)
+
+**Dashboard section:** The KALSHI PREDICTIONS block shows direction, confidence, order book / trade flow values, and bet status for each asset.
+
+**Key files:**
+- `exchange/kalshi.py` -- Kalshi REST client (auth, market discovery, order placement)
+- `strategy/strategies/kalshi_predictor.py` -- Multi-signal confidence scorer (0-100)
+- `KalshiPrimaryKey.txt` -- API key file (line 1 = API key ID, rest = RSA private key PEM)
+
 ## Known Limitations
 
 1. **Mean reversion fails in strong trends.** If BTC enters a sustained bull or bear run, these strategies will underperform or lose money. They are designed for ranging/choppy markets.

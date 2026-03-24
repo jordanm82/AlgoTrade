@@ -24,7 +24,13 @@ class KalshiClient:
 
     def _load_key(self, path: str):
         with open(path, "rb") as f:
-            return serialization.load_pem_private_key(f.read(), password=None)
+            raw = f.read()
+        # The key file may contain an "API Key = ..." header line before the
+        # PEM block.  Extract only the RSA private key portion.
+        pem_start = raw.find(b"-----BEGIN")
+        if pem_start > 0:
+            raw = raw[pem_start:]
+        return serialization.load_pem_private_key(raw, password=None)
 
     def _sign(self, method: str, path: str) -> tuple[str, str]:
         """Sign a request. Returns (timestamp_ms, signature_b64)."""
