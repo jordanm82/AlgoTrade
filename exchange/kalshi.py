@@ -10,6 +10,8 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, utils
 
+from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
+
 BASE_URL = "https://trading-api.kalshi.com"
 DEMO_URL = "https://demo-trading-api.kalshi.com"
 

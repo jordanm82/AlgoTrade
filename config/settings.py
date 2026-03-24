@@ -12,6 +12,7 @@ CDP_KEY_FILE = PROJECT_ROOT / "cdp_api_key.json"
 
 # Kalshi
 KALSHI_KEY_FILE = PROJECT_ROOT / "KalshiPrimaryKey.txt"
+KALSHI_API_KEY_ID = "719d39fa-9119-47e9-98a9-da7af90fb24b"
 
 # Risk limits (hard guardrails)
 MAX_POSITION_PCT = 0.10

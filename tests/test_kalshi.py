@@ -2,10 +2,14 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from exchange.kalshi import KalshiClient
-from strategy.strategies.kalshi_btc import KalshiBTCStrategy
+from strategy.strategies.kalshi_predictor import KalshiPredictor, KalshiSignal
 import pandas as pd
 import numpy as np
 
+
+# ---------------------------------------------------------------------------
+# KalshiClient tests (unchanged)
+# ---------------------------------------------------------------------------
 
 class TestKalshiClient:
     def test_headers_include_required_fields(self):
@@ -53,79 +57,203 @@ class TestKalshiClient:
             assert call_data["no_price"] == 40
 
 
-class TestKalshiBTCStrategy:
-    @pytest.fixture
-    def oversold_df(self):
-        n = 50
-        close = np.full(n, 87000.0)
-        df = pd.DataFrame({
-            "close": close, "high": close + 100, "low": close - 100,
-            "open": close, "volume": [1000] * n,
-            "rsi": [25.0] * n,  # oversold
-            "bb_lower": [86500.0] * n,
-            "bb_middle": [87000.0] * n,
-            "bb_upper": [87500.0] * n,
-        }, index=pd.date_range("2025-01-01", periods=n, freq="15min"))
-        return df
+# ---------------------------------------------------------------------------
+# KalshiPredictor tests
+# ---------------------------------------------------------------------------
 
-    def test_oversold_recommends_yes(self, oversold_df):
-        strat = KalshiBTCStrategy()
-        market = {
-            "ticker": "KXBTC-TEST-B86000",
-            "yes_ask": 60, "no_ask": 40,
-            "floor_strike": 86000,
-            "_mins_to_expiry": 15,
-        }
-        result = strat.evaluate(oversold_df, market)
-        assert result is not None
-        assert result["side"] == "yes"
-        assert result["edge_cents"] > 0
+def _make_df(n=50, close=87000.0, rsi=50.0, bb_lower=86500.0, bb_middle=87000.0,
+             bb_upper=87500.0, macd_hist=0.0, volume=1000.0, vol_sma_20=1000.0,
+             close_trend=None, rsi_trend=None, macd_hist_trend=None):
+    """Build a synthetic DataFrame for predictor testing.
 
-    def test_overbought_recommends_no(self):
-        n = 50
-        close = np.full(n, 87000.0)
-        df = pd.DataFrame({
-            "close": close, "high": close + 100, "low": close - 100,
-            "open": close, "volume": [1000] * n,
-            "rsi": [78.0] * n,
-            "bb_lower": [86500.0] * n, "bb_middle": [87000.0] * n, "bb_upper": [87500.0] * n,
-        }, index=pd.date_range("2025-01-01", periods=n, freq="15min"))
-        strat = KalshiBTCStrategy()
-        market = {
-            "ticker": "KXBTC-TEST-B87000",
-            "yes_ask": 55, "no_ask": 45,
-            "floor_strike": 87000,
-            "_mins_to_expiry": 15,
-        }
-        result = strat.evaluate(df, market)
-        assert result is not None
-        assert result["side"] == "no"
+    close_trend: list of last N close values (overrides tail of close column)
+    rsi_trend:   list of last N RSI values (overrides tail of rsi column)
+    macd_hist_trend: list of last N MACD histogram values
+    """
+    closes = np.full(n, close)
+    rsis = np.full(n, rsi)
+    macd_hists = np.full(n, macd_hist)
+    volumes = np.full(n, volume)
 
-    def test_neutral_rsi_no_bet(self):
-        n = 50
-        close = np.full(n, 87000.0)
-        df = pd.DataFrame({
-            "close": close, "high": close + 100, "low": close - 100,
-            "open": close, "volume": [1000] * n,
-            "rsi": [50.0] * n,
-            "bb_lower": [86500.0] * n, "bb_middle": [87000.0] * n, "bb_upper": [87500.0] * n,
-        }, index=pd.date_range("2025-01-01", periods=n, freq="15min"))
-        strat = KalshiBTCStrategy()
-        market = {
-            "ticker": "KXBTC-TEST-B87000",
-            "yes_ask": 50, "no_ask": 50,
-            "floor_strike": 87000, "_mins_to_expiry": 15,
-        }
-        result = strat.evaluate(df, market)
-        assert result is None
+    if close_trend is not None:
+        for i, v in enumerate(close_trend):
+            closes[n - len(close_trend) + i] = v
+    if rsi_trend is not None:
+        for i, v in enumerate(rsi_trend):
+            rsis[n - len(rsi_trend) + i] = v
+    if macd_hist_trend is not None:
+        for i, v in enumerate(macd_hist_trend):
+            macd_hists[n - len(macd_hist_trend) + i] = v
 
-    def test_too_close_to_expiry_no_bet(self, oversold_df):
-        strat = KalshiBTCStrategy()
-        market = {
-            "ticker": "KXBTC-TEST-B86000",
-            "yes_ask": 60, "no_ask": 40,
-            "floor_strike": 86000,
-            "_mins_to_expiry": 3,  # too close
-        }
-        result = strat.evaluate(oversold_df, market)
-        assert result is None
+    df = pd.DataFrame({
+        "close": closes,
+        "high": closes + 100,
+        "low": closes - 100,
+        "open": closes,
+        "volume": volumes,
+        "rsi": rsis,
+        "bb_lower": np.full(n, bb_lower),
+        "bb_middle": np.full(n, bb_middle),
+        "bb_upper": np.full(n, bb_upper),
+        "macd_hist": macd_hists,
+        "vol_sma_20": np.full(n, vol_sma_20),
+    }, index=pd.date_range("2025-01-01", periods=n, freq="15min"))
+    return df
+
+
+class TestKalshiPredictor:
+    """Tests for the multi-signal confidence scorer."""
+
+    def test_oversold_rsi_below_bb_gives_high_up_confidence(self):
+        """RSI < 25 (30 pts) + price below BB lower (20 pts) = strong UP."""
+        df = _make_df(rsi=22.0, close=86400.0, bb_lower=86500.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+
+        assert signal is not None
+        assert signal.direction == "UP"
+        # RSI < 25 = 30pts, price < bb_lower = 20pts = at least 50
+        assert signal.confidence >= 50
+        assert signal.components["rsi"]["up"] == 30
+        assert signal.components["bb"]["up"] == 20
+
+    def test_overbought_rsi_above_bb_gives_high_down_confidence(self):
+        """RSI > 75 (30 pts) + price above BB upper (20 pts) = strong DOWN."""
+        df = _make_df(rsi=78.0, close=87600.0, bb_upper=87500.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+
+        assert signal is not None
+        assert signal.direction == "DOWN"
+        assert signal.confidence >= 50
+        assert signal.components["rsi"]["down"] == 30
+        assert signal.components["bb"]["down"] == 20
+
+    def test_neutral_rsi_gives_low_or_no_confidence(self):
+        """RSI at 50 should generate zero RSI points."""
+        df = _make_df(rsi=50.0, close=87000.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+
+        # With neutral RSI and price in middle of BB, might be None or very low
+        if signal is not None:
+            assert signal.confidence < 20
+            assert signal.components["rsi"]["up"] == 0
+            assert signal.components["rsi"]["down"] == 0
+
+    def test_all_components_contribute(self):
+        """Every signal component fires for a perfect UP setup."""
+        # RSI < 25 = 30, BB below = 20, MACD hist positive+increasing = 15,
+        # Volume 2x = 10, Momentum 3 green candles = 15, RSI trend recovering = 10
+        df = _make_df(
+            rsi=22.0,
+            close=86400.0,
+            bb_lower=86500.0,
+            macd_hist=5.0,
+            volume=2500.0,
+            vol_sma_20=1000.0,
+            # 3 ascending closes for momentum
+            close_trend=[86200.0, 86300.0, 86350.0, 86400.0],
+            # MACD hist increasing
+            macd_hist_trend=[2.0, 3.0, 4.0, 5.0],
+            # RSI recovering from oversold
+            rsi_trend=[18.0, 19.0, 20.0, 22.0],
+        )
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+
+        assert signal is not None
+        assert signal.direction == "UP"
+        # Check each component contributed
+        assert signal.components["rsi"]["up"] == 30
+        assert signal.components["bb"]["up"] == 20
+        assert signal.components["macd"]["up"] == 15
+        assert signal.components["volume"]["score"] == 10
+        assert signal.components["momentum"]["up"] == 15
+        assert signal.components["rsi_trend"]["up"] == 10
+        # Total = 30 + 20 + 15 + 10 + 15 + 10 = 100
+        assert signal.confidence == 100
+
+    def test_confidence_capped_at_100(self):
+        """Even with extreme signals, confidence does not exceed 100."""
+        df = _make_df(
+            rsi=15.0,
+            close=86000.0,
+            bb_lower=86500.0,
+            macd_hist=10.0,
+            volume=3000.0,
+            vol_sma_20=1000.0,
+            close_trend=[85800.0, 85900.0, 85950.0, 86000.0],
+            macd_hist_trend=[5.0, 7.0, 8.0, 10.0],
+            rsi_trend=[10.0, 12.0, 13.0, 15.0],
+        )
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+
+        assert signal is not None
+        assert signal.confidence <= 100
+
+    def test_insufficient_data_returns_none(self):
+        """Fewer than 20 candles should return None."""
+        df = _make_df(n=10)
+        predictor = KalshiPredictor()
+        assert predictor.score(df) is None
+
+    def test_none_dataframe_returns_none(self):
+        predictor = KalshiPredictor()
+        assert predictor.score(None) is None
+
+    def test_macd_negative_decreasing_gives_down(self):
+        """MACD histogram negative and decreasing = 15 DOWN points."""
+        df = _make_df(
+            rsi=72.0,  # mild overbought for 20 pts
+            macd_hist=-5.0,
+            macd_hist_trend=[-2.0, -3.0, -4.0, -5.0],
+        )
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+
+        assert signal is not None
+        assert signal.direction == "DOWN"
+        assert signal.components["macd"]["down"] == 15
+
+    def test_volume_confirms_dominant_direction(self):
+        """High volume adds to whichever direction is already winning."""
+        df = _make_df(
+            rsi=22.0,  # strong oversold UP
+            volume=2500.0,
+            vol_sma_20=1000.0,
+        )
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+
+        assert signal is not None
+        assert signal.direction == "UP"
+        # Volume 2.5x avg = 10 pts, added to UP since UP is dominant
+        assert signal.components["volume"]["score"] == 10
+
+    def test_momentum_three_red_candles(self):
+        """Three consecutive down candles give 15 DOWN momentum points."""
+        df = _make_df(
+            rsi=68.0,  # mild overbought = 10 DOWN pts
+            close_trend=[87300.0, 87200.0, 87100.0, 87000.0],
+        )
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+
+        assert signal is not None
+        assert signal.direction == "DOWN"
+        assert signal.components["momentum"]["down"] == 15
+
+    def test_signal_dataclass_fields(self):
+        """KalshiSignal has all required fields."""
+        sig = KalshiSignal(
+            asset="BTC", direction="UP", confidence=65.0,
+            components={"rsi": {"up": 20}}, price=87000.0, rsi=28.0,
+        )
+        assert sig.asset == "BTC"
+        assert sig.direction == "UP"
+        assert sig.confidence == 65.0
+        assert sig.price == 87000.0
+        assert sig.rsi == 28.0
+        assert "rsi" in sig.components
