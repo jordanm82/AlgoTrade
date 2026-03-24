@@ -37,6 +37,16 @@ from risk.manager import RiskManager
 # Pairs eligible for RSI Mean Reversion strategy
 RSI_MR_PAIRS = ["ATOM/USDT", "FIL/USDT"]
 
+# Pairs eligible for funding rate arbitrage (Coinbase perps)
+FUNDING_ARB_PERPS = {
+    "BTC-PERP-INTX": "BTC/USDT",
+    "ETH-PERP-INTX": "ETH/USDT",
+    "SOL-PERP-INTX": "SOL/USDT",
+}
+# Funding rate thresholds
+FUNDING_HIGH_THRESHOLD = 0.0003   # 0.03% per hour = ~26% annualized
+FUNDING_LOW_THRESHOLD = -0.0001   # -0.01% per hour
+
 # Intervals in seconds
 TICK_INTERVAL = 60       # price update + stop enforcement
 SIGNAL_INTERVAL = 900    # 15 minutes — matches candle timeframe
@@ -277,6 +287,67 @@ class LiveDaemon:
 
         return signals
 
+    def _funding_arb_signals(self) -> list[dict]:
+        """Check funding rates on Coinbase perps for arb opportunities."""
+        signals = []
+        try:
+            from coinbase.rest import RESTClient
+            client = RESTClient()  # no auth needed for public product data
+            for perp_sym, spot_sym in FUNDING_ARB_PERPS.items():
+                try:
+                    product = client.get_public_product(perp_sym)
+                    details = product.get("future_product_details") or {}
+                    perp_details = details.get("perpetual_details") or {}
+                    rate_str = perp_details.get("funding_rate", "0")
+                    rate = float(rate_str)
+                    # Coinbase uses 1-hour funding intervals
+                    annualized = rate * 24 * 365 * 100
+
+                    coinbase_spot = spot_sym.replace("/USDT", "-USD")
+                    price = self._live_prices.get(spot_sym, 0) if hasattr(self, '_live_prices') else 0
+                    if price == 0:
+                        df = self._dataframes.get(spot_sym)
+                        if df is not None and len(df) > 0:
+                            price = float(df.iloc[-1]["close"])
+
+                    if rate > FUNDING_HIGH_THRESHOLD:
+                        # Longs paying shorts — long spot, short perp to collect
+                        signals.append({
+                            "symbol": spot_sym,
+                            "coinbase_symbol": coinbase_spot,
+                            "action": "BUY",
+                            "strategy": f"funding_arb ({annualized:.0f}% ann)",
+                            "leverage": 1,
+                            "price": price,
+                            "rsi": 50,  # neutral — not RSI-driven
+                            "stop": price * 0.97,
+                            "take_profit": price * 1.03,
+                            "atr": 0,
+                            "funding_rate": rate,
+                            "annualized_pct": annualized,
+                        })
+                    elif rate < FUNDING_LOW_THRESHOLD:
+                        # Shorts paying longs — long perp, short spot
+                        signals.append({
+                            "symbol": spot_sym,
+                            "coinbase_symbol": coinbase_spot,
+                            "action": "SHORT",
+                            "strategy": f"funding_arb ({annualized:.0f}% ann)",
+                            "leverage": 1,
+                            "price": price,
+                            "rsi": 50,
+                            "stop": price * 1.03,
+                            "take_profit": price * 0.97,
+                            "atr": 0,
+                            "funding_rate": rate,
+                            "annualized_pct": annualized,
+                        })
+                except Exception as e:
+                    print(colored(f"  [WARN] Funding rate fetch failed for {perp_sym}: {e}", "yellow"))
+        except ImportError:
+            pass
+        return signals
+
     def _signal_confidence(self, sig: dict) -> float:
         """Score a signal's confidence for priority ranking.
         Higher = more confident. Used to decide which signals get the limited slots."""
@@ -294,6 +365,10 @@ class LiveDaemon:
         if sig.get("symbol", "") in LEVERAGE_PAIRS:
             score += 10
 
+        # Funding arb gets a high score (delta-neutral, lowest risk)
+        if "funding_arb" in sig.get("strategy", ""):
+            score += 25
+
         # Close signals always take priority (protect capital)
         if "CLOSE" in action:
             score += 100
@@ -308,6 +383,8 @@ class LiveDaemon:
         for symbol, df in self._dataframes.items():
             all_signals.extend(self._bb_grid_signals(symbol, df))
             all_signals.extend(self._rsi_mr_signals(symbol, df))
+        # Add funding rate arb signals
+        all_signals.extend(self._funding_arb_signals())
 
         # Score and sort: closes first, then highest confidence
         for sig in all_signals:
