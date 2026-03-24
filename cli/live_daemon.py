@@ -809,7 +809,11 @@ class LiveDaemon:
             # Execute: perp short via Coinbase
             perp_sym = coinbase_sym.replace("-USD", "-PERP-INTX")
             base_size = size_usd / price if price > 0 else 0
-            result = self.executor.open_perp_short(perp_sym, base_size, leverage)
+            try:
+                result = self.executor.open_perp_short(perp_sym, base_size, leverage)
+            except Exception as e:
+                print(colored(f"  [FAIL] SHORT {perp_sym}: {e}", "red"))
+                return
             if result.get("success") or result.get("order_id") or result.get("success_response"):
                 self.tracker.open(pos_key, "SELL", size_usd, price, stop, take_profit)
                 self._trades_today += 1
