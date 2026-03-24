@@ -50,8 +50,42 @@ class Dashboard:
         self._live_prices: dict[str, float] = {}
         # Timestamp of last signal cycle (for indicator freshness label)
         self._last_signal_time: datetime | None = None
+        # Live account balances
+        self._coinbase_balance: float = 0.0
+        self._kalshi_balance: float = 0.0
+        self._start_coinbase: float = 0.0
+        self._start_kalshi: float = 0.0
+        self._fetch_account_balances()
+        self._start_coinbase = self._coinbase_balance
+        self._start_kalshi = self._kalshi_balance
 
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    def _fetch_account_balances(self):
+        """Fetch live balances from both Coinbase and Kalshi."""
+        # Coinbase
+        try:
+            if self.daemon.executor:
+                balances = self.daemon.executor.get_balances()
+                self._coinbase_balance = sum(balances.values())
+            elif self.dry_run:
+                self._coinbase_balance = self.daemon._equity
+        except Exception:
+            pass  # keep last known
+
+        # Kalshi
+        try:
+            from exchange.kalshi import KalshiClient
+            from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
+            client = KalshiClient(
+                api_key_id=KALSHI_API_KEY_ID,
+                private_key_path=str(KALSHI_KEY_FILE),
+                demo=self.dry_run,
+            )
+            resp = client.get_balance()
+            self._kalshi_balance = resp.get("balance", 0) / 100  # cents to dollars
+        except Exception:
+            pass  # keep last known
 
     def _fmt_price(self, price: float) -> str:
         """Format price with appropriate precision for micro-priced tokens."""
@@ -132,7 +166,7 @@ class Dashboard:
             "",
             "=" * 78,
             f"  MODE: {mode}          {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
-            f"  EQUITY: ${self._start_equity:,.2f}",
+            f"  COINBASE: ${self._start_coinbase:,.2f}  |  KALSHI: ${self._start_kalshi:,.2f}  |  TOTAL: ${self._start_coinbase + self._start_kalshi:,.2f}",
             f"  MAX CYCLES: {self.max_cycles}  (~{self.max_cycles * 15} minutes)",
             "=" * 78,
             "",
@@ -168,9 +202,11 @@ class Dashboard:
         m = int((uptime.total_seconds() % 3600) // 60)
 
         mode = "DRY" if self.dry_run else "LIVE"
+
+        # Refresh account balances every tick
+        self._fetch_account_balances()
+
         equity = self.daemon._equity
-        pnl = self.daemon._pnl_today
-        pnl_pct = (equity - self._start_equity) / self._start_equity * 100 if self._start_equity > 0 else 0
         positions = self.daemon.tracker.open_positions()
         exposure = self.daemon.tracker.total_exposure()
         closed = self.daemon.tracker.closed_trades()
@@ -178,6 +214,21 @@ class Dashboard:
         losses = sum(1 for t in closed if t.get("pnl_usd", 0) <= 0)
         total = wins + losses
         wr = (wins / total * 100) if total > 0 else 0
+
+        # Daily P&L: realized (closed trades) + unrealized (open positions)
+        realized_pnl = sum(t.get("pnl_usd", 0) for t in closed)
+        unrealized_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
+        total_pnl = realized_pnl + unrealized_pnl
+
+        # Coinbase P&L from account balance change
+        cb_pnl = self._coinbase_balance - self._start_coinbase
+        # Kalshi P&L from account balance change
+        kl_pnl = self._kalshi_balance - self._start_kalshi
+        # Combined
+        combined_balance = self._coinbase_balance + self._kalshi_balance
+        combined_start = self._start_coinbase + self._start_kalshi
+        combined_pnl = combined_balance - combined_start + unrealized_pnl
+        combined_pct = (combined_pnl / combined_start * 100) if combined_start > 0 else 0
 
         label = f"Cycle {self._cycle_count}/{self.max_cycles}" if is_signal_cycle else f"Tick {self._tick_count}"
 
@@ -187,9 +238,9 @@ class Dashboard:
             f"  ALGOTRADE [{mode}]  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  {label}  |  Up {h}h{m}m",
             "=" * 78,
             "",
-            f"  EQUITY: ${equity:,.2f}  |  P&L: ${pnl:+,.2f} ({pnl_pct:+.2f}%)",
-            f"  POSITIONS: {len(positions)}/{MAX_CONCURRENT_POSITIONS}  |  EXPOSURE: ${exposure:,.2f}",
-            f"  TRADES: {total}  |  W:{wins} L:{losses}  |  WIN RATE: {wr:.1f}%",
+            f"  COINBASE: ${self._coinbase_balance:,.2f} ({cb_pnl:+,.2f})  |  KALSHI: ${self._kalshi_balance:,.2f} ({kl_pnl:+,.2f})  |  COMBINED: ${combined_balance:,.2f}",
+            f"  DAILY P&L: ${combined_pnl:+,.2f} ({combined_pct:+.2f}%)  |  Realized: ${realized_pnl:+,.2f}  |  Unrealized: ${unrealized_pnl:+,.2f}",
+            f"  POSITIONS: {len(positions)}/{MAX_CONCURRENT_POSITIONS}  |  EXPOSURE: ${exposure:,.2f}  |  TRADES: {total} (W:{wins} L:{losses} WR:{wr:.0f}%)",
             "",
         ]
 
