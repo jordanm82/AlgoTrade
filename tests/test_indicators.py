@@ -20,6 +20,12 @@ class TestIndicators:
         assert "macd_signal" in df.columns
         assert "macd_hist" in df.columns
 
+    def test_macd_hist_equals_macd_minus_signal(self, sample_ohlcv):
+        df = add_indicators(sample_ohlcv)
+        valid = df[["macd", "macd_signal", "macd_hist"]].dropna()
+        expected_hist = valid["macd"] - valid["macd_signal"]
+        assert (abs(valid["macd_hist"] - expected_hist) < 1e-10).all()
+
     def test_adds_bollinger_bands(self, sample_ohlcv):
         df = add_indicators(sample_ohlcv)
         assert "bb_upper" in df.columns

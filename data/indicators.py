@@ -19,8 +19,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # MACD
     macd = ta.macd(out["close"], fast=12, slow=26, signal=9)
     out["macd"] = macd.iloc[:, 0]
-    out["macd_signal"] = macd.iloc[:, 1]
-    out["macd_hist"] = macd.iloc[:, 2]
+    out["macd_hist"] = macd.iloc[:, 1]
+    out["macd_signal"] = macd.iloc[:, 2]
 
     # Bollinger Bands
     bbands = ta.bbands(out["close"], length=20, std=2)
