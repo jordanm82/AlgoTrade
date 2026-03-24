@@ -6,7 +6,7 @@ from config.settings import DEFAULT_CANDLE_LIMIT, CDP_KEY_FILE
 
 class DataFetcher:
     def __init__(self):
-        self._spot = ccxt.binance({"enableRateLimit": True})
+        self._spot = ccxt.binanceus({"enableRateLimit": True})
         self._futures = ccxt.binanceusdm({"enableRateLimit": True})
         self._coinbase = None  # lazy init
 

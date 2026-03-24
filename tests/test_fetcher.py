@@ -13,7 +13,7 @@ class TestBinanceData:
         with patch("data.fetcher.ccxt") as mock_ccxt:
             mock_exchange = MagicMock()
             mock_exchange.fetch_ohlcv.return_value = mock_data
-            mock_ccxt.binance.return_value = mock_exchange
+            mock_ccxt.binanceus.return_value = mock_exchange
 
             fetcher = DataFetcher()
             df = fetcher.ohlcv("BTC/USDT", "1h", limit=2, source="binance")
@@ -56,7 +56,7 @@ class TestBinanceData:
         with patch("data.fetcher.ccxt") as mock_ccxt:
             mock_exchange = MagicMock()
             mock_exchange.fetch_ticker.return_value = mock_ticker
-            mock_ccxt.binance.return_value = mock_exchange
+            mock_ccxt.binanceus.return_value = mock_exchange
 
             fetcher = DataFetcher()
             ticker = fetcher.ticker("BTC/USDT", source="binance")
@@ -73,7 +73,7 @@ class TestBinanceData:
         with patch("data.fetcher.ccxt") as mock_ccxt:
             mock_exchange = MagicMock()
             mock_exchange.fetch_order_book.return_value = mock_book
-            mock_ccxt.binance.return_value = mock_exchange
+            mock_ccxt.binanceus.return_value = mock_exchange
 
             fetcher = DataFetcher()
             book = fetcher.order_book("BTC/USDT", depth=2, source="binance")
