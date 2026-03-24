@@ -1,23 +1,33 @@
-# Coinbase tradeable pairs
+# BinanceUS pairs for data (spot)
+BINANCE_SPOT_PAIRS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT",
+    "ADA/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT", "SHIB/USDT",
+    "LTC/USDT", "UNI/USDT", "ATOM/USDT", "FIL/USDT", "MATIC/USDT",
+]
+
+# Coinbase tradeable pairs (spot)
 SPOT_PAIRS = [
-    "BTC-USD",
-    "ETH-USD",
-    "SOL-USD",
+    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD",
+    "ADA-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "SHIB-USD",
+    "LTC-USD", "UNI-USD", "ATOM-USD", "FIL-USD", "MATIC-USD",
 ]
 
+# Coinbase perp pairs
 PERP_PAIRS = [
-    "BTC-PERP-INTX",
-    "ETH-PERP-INTX",
-    "SOL-PERP-INTX",
+    "BTC-PERP-INTX", "ETH-PERP-INTX", "SOL-PERP-INTX",
 ]
 
-# Binance symbols for broader data (mapped to Coinbase equivalents)
-BINANCE_SPOT = {
-    "BTC/USDT": "BTC-USD",
-    "ETH/USDT": "ETH-USD",
-    "SOL/USDT": "SOL-USD",
+# Mapping: binanceus symbol -> coinbase symbol
+BINANCE_TO_COINBASE = {
+    "BTC/USDT": "BTC-USD", "ETH/USDT": "ETH-USD", "SOL/USDT": "SOL-USD",
+    "XRP/USDT": "XRP-USD", "DOGE/USDT": "DOGE-USD", "ADA/USDT": "ADA-USD",
+    "AVAX/USDT": "AVAX-USD", "LINK/USDT": "LINK-USD", "DOT/USDT": "DOT-USD",
+    "SHIB/USDT": "SHIB-USD", "LTC/USDT": "LTC-USD", "UNI/USDT": "UNI-USD",
+    "ATOM/USDT": "ATOM-USD", "FIL/USDT": "FIL-USD", "MATIC/USDT": "MATIC-USD",
 }
 
+# Legacy aliases
+BINANCE_SPOT = BINANCE_TO_COINBASE
 BINANCE_FUTURES = {
     "BTC/USDT:USDT": "BTC-PERP-INTX",
     "ETH/USDT:USDT": "ETH-PERP-INTX",
