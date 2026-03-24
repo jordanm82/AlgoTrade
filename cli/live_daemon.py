@@ -392,9 +392,13 @@ class LiveDaemon:
         return score
 
     def _collect_all_signals(self) -> list[dict]:
-        """Collect all signals, score by confidence, sort highest first."""
+        """Collect all signals, score by confidence, sort highest first.
+        Only iterates Coinbase trading pairs (ALL_PAIRS), not Kalshi-only pairs."""
         all_signals = []
-        for symbol, df in self._dataframes.items():
+        for symbol in ALL_PAIRS:
+            df = self._dataframes.get(symbol)
+            if df is None or len(df) < 20:
+                continue
             all_signals.extend(self._bb_grid_signals(symbol, df))
             all_signals.extend(self._rsi_mr_signals(symbol, df))
         # Add funding rate arb signals
