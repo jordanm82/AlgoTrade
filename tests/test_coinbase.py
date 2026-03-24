@@ -19,7 +19,7 @@ class TestCoinbaseExecutor:
         mock_client.market_order_buy.assert_called_once()
         call_kwargs = mock_client.market_order_buy.call_args
         assert call_kwargs.kwargs["product_id"] == "BTC-USD"
-        assert call_kwargs.kwargs["quote_size"] == "500.0"
+        assert call_kwargs.kwargs["quote_size"] == "500.00"
         assert result["success"] is True
 
     def test_market_sell_spot(self, mock_client):
@@ -30,7 +30,7 @@ class TestCoinbaseExecutor:
         result = executor.market_sell("BTC-USD", 0.01)
         mock_client.market_order_sell.assert_called_once()
         call_kwargs = mock_client.market_order_sell.call_args
-        assert call_kwargs.kwargs["base_size"] == "0.01"
+        assert call_kwargs.kwargs["base_size"] == "0.01000000"
 
     def test_open_perp_long(self, mock_client):
         mock_client.market_order_buy.return_value = MagicMock(
