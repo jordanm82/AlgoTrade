@@ -105,28 +105,13 @@ class Dashboard:
         total = wins + losses
         wr = (wins / total * 100) if total > 0 else 0
 
-        if not is_signal_cycle:
-            # Compact 1-minute tick status
-            pnl_c = colored(f"${pnl:+,.2f}", "green" if pnl >= 0 else "red")
-            pos_str = f"{len(positions)}/{MAX_CONCURRENT_POSITIONS}"
+        # Signal cycles show "SIGNAL CYCLE" in header, tick updates show "TICK"
+        cycle_label = f"Cycle {self._cycle_count}/{self.max_cycles}" if is_signal_cycle else f"Tick {self._tick_count}"
 
-            # Show mini position P&L
-            pos_detail = ""
-            for p in positions:
-                sym_short = p["symbol"].split(":")[0].replace("-USD", "")
-                upnl = p["unrealized_pnl"]
-                c = "+" if upnl >= 0 else ""
-                pos_detail += f" {sym_short}:{c}{upnl:.2f}"
-
-            print(f"[{mode}] {now.strftime('%H:%M')} | eq=${equity:,.0f} pnl={pnl_c} | "
-                  f"pos={pos_str} exp=${exposure:,.0f} | "
-                  f"trades={total} wr={wr:.0f}% |{pos_detail}")
-            return
-
-        # Full dashboard on signal cycles
+        # Full dashboard (every tick and every signal cycle)
         print(f"""
 {'='*78}
-  ALGOTRADE [{mode}]  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  Cycle {self._cycle_count}/{self.max_cycles}  |  Up {h}h{m}m
+  ALGOTRADE [{mode}]  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  {cycle_label}  |  Up {h}h{m}m
 {'='*78}
 
   EQUITY: ${equity:,.2f}  |  P&L: ${pnl:+,.2f} ({pnl_pct:+.2f}%)
@@ -173,8 +158,8 @@ class Dashboard:
                 pnl_c = colored(f"${upnl:+.2f}", "green" if upnl >= 0 else "red")
                 print(f"  {key:<32} {side:<14} ${p['entry_price']:>9.4f} ${p['current_price']:>9.4f} {pnl_c:>19} ${p['stop_price']:>9.4f}")
 
-        # Signals
-        sigs = signals or []
+        # Signals (show current cycle signals, or last known signals on ticks)
+        sigs = signals if is_signal_cycle else self._last_signals
         if sigs:
             print(f"\n  SIGNALS THIS CYCLE ({len(sigs)}):")
             for s in sigs[-8:]:
@@ -203,7 +188,11 @@ class Dashboard:
                 print(f"    {sym:<25} {side:<5} {pnl_c}")
 
         remaining = self.max_cycles - self._cycle_count
-        print(f"\n  Next cycle in ~15 min | {remaining} cycles remaining")
+        if is_signal_cycle:
+            print(f"\n  Next signal cycle in ~15 min | {remaining} cycles remaining")
+        else:
+            mins_to_cycle = 15 - (self._tick_count % 15)
+            print(f"\n  Next signal cycle in ~{mins_to_cycle} min | {remaining} cycles remaining")
         print(f"{'='*78}")
         sys.stdout.flush()
 
@@ -278,14 +267,14 @@ class Dashboard:
             if self._cycle_count >= self.max_cycles:
                 break
 
-            # Wait ~15 minutes with 1-minute tick updates
+            # Wait ~15 minutes with 1-minute full dashboard redraws
             for tick in range(15):
                 if not self.daemon._running:
                     break
                 time.sleep(60)
                 self._tick_count += 1
                 self.daemon.tick()
-                self._draw_status(is_signal_cycle=False)
+                self._draw_status(is_signal_cycle=False, signals=None)
 
         # Final summary
         self._draw_final()
