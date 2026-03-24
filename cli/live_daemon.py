@@ -903,6 +903,55 @@ class LiveDaemon:
             except Exception as e:
                 print(colored(f"  [WARN] Price update failed for {pos_key}: {e}", "yellow"))
 
+    def _check_profit_taking(self):
+        """Check profit-taking levels on all open positions."""
+        for pos_key, pos in list(self.tracker._positions.items()):
+            actions = pos.check_profit_taking()
+            for action in actions:
+                if action["action"] == "partial_sell":
+                    pct = action["pct"]
+                    reason = action["reason"]
+                    usd_to_sell = pos.reduce_size(pct)
+
+                    # In live mode, execute partial sell
+                    coinbase_sym = pos_key.split(":")[0]
+                    if not self.dry_run and self.executor:
+                        base_to_sell = usd_to_sell / pos.current_price if pos.current_price > 0 else 0
+                        if pos.side == "BUY":
+                            self.executor.market_sell(coinbase_sym, base_to_sell)
+                        # For shorts, partial close is more complex -- skip for now
+
+                    self._pnl_today += (pos.current_price - pos.entry_price) / pos.entry_price * usd_to_sell
+                    print(colored(f"  [TP] {pos_key} {reason} — sold {pct}% (${usd_to_sell:.2f})", "green"))
+                    self.store.append_trade({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "symbol": coinbase_sym, "side": "PARTIAL_SELL",
+                        "size_usd": usd_to_sell, "price": pos.current_price,
+                        "pnl": (pos.current_price - pos.entry_price) / pos.entry_price * usd_to_sell,
+                        "source": "profit_taking",
+                    })
+
+                elif action["action"] == "trailing_stop":
+                    reason = action["reason"]
+                    print(colored(f"  [TRAIL] {pos_key} {reason}", "yellow"))
+                    # Close remaining position
+                    closed = self.tracker.close(pos_key, pos.current_price)
+                    # Execute sell
+                    coinbase_sym = pos_key.split(":")[0]
+                    if not self.dry_run and self.executor:
+                        base_size = pos.size_usd / pos.current_price if pos.current_price > 0 else 0
+                        if pos.side == "BUY":
+                            self.executor.market_sell(coinbase_sym, base_size)
+                    self._pnl_today += closed.get("pnl_usd", 0)
+                    self.store.append_trade({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "symbol": coinbase_sym, "side": "TRAILING_STOP",
+                        "size_usd": pos.size_usd, "price": pos.current_price,
+                        "pnl": closed.get("pnl_usd", 0),
+                        "source": "trailing_stop",
+                    })
+                    break  # position is closed, stop iterating actions
+
     def _enforce_stops(self):
         """Check and execute stop-losses."""
         stopped = self.tracker.check_stops()
@@ -1072,9 +1121,10 @@ class LiveDaemon:
         return signals
 
     def tick(self):
-        """Minute tick: update prices, enforce stops."""
+        """Minute tick: update prices, enforce stops, check profit taking."""
         self._update_prices()
         self._enforce_stops()
+        self._check_profit_taking()
         self._update_equity()
 
     def run(self):

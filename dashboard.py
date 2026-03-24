@@ -224,10 +224,11 @@ class Dashboard:
         cb_pnl = self._coinbase_balance - self._start_coinbase
         # Kalshi P&L from account balance change
         kl_pnl = self._kalshi_balance - self._start_kalshi
-        # Combined
-        combined_balance = self._coinbase_balance + self._kalshi_balance
+        # Proper P&L: account balance + position value (not just cash)
+        position_value = sum(p.get("size_usd", 0) + p.get("unrealized_pnl", 0) for p in positions)
         combined_start = self._start_coinbase + self._start_kalshi
-        combined_pnl = combined_balance - combined_start + unrealized_pnl
+        total_value = self._coinbase_balance + self._kalshi_balance + position_value
+        combined_pnl = total_value - combined_start
         combined_pct = (combined_pnl / combined_start * 100) if combined_start > 0 else 0
 
         label = f"Cycle {self._cycle_count}/{self.max_cycles}" if is_signal_cycle else f"Tick {self._tick_count}"
@@ -238,7 +239,7 @@ class Dashboard:
             f"  ALGOTRADE [{mode}]  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  {label}  |  Up {h}h{m}m",
             "=" * 78,
             "",
-            f"  COINBASE: ${self._coinbase_balance:,.2f} ({cb_pnl:+,.2f})  |  KALSHI: ${self._kalshi_balance:,.2f} ({kl_pnl:+,.2f})  |  COMBINED: ${combined_balance:,.2f}",
+            f"  COINBASE: ${self._coinbase_balance:,.2f} + positions ${position_value:,.2f}  |  KALSHI: ${self._kalshi_balance:,.2f}  |  TOTAL: ${total_value:,.2f}",
             f"  DAILY P&L: ${combined_pnl:+,.2f} ({combined_pct:+.2f}%)  |  Realized: ${realized_pnl:+,.2f}  |  Unrealized: ${unrealized_pnl:+,.2f}",
             f"  POSITIONS: {len(positions)}/{MAX_CONCURRENT_POSITIONS}  |  EXPOSURE: ${exposure:,.2f}  |  TRADES: {total} (W:{wins} L:{losses} WR:{wr:.0f}%)",
             "",
