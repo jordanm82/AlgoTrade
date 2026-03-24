@@ -339,7 +339,16 @@ class LiveDaemon:
                     f"size=${size_usd:.0f} stop=${stop:.4f}",
                     "green",
                 ))
-                return
+                # Still track the position for dry-run simulation
+                self.tracker.open(pos_key, "BUY", size_usd, price, stop, take_profit)
+                self._trades_today += 1
+                self.store.append_trade({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": coinbase_sym, "side": "BUY", "strategy": strategy,
+                    "size_usd": size_usd, "price": price, "stop": stop,
+                    "leverage": leverage, "source": "live_daemon_dry",
+                })
+                return  # skip exchange execution only
 
             # Execute: spot buy via Coinbase
             result = self.executor.market_buy(coinbase_sym, size_usd)
@@ -395,7 +404,16 @@ class LiveDaemon:
                     f"size=${size_usd:.0f} stop=${stop:.4f}",
                     "red",
                 ))
-                return
+                # Still track the position for dry-run simulation
+                self.tracker.open(pos_key, "SELL", size_usd, price, stop, take_profit)
+                self._trades_today += 1
+                self.store.append_trade({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": coinbase_sym, "side": "SHORT", "strategy": strategy,
+                    "size_usd": size_usd, "price": price, "stop": stop,
+                    "leverage": leverage, "source": "live_daemon_dry",
+                })
+                return  # skip exchange execution only
 
             # Execute: perp short via Coinbase
             perp_sym = coinbase_sym.replace("-USD", "-PERP-INTX")
@@ -432,7 +450,23 @@ class LiveDaemon:
                     f"RSI={sig.get('rsi', 0):.1f} | {strategy}",
                     "cyan",
                 ))
-                return
+                # Still close in tracker for dry-run bookkeeping
+                closed = self.tracker.close(pos_key, price)
+                pnl = closed.get("pnl_usd", 0)
+                self._pnl_today += pnl
+                self._trades_today += 1
+                self.store.append_trade({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": coinbase_sym, "side": "CLOSE_LONG", "strategy": strategy,
+                    "size_usd": closed.get("size_usd", 0), "price": price,
+                    "pnl": pnl, "source": "live_daemon_dry",
+                })
+                pnl_color = "green" if pnl >= 0 else "red"
+                print(colored(
+                    f"  [DRY-RUN P&L] {coinbase_sym} ${pnl:+.2f}",
+                    pnl_color,
+                ))
+                return  # skip exchange execution only
 
             # Get position details before closing
             positions = self.tracker.open_positions()
@@ -472,7 +506,23 @@ class LiveDaemon:
                     f"RSI={sig.get('rsi', 0):.1f} | {strategy}",
                     "cyan",
                 ))
-                return
+                # Still close in tracker for dry-run bookkeeping
+                closed = self.tracker.close(pos_key, price)
+                pnl = closed.get("pnl_usd", 0)
+                self._pnl_today += pnl
+                self._trades_today += 1
+                self.store.append_trade({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": coinbase_sym, "side": "COVER", "strategy": strategy,
+                    "size_usd": closed.get("size_usd", 0), "price": price,
+                    "pnl": pnl, "source": "live_daemon_dry",
+                })
+                pnl_color = "green" if pnl >= 0 else "red"
+                print(colored(
+                    f"  [DRY-RUN P&L] {coinbase_sym} ${pnl:+.2f}",
+                    pnl_color,
+                ))
+                return  # skip exchange execution only
 
             positions = self.tracker.open_positions()
             pos = next((p for p in positions if p["symbol"] == pos_key), None)

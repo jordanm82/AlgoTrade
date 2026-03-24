@@ -15,6 +15,7 @@ import argparse
 import io
 import signal
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,8 +44,40 @@ class Dashboard:
         self._last_signals: list[dict] = []
         # Live ticker prices updated every minute
         self._live_prices: dict[str, float] = {}
+        # Timestamp of last signal cycle (for indicator freshness label)
+        self._last_signal_time: datetime | None = None
 
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    def _fmt_price(self, price: float) -> str:
+        """Format price with appropriate precision for micro-priced tokens."""
+        if price == 0:
+            return "    $0.00"
+        elif price < 0.001:
+            return f"${price:>9.8f}"
+        elif price < 1:
+            return f"${price:>9.6f}"
+        elif price < 100:
+            return f"${price:>9.4f}"
+        else:
+            return f"${price:>9.2f}"
+
+    def _market_regime(self, df: pd.DataFrame) -> str:
+        """Compute market regime from last 96 candles (24h on 15m)."""
+        if df is None or len(df) < 96:
+            return "N/A"
+        closes = df["close"].iloc[-96:]
+        sma_96 = float(closes.mean())
+        current = float(df.iloc[-1]["close"])
+        if sma_96 == 0:
+            return "N/A"
+        pct_diff = (current - sma_96) / sma_96
+        if pct_diff > 0.03:
+            return "TRENDING UP"
+        elif pct_diff < -0.03:
+            return "TRENDING DN"
+        else:
+            return "RANGING"
 
     def _out(self, text: str):
         """Write to both stdout and log file."""
@@ -160,9 +193,19 @@ class Dashboard:
             "",
         ]
 
+        # Indicator freshness label
+        if self._last_signal_time:
+            delta = now - self._last_signal_time
+            mins_ago = int(delta.total_seconds() // 60)
+            mins_to_next = max(0, 15 - mins_ago)
+            lines.append(f"  PRICES: live | INDICATORS: {mins_ago} min ago (next refresh in ~{mins_to_next} min)")
+        else:
+            lines.append(f"  PRICES: live | INDICATORS: pending first cycle")
+        lines.append("")
+
         # Pairs table with LIVE prices
-        lines.append(f"  {'PAIR':<12} {'PRICE':>10} {'RSI':>6} {'BB_LOW':>10} {'BB_MID':>10} {'BB_UP':>10} {'SIGNAL':<16}")
-        lines.append(f"  {'-'*76}")
+        lines.append(f"  {'PAIR':<12} {'PRICE':>10} {'RSI':>6} {'BB_LOW':>10} {'BB_MID':>10} {'BB_UP':>10} {'REGIME':<13} {'SIGNAL':<16}")
+        lines.append(f"  {'-'*91}")
         for sym in MONITORED_PAIRS_15M:
             df = self.daemon._dataframes.get(sym)
             if df is None or len(df) == 0:
@@ -176,6 +219,7 @@ class Dashboard:
             bb_l = float(last.get("bb_lower", 0)) if pd.notna(last.get("bb_lower")) else 0
             bb_m = float(last.get("bb_middle", 0)) if pd.notna(last.get("bb_middle")) else 0
             bb_u = float(last.get("bb_upper", 0)) if pd.notna(last.get("bb_upper")) else 0
+            regime = self._market_regime(df)
 
             sig_str = ""
             if price < bb_l and rsi < 35:
@@ -188,7 +232,11 @@ class Dashboard:
                 sig_str = "! RSI OVERBOUGHT"
 
             lev_tag = " [2x]" if sym in LEVERAGE_PAIRS else ""
-            lines.append(f"  {sym:<12} ${price:>9.4f} {rsi:5.1f} ${bb_l:>9.4f} ${bb_m:>9.4f} ${bb_u:>9.4f} {sig_str}{lev_tag}")
+            price_str = self._fmt_price(price)
+            bb_l_str = self._fmt_price(bb_l)
+            bb_m_str = self._fmt_price(bb_m)
+            bb_u_str = self._fmt_price(bb_u)
+            lines.append(f"  {sym:<12} {price_str} {rsi:5.1f} {bb_l_str} {bb_m_str} {bb_u_str} {regime:<13}{sig_str}{lev_tag}")
 
         # Open positions with live P&L
         if positions:
@@ -201,24 +249,46 @@ class Dashboard:
                 side = p["side"]
                 upnl = p["unrealized_pnl"]
                 pnl_sign = "+" if upnl >= 0 else ""
+                entry_str = self._fmt_price(p['entry_price'])
+                now_str = self._fmt_price(p['current_price'])
+                stop_str = self._fmt_price(p['stop_price'])
                 lines.append(
                     f"  {key:<32} {side:<5} "
-                    f"${p['entry_price']:>9.4f} ${p['current_price']:>9.4f} "
-                    f"${pnl_sign}{upnl:.2f}{'':>4} ${p['stop_price']:>9.4f}"
+                    f"{entry_str} {now_str} "
+                    f"${pnl_sign}{upnl:.2f}{'':>4} {stop_str}"
                 )
 
-        # Signals
+        # Signals (with confluence detection)
         sigs = signals if is_signal_cycle else self._last_signals
         if sigs:
             lines.append("")
+            # Group signals by (symbol, action) for confluence detection
+            grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+            for s in sigs:
+                key = (s.get("symbol", "?"), s.get("action", "?"))
+                grouped[key].append(s)
+
+            confluence_lines = []
+            for (sym, action), group in grouped.items():
+                first = group[0]
+                price_val = first.get("price", 0)
+                rsi_v = first.get("rsi", 0)
+                price_str = self._fmt_price(price_val)
+                if len(group) > 1:
+                    strats = " + ".join(s.get("strategy", "?") for s in group)
+                    confluence_lines.append(
+                        f"    >> {action} {sym} @ {price_str} RSI={rsi_v:.1f} "
+                        f"[{len(group)}x CONFLUENCE: {strats}]"
+                    )
+                else:
+                    strat = first.get("strategy", "?")
+                    confluence_lines.append(
+                        f"    >> {action} {sym} @ {price_str} RSI={rsi_v:.1f} [{strat}]"
+                    )
+
             lines.append(f"  SIGNALS ({len(sigs)}):")
-            for s in sigs[-8:]:
-                action = s.get("action", "?")
-                sym = s.get("symbol", "?")
-                price = s.get("price", 0)
-                rsi_v = s.get("rsi", 0)
-                strat = s.get("strategy", "?")
-                lines.append(f"    >> {action} {sym} @ ${price:.4f} RSI={rsi_v:.1f} [{strat}]")
+            for cl in confluence_lines[-8:]:
+                lines.append(cl)
         else:
             lines.append("")
             lines.append("  No signals this cycle")
@@ -313,6 +383,7 @@ class Dashboard:
             self._cycle_count += 1
             signals = self.daemon.signal_cycle()
             self._last_signals = signals or []
+            self._last_signal_time = datetime.now(timezone.utc)
             self._fetch_live_prices()
             self._draw_dashboard(is_signal_cycle=True, signals=self._last_signals)
 
