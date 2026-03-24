@@ -57,7 +57,7 @@ config/settings.py    — risk limits
 |-----------|-------|-------|
 | Position size | 10% of current equity | Compounds as equity grows |
 | Max leverage | 3x | Config says 3, production uses 2x max |
-| Max concurrent positions | 6 | One per pair+strategy+side |
+| Max concurrent positions | 3 | Highest confidence signals take priority |
 | Stop-loss | 3% from entry | Enforced every 1 minute |
 | Daily drawdown halt | 5% | All trading stops if equity drops 5% from day start |
 | Min balance | $100 | Cannot trade below this |

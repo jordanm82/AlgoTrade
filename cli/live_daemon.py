@@ -277,12 +277,43 @@ class LiveDaemon:
 
         return signals
 
+    def _signal_confidence(self, sig: dict) -> float:
+        """Score a signal's confidence for priority ranking.
+        Higher = more confident. Used to decide which signals get the limited slots."""
+        score = 0.0
+        rsi = sig.get("rsi", 50)
+        action = sig.get("action", "")
+
+        # RSI extremity — further from 50 = more confident
+        if action in ("BUY", "CLOSE_SHORT"):
+            score += max(0, (35 - rsi) * 2)  # RSI 20 scores 30, RSI 30 scores 10
+        elif action in ("SHORT", "CLOSE_LONG"):
+            score += max(0, (rsi - 65) * 2)  # RSI 80 scores 30, RSI 70 scores 10
+
+        # Leverage pairs get a bonus (better backtested)
+        if sig.get("symbol", "") in LEVERAGE_PAIRS:
+            score += 10
+
+        # Close signals always take priority (protect capital)
+        if "CLOSE" in action:
+            score += 100
+
+        # Confluence bonus — if both strategies fire on same pair, caller handles this
+        sig["_confidence"] = round(score, 1)
+        return score
+
     def _collect_all_signals(self) -> list[dict]:
-        """Collect all signals across all pairs and strategies."""
+        """Collect all signals, score by confidence, sort highest first."""
         all_signals = []
         for symbol, df in self._dataframes.items():
             all_signals.extend(self._bb_grid_signals(symbol, df))
             all_signals.extend(self._rsi_mr_signals(symbol, df))
+
+        # Score and sort: closes first, then highest confidence
+        for sig in all_signals:
+            self._signal_confidence(sig)
+        all_signals.sort(key=lambda s: s.get("_confidence", 0), reverse=True)
+
         return all_signals
 
     # ------------------------------------------------------------------
@@ -709,8 +740,15 @@ class LiveDaemon:
         signals = self._collect_all_signals()
 
         if signals:
-            print(f"[CYCLE] {len(signals)} signals detected:")
+            print(f"[CYCLE] {len(signals)} signals detected (sorted by confidence):")
             for sig in signals:
+                conf = sig.get("_confidence", 0)
+                action = sig.get("action", "?")
+                sym = sig.get("symbol", "?")
+                # Skip new entries if at max positions (closes always execute)
+                if action in ("BUY", "SHORT") and not self.tracker.can_open():
+                    print(colored(f"  [SKIP] {action} {sym} (conf={conf:.0f}) — max {MAX_CONCURRENT_POSITIONS} positions reached", "yellow"))
+                    continue
                 self._execute_signal(sig)
         else:
             print("[CYCLE] No signals")

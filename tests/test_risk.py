@@ -16,7 +16,7 @@ class TestRiskManager:
 
     def test_rejects_too_many_concurrent(self):
         rm = RiskManager(portfolio_value=10000.0)
-        ok, reason = rm.check_entry(size_usd=500.0, leverage=1, current_positions=6)
+        ok, reason = rm.check_entry(size_usd=500.0, leverage=1, current_positions=3)
         assert ok is False
         assert "concurrent" in reason.lower()
 

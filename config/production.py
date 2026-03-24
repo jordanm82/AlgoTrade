@@ -33,5 +33,5 @@ RSI_MR_CONFIG = {
 # Risk settings
 POSITION_SIZE_PCT = 0.10   # 10% of equity per trade, compounding
 MAX_LEVERAGE = 2           # 2x max on validated pairs, 1x on others
-MAX_CONCURRENT_POSITIONS = 6  # up from 3 — we're trading 6 pairs
+MAX_CONCURRENT_POSITIONS = 3  # max 3 at a time, highest confidence takes priority
 STOP_LOSS_PCT = 0.03       # 3% hard stop
