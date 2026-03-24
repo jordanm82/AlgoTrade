@@ -1,0 +1,189 @@
+# exchange/kalshi.py
+"""Kalshi prediction market client for BTC contracts."""
+import base64
+import hashlib
+import json
+import time
+from pathlib import Path
+
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, utils
+
+BASE_URL = "https://trading-api.kalshi.com"
+DEMO_URL = "https://demo-trading-api.kalshi.com"
+
+
+class KalshiClient:
+    def __init__(self, api_key_id: str, private_key_path: str, demo: bool = False):
+        self.api_key_id = api_key_id
+        self.base_url = DEMO_URL if demo else BASE_URL
+        self._private_key = self._load_key(private_key_path)
+
+    def _load_key(self, path: str):
+        with open(path, "rb") as f:
+            return serialization.load_pem_private_key(f.read(), password=None)
+
+    def _sign(self, method: str, path: str) -> tuple[str, str]:
+        """Sign a request. Returns (timestamp_ms, signature_b64)."""
+        ts = str(int(time.time() * 1000))
+        message = f"{ts}\n{method}\n{path}"
+        msg_hash = hashlib.sha256(message.encode()).digest()
+        signature = self._private_key.sign(
+            msg_hash,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            utils.Prehashed(hashes.SHA256()),
+        )
+        return ts, base64.b64encode(signature).decode()
+
+    def _headers(self, method: str, path: str) -> dict:
+        ts, sig = self._sign(method, path)
+        return {
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        url = f"{self.base_url}{path}"
+        headers = self._headers("GET", path)
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _post(self, path: str, data: dict) -> dict:
+        url = f"{self.base_url}{path}"
+        headers = self._headers("POST", path)
+        resp = requests.post(url, headers=headers, json=data, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _delete(self, path: str) -> dict:
+        url = f"{self.base_url}{path}"
+        headers = self._headers("DELETE", path)
+        resp = requests.delete(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    # --- Market Discovery ---
+
+    def get_btc_events(self, status: str = "open") -> list[dict]:
+        """Find open BTC prediction events."""
+        # Try multiple series tickers that Kalshi might use
+        for series in ["KXBTC", "KXBTCD", "KXBTCUSD", "BTC"]:
+            try:
+                resp = self._get("/trade-api/v2/events", {
+                    "series_ticker": series,
+                    "status": status,
+                    "with_nested_markets": "true",
+                    "limit": 20,
+                })
+                events = resp.get("events", [])
+                if events:
+                    return events
+            except Exception:
+                continue
+        return []
+
+    def get_markets(self, event_ticker: str = None, series_ticker: str = None,
+                    status: str = "open") -> list[dict]:
+        """List markets, optionally filtered."""
+        params = {"status": status, "limit": 200}
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        resp = self._get("/trade-api/v2/markets", params)
+        return resp.get("markets", [])
+
+    def get_market(self, ticker: str) -> dict:
+        """Get a single market's details."""
+        return self._get(f"/trade-api/v2/markets/{ticker}")
+
+    def get_orderbook(self, ticker: str) -> dict:
+        """Get the orderbook for a market."""
+        return self._get(f"/trade-api/v2/markets/{ticker}/orderbook")
+
+    def find_btc_15m_markets(self) -> list[dict]:
+        """Find BTC markets expiring within the next ~30 minutes.
+        These are the short-term contracts we want to trade."""
+        events = self.get_btc_events()
+        now = time.time()
+        short_term = []
+        for event in events:
+            for market in event.get("markets", []):
+                # Check if market expires within 30 minutes
+                exp = market.get("expiration_time") or market.get("close_time", "")
+                if exp:
+                    try:
+                        from datetime import datetime
+                        if "T" in exp:
+                            exp_ts = datetime.fromisoformat(exp.replace("Z", "+00:00")).timestamp()
+                            mins_to_exp = (exp_ts - now) / 60
+                            if 5 < mins_to_exp < 30:
+                                market["_mins_to_expiry"] = round(mins_to_exp, 1)
+                                short_term.append(market)
+                    except Exception:
+                        pass
+        return sorted(short_term, key=lambda m: m.get("_mins_to_expiry", 999))
+
+    # --- Trading ---
+
+    def place_order(self, ticker: str, side: str, count: int,
+                    price_cents: int | None = None, order_type: str = "market") -> dict:
+        """Place an order.
+        side: 'yes' or 'no'
+        count: number of contracts
+        price_cents: 1-99 for limit orders
+        order_type: 'market' or 'limit'
+        """
+        data = {
+            "ticker": ticker,
+            "action": "buy",
+            "side": side,
+            "type": order_type,
+            "count": count,
+        }
+        if order_type == "limit" and price_cents is not None:
+            if side == "yes":
+                data["yes_price"] = price_cents
+            else:
+                data["no_price"] = price_cents
+        return self._post("/trade-api/v2/portfolio/orders", data)
+
+    def bet_btc_up(self, ticker: str, count: int, price_cents: int | None = None) -> dict:
+        """Bet that BTC will be ABOVE the strike at expiry."""
+        otype = "limit" if price_cents else "market"
+        return self.place_order(ticker, "yes", count, price_cents, otype)
+
+    def bet_btc_down(self, ticker: str, count: int, price_cents: int | None = None) -> dict:
+        """Bet that BTC will be BELOW the strike at expiry."""
+        otype = "limit" if price_cents else "market"
+        return self.place_order(ticker, "no", count, price_cents, otype)
+
+    def cancel_order(self, order_id: str) -> dict:
+        return self._delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+
+    # --- Portfolio ---
+
+    def get_balance(self) -> dict:
+        """Get account balance in cents."""
+        return self._get("/trade-api/v2/portfolio/balance")
+
+    def get_positions(self, event_ticker: str = None) -> list[dict]:
+        """Get open positions."""
+        params = {"settlement_status": "unsettled", "limit": 100}
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        resp = self._get("/trade-api/v2/portfolio/positions", params)
+        return resp.get("market_positions", [])
+
+    def get_orders(self, status: str = "resting") -> list[dict]:
+        """Get open orders."""
+        resp = self._get("/trade-api/v2/portfolio/orders", {"status": status, "limit": 100})
+        return resp.get("orders", [])

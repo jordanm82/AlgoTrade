@@ -10,6 +10,9 @@ SNAPSHOTS_DIR = PROJECT_ROOT / "data" / "snapshots"
 # Coinbase
 CDP_KEY_FILE = PROJECT_ROOT / "cdp_api_key.json"
 
+# Kalshi
+KALSHI_KEY_FILE = PROJECT_ROOT / "KalshiPrimaryKey.txt"
+
 # Risk limits (hard guardrails)
 MAX_POSITION_PCT = 0.10
 MAX_CONCURRENT = 3
