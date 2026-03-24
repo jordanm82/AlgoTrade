@@ -109,22 +109,31 @@ class LiveDaemon:
         # --- Coinbase spot balances ---
         try:
             balances = self.executor.get_balances()
-            for currency, value in balances.items():
-                if currency == "USD" or value < 1.0:  # skip USD and dust
+            for currency, token_amount in balances.items():
+                if currency in ("USD", "USDC", "USDT"):
+                    continue
+                # Get current price to compute USD value
+                binance_sym = f"{currency}/USDT"
+                try:
+                    ticker = self.fetcher.ticker(binance_sym)
+                    price = ticker.get("last", 0)
+                except Exception:
+                    price = 0
+                if price <= 0:
+                    continue
+                usd_value = token_amount * price
+                if usd_value < 1.0:  # skip dust (< $1)
                     continue
                 # Check if we have a tracked position for this currency
                 coinbase_sym = f"{currency}-USD"
                 tracked = any(coinbase_sym in p["symbol"] for p in self.tracker.open_positions())
-                if not tracked and value >= 1.0:
-                    # Found an untracked position -- add it with estimated entry
-                    print(colored(f"  [SYNC] Found untracked {currency}: ${value:.2f} — adding to tracker", "yellow"))
-                    # Use current price as entry (we don't know the real entry)
-                    binance_sym = f"{currency}/USDT"
-                    ticker = self.fetcher.ticker(binance_sym)
-                    price = ticker.get("last", 0)
-                    if price > 0:
-                        pos_key = f"{coinbase_sym}:synced:long"
-                        self.tracker.open(pos_key, "BUY", value, price, price * 0.97, price * 1.10)
+                if not tracked:
+                    print(colored(
+                        f"  [SYNC] Found untracked {currency}: {token_amount:.6f} "
+                        f"(${usd_value:.2f} @ ${price:.2f}) — adding to tracker",
+                        "yellow"))
+                    pos_key = f"{coinbase_sym}:synced:long"
+                    self.tracker.open(pos_key, "BUY", usd_value, price, price * 0.97, price * 1.10)
         except Exception as e:
             print(colored(f"  [WARN] Coinbase sync failed: {e}", "yellow"))
 
