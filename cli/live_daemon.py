@@ -642,11 +642,26 @@ class LiveDaemon:
                         continue
 
                     # Pick the soonest-expiring open market
-                    ticker = all_markets[0].get("ticker", "")
-                    # Price based on our confidence: pay slightly above 50c for edge
-                    # Higher confidence → willing to pay more (but still below our estimated probability)
-                    # conf=30 → pay 55c, conf=50 → pay 60c, conf=70 → pay 65c
-                    fill_price = min(70, max(51, int(50 + signal.confidence * 0.3)))
+                    market = all_markets[0]
+                    ticker = market.get("ticker", "")
+                    # Query the current ask and bid at that price for instant fill
+                    if side == "yes":
+                        fill_price = market.get("yes_ask") or 50
+                    else:
+                        fill_price = market.get("no_ask") or 50
+                    # If market data is stale, fetch orderbook
+                    if fill_price is None or fill_price == 0:
+                        try:
+                            book = self.kalshi_client.get_orderbook(ticker)
+                            ob = book.get("orderbook", {})
+                            asks = ob.get("yes" if side == "yes" else "no", [])
+                            if asks:
+                                fill_price = asks[0][0]  # best ask price
+                        except Exception:
+                            fill_price = 50
+                    fill_price = int(fill_price)
+                    if fill_price < 1 or fill_price > 99:
+                        fill_price = 50
                     result = self.kalshi_client.place_order(
                         ticker=ticker,
                         side=side,
