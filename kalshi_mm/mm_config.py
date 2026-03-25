@@ -4,6 +4,8 @@
 MM_ASSETS = {
     "BTC/USDT": "KXBTC15M",
     "ETH/USDT": "KXETH15M",
+    "SOL/USDT": "KXSOL15M",
+    "XRP/USDT": "KXXRP15M",
 }
 
 # Spread (in cents)
