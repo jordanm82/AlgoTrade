@@ -15,9 +15,10 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 # ---------------------------------------------------------------------------
-# Global daemon process handle
+# Global daemon process handles
 # ---------------------------------------------------------------------------
 _daemon_process = None
+_mm_process = None
 
 server = Server("algotrade")
 
@@ -370,6 +371,32 @@ async def list_tools():
                     "lines": {"type": "integer", "description": "Max lines per category.", "default": 30},
                 },
             },
+        ),
+        # MM Tools
+        Tool(
+            name="algotrade_mm_start",
+            description="Start the market maker bot as a background subprocess.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["live", "dry-run"],
+                        "description": "Trading mode.",
+                        "default": "dry-run",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="algotrade_mm_stop",
+            description="Stop the market maker bot gracefully.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="algotrade_mm_status",
+            description="Show market maker dashboard state.",
+            inputSchema={"type": "object", "properties": {}},
         ),
     ]
 
@@ -1292,6 +1319,54 @@ def handle_config_set(pair: str, key: str, value) -> dict:
 
 
 # ===================================================================
+#  Market maker handlers
+# ===================================================================
+
+def handle_mm_start(mode="dry-run"):
+    global _mm_process
+    if _daemon_process and _daemon_process.poll() is None:
+        return {"error": "Predictor daemon is running. Stop it first (algotrade_stop)."}
+    if _mm_process and _mm_process.poll() is None:
+        return {"error": "Market maker already running.", "pid": _mm_process.pid}
+    cmd = [sys.executable, "-m", "kalshi_mm.mm_daemon", "--mode", mode]
+    log_path = "/tmp/mm_stdout.log"
+    with open(log_path, "w") as log_f:
+        _mm_process = subprocess.Popen(
+            cmd, stdout=log_f, stderr=subprocess.STDOUT,
+            cwd=str(Path(__file__).parent),
+        )
+    return {"status": "started", "mode": mode, "pid": _mm_process.pid}
+
+
+def handle_mm_stop():
+    global _mm_process
+    if not _mm_process or _mm_process.poll() is not None:
+        return {"status": "not running"}
+    _mm_process.terminate()
+    try:
+        _mm_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _mm_process.kill()
+    _mm_process = None
+    return {"status": "stopped"}
+
+
+def handle_mm_status():
+    dash_path = Path("data/store/mm_dashboard.log")
+    result = {}
+    if dash_path.exists():
+        result["dashboard"] = dash_path.read_text()
+    else:
+        result["dashboard"] = "No dashboard data yet."
+    if _mm_process and _mm_process.poll() is None:
+        result["running"] = True
+        result["pid"] = _mm_process.pid
+    else:
+        result["running"] = False
+    return result
+
+
+# ===================================================================
 #  Dispatcher
 # ===================================================================
 
@@ -1385,6 +1460,12 @@ async def call_tool(name: str, arguments: dict):
             result = handle_logs(lines=arguments.get("lines", 50))
         elif name == "algotrade_errors":
             result = handle_errors(lines=arguments.get("lines", 30))
+        elif name == "algotrade_mm_start":
+            result = handle_mm_start(mode=arguments.get("mode", "dry-run"))
+        elif name == "algotrade_mm_stop":
+            result = handle_mm_stop()
+        elif name == "algotrade_mm_status":
+            result = handle_mm_status()
         else:
             result = {"error": f"Unknown tool: {name}"}
     except Exception as e:
