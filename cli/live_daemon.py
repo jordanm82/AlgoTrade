@@ -559,17 +559,18 @@ class LiveDaemon:
     }
 
     def _init_kalshi_client(self):
-        """Lazy-initialize the Kalshi client."""
+        """Lazy-initialize the Kalshi client.
+        Always uses production API — V3 needs real strike prices even in dry-run.
+        Dry-run only skips order placement, not market data queries."""
         if self.kalshi_client is not None:
             return
         try:
             from exchange.kalshi import KalshiClient
             from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
-            demo = self.dry_run  # demo=True for dry-run, demo=False for live
             self.kalshi_client = KalshiClient(
                 api_key_id=KALSHI_API_KEY_ID,
                 private_key_path=str(KALSHI_KEY_FILE),
-                demo=demo,
+                demo=False,  # always production — need real strikes/prices
             )
         except Exception as e:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
@@ -1857,7 +1858,8 @@ class LiveDaemon:
                 # Wall-clock aligned Kalshi eval at :01, :06, :11 + LAST_LOOK at :12/:27/:42/:57
                 current_minute = datetime.now(timezone.utc).minute
                 should_eval = (current_minute % 5 == 1 and now - self._last_kalshi_eval >= 240) \
-                           or (current_minute % 15 == 12 and now - self._last_kalshi_eval >= 50)
+                           or (current_minute % 15 == 12 and now - self._last_kalshi_eval >= 50) \
+                           or (current_minute % 15 == 1 and now - self._last_kalshi_eval >= 50)
                 if should_eval:
                     try:
                         self._kalshi_eval()

@@ -495,7 +495,8 @@ class Dashboard:
                 current_minute = datetime.now(timezone.utc).minute
                 now_ts = time.time()
                 should_eval = (current_minute % 5 == 1 and now_ts - self.daemon._last_kalshi_eval >= 240) \
-                           or (current_minute % 15 == 12 and now_ts - self.daemon._last_kalshi_eval >= 50)
+                           or (current_minute % 15 == 12 and now_ts - self.daemon._last_kalshi_eval >= 50) \
+                           or (current_minute % 15 == 1 and now_ts - self.daemon._last_kalshi_eval >= 50)
                 if should_eval:
                     try:
                         self.daemon._kalshi_eval()
