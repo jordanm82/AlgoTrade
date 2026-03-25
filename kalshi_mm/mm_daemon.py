@@ -235,9 +235,14 @@ class MMAssetRunner:
             if filled:
                 return  # state already transitioned
 
-            # Re-quote if drifted
-            if abs(bid - self.inv.bid_price_cents) >= REQUOTE_DRIFT_CENTS:
-                self._cancel_pending_bid()
+            # Only re-quote UPWARD (mid rose = we can bid higher = better fill chance).
+            # Never chase price down — that's directional betting, not market making.
+            if bid > self.inv.bid_price_cents and (bid - self.inv.bid_price_cents) >= REQUOTE_DRIFT_CENTS:
+                cancel_result = self._cancel_pending_bid()
+                if cancel_result and cancel_result.get("status") == "filled":
+                    # Bid filled during cancel — treat as fill
+                    self._handle_bid_fill_from_cancel(self.inv.pending_bid_id or "")
+                    return
                 self._place_bid(bid, ob)
             else:
                 self.status_msg = (

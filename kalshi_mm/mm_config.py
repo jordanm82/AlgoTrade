@@ -22,8 +22,8 @@ VPIN_WINDOW_SECONDS = 120
 
 # Timing (seconds unless noted)
 POLL_INTERVAL = 3
-QUOTE_WINDOW_MIN_MINUTES = 5
-QUOTE_WINDOW_MAX_MINUTES = 12
+QUOTE_WINDOW_MIN_MINUTES = 3   # stop quoting below this (hard cutoff takes over)
+QUOTE_WINDOW_MAX_MINUTES = 16  # accept any fresh 15m window immediately
 HARD_CUTOFF_MINUTES = 3    # 3 minutes — safe exit window
 DISCOVERY_RETRY_SECONDS = 10
 FORCED_EXIT_RETRY_SECONDS = 10
