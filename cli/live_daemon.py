@@ -1042,113 +1042,6 @@ class LiveDaemon:
 
         return pred
 
-    def _kalshi_cycle(self):
-        """Run Kalshi predictions for BTC/ETH/SOL/XRP/BNB and optionally place bets."""
-        # Prune expired bets (Kalshi 15m contracts settle in 15 minutes)
-        now = time.time()
-        self._active_kalshi_bets = {
-            t: placed for t, placed in self._active_kalshi_bets.items()
-            if now - placed < 900  # 15 minutes
-        }
-        if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
-            print(colored("  Kalshi: at max concurrent bets, skipping cycle", "yellow"))
-            return
-
-        predictions = []
-        valid_signals = []
-        for symbol, series_ticker in self.KALSHI_PAIRS.items():
-            # Kalshi pairs may not be in our Coinbase trading set — fetch independently
-            df = self._dataframes.get(symbol)
-            if df is None or len(df) < 20:
-                try:
-                    df = self._fetch_pair(symbol)
-                    if df is not None:
-                        self._dataframes[symbol] = df
-                except Exception:
-                    pass
-            if df is None or len(df) < 20:
-                predictions.append({
-                    "symbol": symbol, "asset": symbol.split("/")[0],
-                    "direction": "--", "confidence": 0,
-                    "reason": "no data", "ob": 0, "flow": 0,
-                })
-                continue
-
-            # Get leading indicator data for enhanced prediction
-            market_data = None
-            try:
-                from data.market_data import get_order_book_imbalance, get_trade_flow
-                ob = get_order_book_imbalance(symbol)
-                tf = get_trade_flow(symbol, limit=100)
-                market_data = {"order_book": ob, "trade_flow": tf}
-            except Exception:
-                pass
-
-            # Fetch 1h data for multi-timeframe confirmation
-            df_1h = None
-            try:
-                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
-                if df_1h is not None and not df_1h.empty:
-                    from data.indicators import add_indicators
-                    df_1h = add_indicators(df_1h)
-            except Exception as e:
-                print(colored(f"  Warning: 1h data fetch failed for {symbol}: {e}", "yellow"))
-
-            signal = self.kalshi_predictor.score(df, market_data=market_data, df_1h=df_1h)
-            if signal is None:
-                predictions.append({
-                    "symbol": symbol, "asset": symbol.split("/")[0],
-                    "direction": "--", "confidence": 0,
-                    "reason": "neutral", "ob": 0, "flow": 0,
-                })
-                continue
-
-            ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
-            net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
-
-            pred = {
-                "symbol": symbol,
-                "asset": symbol.split("/")[0],
-                "direction": signal.direction,
-                "confidence": signal.confidence,
-                "ob": ob_imb,
-                "flow": net_flow,
-                "reason": "",
-            }
-
-            asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, self.kalshi_threshold)
-            if signal.confidence < asset_threshold:
-                pred["reason"] = f"below threshold ({asset_threshold})"
-                predictions.append(pred)
-                continue
-
-            # Signal cleared threshold — collect for confidence-ranked execution
-            valid_signals.append({
-                "symbol": symbol,
-                "series_ticker": series_ticker,
-                "signal": signal,
-                "market_data": market_data,
-                "pred": pred,
-            })
-
-        # Sort by confidence descending — highest conviction bets get priority
-        valid_signals.sort(key=lambda x: x["signal"].confidence, reverse=True)
-
-        # Execute top signals up to concurrency limit
-        for vs in valid_signals:
-            if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
-                vs["pred"]["reason"] = "at max concurrent bets (lower confidence skipped)"
-                predictions.append(vs["pred"])
-                continue
-
-            pred = self._kalshi_execute_bet(
-                vs["symbol"], vs["series_ticker"], vs["signal"], vs["market_data"]
-            )
-            predictions.append(pred)
-
-        self.kalshi_predictions = predictions
-        return predictions
-
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
@@ -1767,12 +1660,6 @@ class LiveDaemon:
         else:
             print("[CYCLE] Kalshi-only mode — skipping spot signals")
 
-        # Kalshi prediction cycle
-        try:
-            self._kalshi_cycle()
-        except Exception as e:
-            print(colored(f"  [KALSHI ERR] cycle failed: {e}", "yellow"))
-
         self._update_equity()
         self._reconcile_positions()
         self._save_snapshot(signals)
@@ -1803,6 +1690,13 @@ class LiveDaemon:
         # Run initial signal cycle immediately
         self.signal_cycle()
 
+        # Run initial Kalshi eval immediately
+        try:
+            self._kalshi_eval()
+            self._last_kalshi_eval = time.time()
+        except Exception as e:
+            print(colored(f"  [KALSHI EVAL ERR] startup eval: {e}", "red"))
+
         last_signal_time = time.time()
 
         while self._running:
@@ -1817,6 +1711,17 @@ class LiveDaemon:
                 if now - last_signal_time >= SIGNAL_INTERVAL:
                     self.signal_cycle()
                     last_signal_time = now
+
+                # Wall-clock aligned Kalshi eval at :01, :06, :11 + LAST_LOOK at :12/:27/:42/:57
+                current_minute = datetime.now(timezone.utc).minute
+                should_eval = (current_minute % 5 == 1 and now - self._last_kalshi_eval >= 240) \
+                           or (current_minute % 15 == 12 and now - self._last_kalshi_eval >= 50)
+                if should_eval:
+                    try:
+                        self._kalshi_eval()
+                    except Exception as e:
+                        print(colored(f"  [KALSHI EVAL ERR] {e}", "red"))
+                    self._last_kalshi_eval = now
 
             except KeyboardInterrupt:
                 break
