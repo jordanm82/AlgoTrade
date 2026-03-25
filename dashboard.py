@@ -460,48 +460,29 @@ class Dashboard:
             self.daemon._running = False
         signal.signal(signal.SIGINT, _handle_sigint)
 
-        while self.daemon._running and self._cycle_count < self.max_cycles:
-            # Signal cycle (fetches fresh 15m candles + indicators)
-            self._cycle_count += 1
-            signals = self.daemon.signal_cycle()
-            self._last_signals = signals or []
-            self._last_signal_time = datetime.now(timezone.utc)
-            self._fetch_live_prices()
-            # Run Kalshi eval on startup of each signal cycle
+        if self.daemon.kalshi_only:
+            # ── Kalshi-only mode: simple 1-minute tick loop ──
+            # Run initial eval immediately
             try:
                 self.daemon._kalshi_eval()
                 self.daemon._last_kalshi_eval = time.time()
             except Exception as e:
                 print(f"  [KALSHI EVAL ERR] {e}")
-            self._draw_dashboard(is_signal_cycle=True, signals=self._last_signals)
+            self._draw_dashboard(is_signal_cycle=True, signals=None)
 
-            if self._cycle_count >= self.max_cycles:
-                break
-
-            # 15 x 1-minute ticks with live price updates
-            for tick in range(15):
-                if not self.daemon._running:
-                    break
-                # Sleep in 1-second chunks so Ctrl+C is responsive
+            total_ticks = self.max_cycles * 15  # convert cycles to minutes
+            tick = 0
+            while self.daemon._running and tick < total_ticks:
+                # Sleep 1 minute in 1-second chunks
                 for _ in range(60):
                     if not self.daemon._running:
                         break
                     time.sleep(1)
-                self._tick_count += 1
-                # Fetch fresh prices from exchange
-                self._fetch_live_prices()
-                # Update position prices + enforce stops
-                for sym in ALL_PAIRS:
-                    if sym in self._live_prices:
-                        coinbase_sym = COINBASE_MAP.get(sym, "")
-                        # Update any positions that match this pair
-                        for pos in self.daemon.tracker.open_positions():
-                            if coinbase_sym in pos["symbol"]:
-                                self.daemon.tracker.update_price(pos["symbol"], self._live_prices[sym])
-                if not self.daemon.kalshi_only:
-                    self.daemon._enforce_stops()
-                self.daemon._update_equity()
-                # Wall-clock aligned Kalshi eval
+                if not self.daemon._running:
+                    break
+                tick += 1
+
+                # Kalshi eval every tick — let the eval method decide if it's time
                 current_minute = datetime.now(timezone.utc).minute
                 now_ts = time.time()
                 should_eval = (current_minute % 5 == 1 and now_ts - self.daemon._last_kalshi_eval >= 240) \
@@ -513,7 +494,57 @@ class Dashboard:
                     except Exception as e:
                         print(f"  [KALSHI EVAL ERR] {e}")
                     self.daemon._last_kalshi_eval = now_ts
+
+                self.daemon._update_equity()
                 self._draw_dashboard(is_signal_cycle=False, signals=None)
+
+        else:
+            # ── Full mode: 15-minute signal cycles with ticks ──
+            while self.daemon._running and self._cycle_count < self.max_cycles:
+                self._cycle_count += 1
+                signals = self.daemon.signal_cycle()
+                self._last_signals = signals or []
+                self._last_signal_time = datetime.now(timezone.utc)
+                self._fetch_live_prices()
+                try:
+                    self.daemon._kalshi_eval()
+                    self.daemon._last_kalshi_eval = time.time()
+                except Exception as e:
+                    print(f"  [KALSHI EVAL ERR] {e}")
+                self._draw_dashboard(is_signal_cycle=True, signals=self._last_signals)
+
+                if self._cycle_count >= self.max_cycles:
+                    break
+
+                for tick in range(15):
+                    if not self.daemon._running:
+                        break
+                    for _ in range(60):
+                        if not self.daemon._running:
+                            break
+                        time.sleep(1)
+                    self._tick_count += 1
+                    self._fetch_live_prices()
+                    for sym in ALL_PAIRS:
+                        if sym in self._live_prices:
+                            coinbase_sym = COINBASE_MAP.get(sym, "")
+                            for pos in self.daemon.tracker.open_positions():
+                                if coinbase_sym in pos["symbol"]:
+                                    self.daemon.tracker.update_price(pos["symbol"], self._live_prices[sym])
+                    self.daemon._enforce_stops()
+                    self.daemon._update_equity()
+                    current_minute = datetime.now(timezone.utc).minute
+                    now_ts = time.time()
+                    should_eval = (current_minute % 5 == 1 and now_ts - self.daemon._last_kalshi_eval >= 240) \
+                               or (current_minute % 15 == 12 and now_ts - self.daemon._last_kalshi_eval >= 50) \
+                               or (current_minute % 15 == 1 and now_ts - self.daemon._last_kalshi_eval >= 50)
+                    if should_eval:
+                        try:
+                            self.daemon._kalshi_eval()
+                        except Exception as e:
+                            print(f"  [KALSHI EVAL ERR] {e}")
+                        self.daemon._last_kalshi_eval = now_ts
+                    self._draw_dashboard(is_signal_cycle=False, signals=None)
 
         self._draw_final()
 
