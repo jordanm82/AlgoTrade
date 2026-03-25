@@ -58,10 +58,25 @@ class K15State:
 
 
 # ─── Layout Builder ─────────────────────────────────────────────────
-def build_layout(state: K15State) -> Layout:
+def build_layout(state: K15State, input_buffer: str = "") -> Layout:
     """Build the rich Layout from current state."""
+    # Top: two columns. Bottom: input prompt.
     layout = Layout()
-    layout.split_row(
+    layout.split_column(
+        Layout(name="top", ratio=1),
+        Layout(name="bottom", size=3),
+    )
+
+    # Input prompt at the bottom
+    from rich.text import Text as RichText
+    prompt = RichText()
+    prompt.append("\n k15> ", style="bold cyan")
+    prompt.append(input_buffer)
+    prompt.append("█", style="bold cyan")  # cursor
+    layout["bottom"].update(Panel(prompt, box=box.SIMPLE, style="dim"))
+
+    # Top splits into left and right
+    layout["top"].split_row(
         Layout(name="left", ratio=3),
         Layout(name="right", ratio=2),
     )
@@ -426,10 +441,9 @@ def main():
     except Exception:
         console.print("[yellow]Could not connect to Kalshi[/yellow]")
 
-    # Approach: raw terminal mode captures individual keystrokes.
-    # We build the input buffer character by character, and redraw
-    # the dashboard on a timer WITHOUT losing the user's partial input.
-    # The input buffer is always preserved and re-rendered with the prompt.
+    # Full-screen Live display with input buffer rendered inside the layout.
+    # Raw terminal mode captures keystrokes without echo.
+    # Live.update() redraws in-place — no scrolling, no flicker.
 
     import tty
     import termios
@@ -438,57 +452,54 @@ def main():
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
-    def render():
-        """Clear screen and render dashboard + current input buffer."""
-        sys.stdout.write("\033[2J\033[H")  # clear screen + cursor home
-        sys.stdout.flush()
-        console.print(build_layout(state))
-        # Show prompt with whatever the user has typed so far
-        sys.stdout.write(f"\033[1;36mk15>\033[0m {input_buffer}")
-        sys.stdout.flush()
-
     try:
-        tty.setcbreak(fd)  # char-by-char input, no echo needed (we handle it)
-        render()
+        tty.setcbreak(fd)
 
-        while True:
-            # Check for input with 2-second timeout
-            ready, _, _ = select.select([sys.stdin], [], [], 2.0)
+        with Live(build_layout(state, input_buffer), console=console,
+                  refresh_per_second=0, screen=True) as live:
 
-            if ready:
-                ch = sys.stdin.read(1)
+            last_refresh = time.time()
 
-                if ch == '\n' or ch == '\r':
-                    # Enter pressed — process command
-                    cmd = input_buffer.strip()
-                    input_buffer = ""
-                    if cmd:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        if handle_command(cmd, state, console):
-                            break
-                        time.sleep(0.3)
-                elif ch == '\x7f' or ch == '\x08':
-                    # Backspace
-                    if input_buffer:
-                        input_buffer = input_buffer[:-1]
-                elif ch == '\x03':
-                    # Ctrl+C
-                    break
-                elif ch == '\x04':
-                    # Ctrl+D
-                    break
-                elif ch >= ' ':
-                    # Regular character
-                    input_buffer += ch
+            while True:
+                # Check for keystroke with short timeout
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
 
-            # Redraw dashboard (preserves input_buffer in the prompt)
-            render()
+                if ready:
+                    ch = sys.stdin.read(1)
+
+                    if ch == '\n' or ch == '\r':
+                        cmd = input_buffer.strip()
+                        input_buffer = ""
+                        if cmd:
+                            # Temporarily exit Live to show command output
+                            live.stop()
+                            console.clear()
+                            if handle_command(cmd, state, console):
+                                break
+                            time.sleep(0.5)
+                            # Resume Live
+                            live.start()
+                    elif ch == '\x7f' or ch == '\x08':
+                        if input_buffer:
+                            input_buffer = input_buffer[:-1]
+                    elif ch == '\x03' or ch == '\x04':
+                        break
+                    elif ch >= ' ':
+                        input_buffer += ch
+
+                    # Update display immediately on keystroke
+                    live.update(build_layout(state, input_buffer))
+                    last_refresh = time.time()
+
+                # Auto-refresh every 2 seconds
+                now = time.time()
+                if now - last_refresh >= 2.0:
+                    live.update(build_layout(state, input_buffer))
+                    last_refresh = now
 
     except (KeyboardInterrupt, EOFError):
         pass
     finally:
-        # Restore terminal settings
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         if state.running:
             state.running = False
