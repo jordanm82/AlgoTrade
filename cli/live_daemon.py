@@ -1345,10 +1345,15 @@ class LiveDaemon:
                         f"  [RECONCILE] Tracked {currency} has no tokens on Coinbase — removing phantom position",
                         "yellow"))
                     # Find and close the phantom position in tracker
+                    # tracker.close() expects the position symbol key (e.g. "SOL-USD:synced:long")
                     for pos in self.tracker.open_positions():
-                        if pos["symbol"].split("-")[0] == currency:
-                            self.tracker.close(pos["key"], float(pos.get("entry_price", 0)))
-                            print(colored(f"  [RECONCILE] Closed phantom: {pos['key']}", "yellow"))
+                        pos_currency = pos["symbol"].split("-")[0]
+                        if pos_currency == currency:
+                            try:
+                                self.tracker.close(pos["symbol"], float(pos.get("entry_price", 0)))
+                                print(colored(f"  [RECONCILE] Closed phantom: {pos['symbol']}", "yellow"))
+                            except Exception as e:
+                                print(colored(f"  [RECONCILE] Failed to close {pos['symbol']}: {e}", "yellow"))
         except Exception as e:
             print(colored(f"  [RECONCILE] Failed: {e}", "yellow"))
 
