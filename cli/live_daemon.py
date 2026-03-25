@@ -1338,11 +1338,17 @@ class LiveDaemon:
                         "yellow"))
 
             # Check for tracked positions with no tokens on Coinbase
+            # Coinbase is source of truth — auto-close phantom positions
             for currency in tracked_currencies:
                 if currency not in balances or balances.get(currency, 0) < 0.001:
                     print(colored(
-                        f"  [RECONCILE] Tracked {currency} has no tokens on Coinbase — phantom position",
+                        f"  [RECONCILE] Tracked {currency} has no tokens on Coinbase — removing phantom position",
                         "yellow"))
+                    # Find and close the phantom position in tracker
+                    for pos in self.tracker.open_positions():
+                        if pos["symbol"].split("-")[0] == currency:
+                            self.tracker.close(pos["key"], float(pos.get("entry_price", 0)))
+                            print(colored(f"  [RECONCILE] Closed phantom: {pos['key']}", "yellow"))
         except Exception as e:
             print(colored(f"  [RECONCILE] Failed: {e}", "yellow"))
 

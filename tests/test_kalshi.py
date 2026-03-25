@@ -608,13 +608,15 @@ class TestKalshiFilters:
         signal = predictor.score(df)
         assert signal is None
 
-    def test_volatility_too_low_rejects(self):
-        """ATR in sub-10th percentile of its history rejects signal."""
+    def test_low_volatility_does_not_reject(self):
+        """Low ATR should NOT reject — only high volatility spikes are filtered.
+        Low-vol rejection was removed because it triggered false rejections
+        during normal calm markets with limited data windows."""
         df = _make_df(n=250, rsi=22.0, atr=200.0)
         df.iloc[-1, df.columns.get_loc("atr")] = 5.0
         predictor = KalshiPredictor()
         signal = predictor.score(df)
-        assert signal is None
+        assert signal is not None  # should pass through, not rejected
 
     def test_margin_auto_passes_when_loser_zero(self):
         """When loser score is 0 or negative, margin filter auto-passes."""

@@ -458,13 +458,16 @@ class KalshiPredictor:
             components["filter_conflict"] = True
             return True
 
-        # Filter 2: Volatility regime (ATR percentile over 200-period window)
+        # Filter 2: Volatility regime — only reject extreme volatility spikes
+        # The low-volatility check was too aggressive with limited data (200 candles),
+        # rejecting signals during normal calm markets. Now only rejects when ATR
+        # spikes above 90th percentile (chaotic markets where 15m predictions fail).
         if "atr" in df.columns and len(df) >= 200:
             atr_series = df["atr"].dropna().tail(200)
             if len(atr_series) >= 50:
                 current_atr = float(atr_series.iloc[-1])
                 percentile = (atr_series < current_atr).sum() / len(atr_series) * 100
-                if percentile > 90 or percentile < 10:
+                if percentile > 90:
                     components["filter_volatility"] = True
                     return True
 
