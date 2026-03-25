@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 
 from kalshi_mm.mm_config import (
-    RISK_BUDGET_PCT, MIN_CONTRACTS_PER_QUOTE, MAX_CONTRACTS_PER_ASSET,
+    RISK_BUDGET_PCT, MAX_CONTRACTS_PER_ASSET,
     MAX_DAILY_LOSS_CENTS, MAX_WINDOW_LOSS_CENTS, MAX_EXIT_LOSS_CENTS,
     IDLE,
 )
@@ -27,11 +27,14 @@ def calc_round_trip_pnl(buy_cents: int, sell_cents: int, contracts: int) -> int:
 
 
 def compute_contracts(balance_cents: int, entry_price_cents: int) -> int | None:
-    """Compute contracts to quote. Returns None if insufficient budget."""
+    """Compute contracts to quote based on 10% of balance (compounds).
+
+    Returns None only if balance can't afford even 1 contract.
+    """
     risk_budget = int(balance_cents * RISK_BUDGET_PCT)
     contracts = risk_budget // entry_price_cents
     contracts = min(contracts, MAX_CONTRACTS_PER_ASSET)
-    if contracts < MIN_CONTRACTS_PER_QUOTE:
+    if contracts < 1:
         return None
     return contracts
 
