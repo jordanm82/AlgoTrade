@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "algotrade": {
+      "command": "/Users/jordan/Documents/Dev/algotrade/venv/bin/python",
+      "args": ["/Users/jordan/Documents/Dev/algotrade/mcp_server.py"],
+      "cwd": "/Users/jordan/Documents/Dev/algotrade"
+    }
+  }
+}
