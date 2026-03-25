@@ -45,13 +45,21 @@ class KalshiPredictorV3:
 
     def predict(self, df: pd.DataFrame, strike_price: float,
                 minutes_remaining: float, market_data: dict | None = None,
-                df_1h: pd.DataFrame | None = None) -> KalshiV3Signal | None:
-        """Compute strike-relative probability and bet recommendation."""
+                df_1h: pd.DataFrame | None = None,
+                current_price: float | None = None) -> KalshiV3Signal | None:
+        """Compute strike-relative probability and bet recommendation.
+
+        Args:
+            current_price: Override price for distance calculation.
+                Use Coinbase price (closer to CF Benchmarks BRTI settlement source)
+                instead of BinanceUS candle close which has a ~$15-30 spread.
+        """
         if df is None or len(df) < 20:
             return None
 
         last = df.iloc[-1]
-        current_price = float(last["close"])
+        if current_price is None:
+            current_price = float(last["close"])
         atr = float(last.get("atr", 0)) if pd.notna(last.get("atr")) else 0
 
         if atr <= 0 or strike_price <= 0:

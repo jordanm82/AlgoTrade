@@ -558,6 +558,29 @@ class LiveDaemon:
         "BNB/USDT": 35,
     }
 
+    # Coinbase symbol mapping for V3 live price (closer to CF Benchmarks BRTI)
+    COINBASE_PRICE_MAP = {
+        "BTC/USDT": "BTC-USD",
+        "ETH/USDT": "ETH-USD",
+        "SOL/USDT": "SOL-USD",
+        "XRP/USDT": "XRP-USD",
+        "BNB/USDT": "BNB-USD",
+    }
+
+    def _get_coinbase_price(self, symbol: str) -> float | None:
+        """Get live price from Coinbase (closer to BRTI than BinanceUS)."""
+        try:
+            from coinbase.rest import RESTClient
+            from config.settings import CDP_KEY_FILE
+            cb_symbol = self.COINBASE_PRICE_MAP.get(symbol)
+            if not cb_symbol:
+                return None
+            client = RESTClient(key_file=str(CDP_KEY_FILE))
+            product = client.get_product(cb_symbol)
+            return float(product["price"])
+        except Exception:
+            return None
+
     def _init_kalshi_client(self):
         """Lazy-initialize the Kalshi client.
         Always uses production API — V3 needs real strike prices even in dry-run.
@@ -775,10 +798,13 @@ class LiveDaemon:
 
                     if strike and close_time_dt:
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
+                        # Use Coinbase price (closer to BRTI) instead of BinanceUS
+                        cb_price = self._get_coinbase_price(symbol)
                         signal = self.kalshi_predictor.predict(
                             df_15m, strike_price=float(strike),
                             minutes_remaining=mins_left,
-                            market_data=market_data, df_1h=df_1h
+                            market_data=market_data, df_1h=df_1h,
+                            current_price=cb_price,
                         )
                         # Store strike info in pending signal for V3
                         if signal and asset not in self._kalshi_pending_signals:
@@ -906,10 +932,12 @@ class LiveDaemon:
 
                     if strike and close_time_dt:
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
+                        cb_price = self._get_coinbase_price(symbol)
                         signal = self.kalshi_predictor.predict(
                             df_15m, strike_price=float(strike),
                             minutes_remaining=mins_left,
-                            market_data=market_data, df_1h=df_1h
+                            market_data=market_data, df_1h=df_1h,
+                            current_price=cb_price,
                         )
                         if signal and pending:
                             pending["probability"] = signal.probability

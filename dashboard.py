@@ -380,11 +380,16 @@ class Dashboard:
                     target = pending.get("strike_price", 0)
                     if target:
                         target_str = f"${target:,.2f}"
-                        # Get current price from cached data
+                        # Get current price from Coinbase (closer to BRTI settlement)
                         symbol = f"{asset}/USDT"
-                        df = self.daemon._dataframes.get(symbol) or self.daemon._kalshi_cached_dataframes.get(symbol)
-                        if df is not None and len(df) > 0:
-                            current = float(df.iloc[-1]["close"])
+                        cb_price = self.daemon._get_coinbase_price(symbol) if hasattr(self.daemon, '_get_coinbase_price') else None
+                        if cb_price:
+                            current = cb_price
+                        else:
+                            # Fallback to cached candle data
+                            df = self.daemon._dataframes.get(symbol) or self.daemon._kalshi_cached_dataframes.get(symbol)
+                            current = float(df.iloc[-1]["close"]) if df is not None and len(df) > 0 else 0
+                        if current:
                             current_str = f"${current:,.2f}"
                             diff = current - target
                             sign = "+" if diff >= 0 else ""
