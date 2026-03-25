@@ -49,27 +49,27 @@ class TestCalcRoundTripPnl:
 class TestComputeContracts:
     def test_normal_balance(self):
         from kalshi_mm.mm_inventory import compute_contracts
-        # $100 = 10000c, 10% = 1000c, at 50c = 20 contracts
-        assert compute_contracts(10000, 50) == 20
+        # $100 = 10000c, 10% = 1000c, half for bid = 500c, at 50c = 10 contracts
+        assert compute_contracts(10000, 50) == 10
 
     def test_large_balance_capped_at_max(self):
         from kalshi_mm.mm_inventory import compute_contracts
-        # $1000 = 100000c, 10% = 10000c, at 50c = 200, capped at 50
+        # $1000 = 100000c, 10% = 10000c, half = 5000c, at 50c = 100, capped at 50
         assert compute_contracts(100000, 50) == 50
 
     def test_small_balance_still_works(self):
         from kalshi_mm.mm_inventory import compute_contracts
-        # $5 = 500c, 10% = 50c, at 50c = 1 contract (no min floor)
-        assert compute_contracts(500, 50) == 1
+        # $10 = 1000c, 10% = 100c, half = 50c, at 50c = 1 contract
+        assert compute_contracts(1000, 50) == 1
 
     def test_too_small_returns_none(self):
         from kalshi_mm.mm_inventory import compute_contracts
-        # $0.40 = 40c, 10% = 4c, at 50c = 0 contracts
-        assert compute_contracts(40, 50) is None
+        # $5 = 500c, 10% = 50c, half = 25c, at 50c = 0 contracts
+        assert compute_contracts(500, 50) is None
 
     def test_compounds_with_balance(self):
         from kalshi_mm.mm_inventory import compute_contracts
-        # As balance grows, contracts grow
-        assert compute_contracts(5000, 50) == 10   # $50 -> 10 contracts
-        assert compute_contracts(10000, 50) == 20   # $100 -> 20 contracts
-        assert compute_contracts(20000, 50) == 40   # $200 -> 40 contracts
+        # As balance grows, contracts grow (half of 10% budget used for bid)
+        assert compute_contracts(5000, 50) == 5    # $50 -> 5 contracts
+        assert compute_contracts(10000, 50) == 10   # $100 -> 10 contracts
+        assert compute_contracts(20000, 50) == 20   # $200 -> 20 contracts

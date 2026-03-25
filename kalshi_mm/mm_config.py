@@ -24,11 +24,12 @@ VPIN_WINDOW_SECONDS = 120
 POLL_INTERVAL = 3
 QUOTE_WINDOW_MIN_MINUTES = 5
 QUOTE_WINDOW_MAX_MINUTES = 12
-HARD_CUTOFF_MINUTES = 1.5  # 90 seconds — plenty of liquidity to exit
+HARD_CUTOFF_MINUTES = 3    # 3 minutes — safe exit window
 DISCOVERY_RETRY_SECONDS = 10
 FORCED_EXIT_RETRY_SECONDS = 10
 
 # Inventory
+MAX_CONCURRENT_POSITIONS = 2   # max assets with capital deployed at once
 MAX_CONTRACTS_PER_ASSET = 50
 INVENTORY_TIMEOUT_SECONDS = 300
 RISK_BUDGET_PCT = 0.10  # 10% of balance, compounds as balance grows

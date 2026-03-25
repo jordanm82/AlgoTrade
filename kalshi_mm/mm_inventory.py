@@ -29,10 +29,17 @@ def calc_round_trip_pnl(buy_cents: int, sell_cents: int, contracts: int) -> int:
 def compute_contracts(balance_cents: int, entry_price_cents: int) -> int | None:
     """Compute contracts to quote based on 10% of balance (compounds).
 
+    On Kalshi, selling YES is internally buying NO at (100-ask_price).
+    So we need balance for BOTH the bid AND the eventual sell.
+    We use half the risk budget for the bid, reserving the other half
+    for the sell order.
+
     Returns None only if balance can't afford even 1 contract.
     """
     risk_budget = int(balance_cents * RISK_BUDGET_PCT)
-    contracts = risk_budget // entry_price_cents
+    # Reserve half for the sell side (Kalshi sell = buy opposite side)
+    bid_budget = risk_budget // 2
+    contracts = bid_budget // entry_price_cents
     contracts = min(contracts, MAX_CONTRACTS_PER_ASSET)
     if contracts < 1:
         return None

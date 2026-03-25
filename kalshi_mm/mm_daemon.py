@@ -965,29 +965,26 @@ def main():
             if args.cycles > 0 and cycle > args.cycles:
                 break
 
-            # Tick runners — only 1 can hold inventory at a time.
-            # If any runner has inventory (QUOTING_ASK or EXITING), only tick
-            # that runner + runners in IDLE/DISCOVERING (no capital at risk).
-            active_holder = None
-            for r in runners:
-                if r.inv.has_inventory() or r.inv.pending_bid_id is not None:
-                    active_holder = r
-                    break
+            # Tick runners — max MAX_CONCURRENT_POSITIONS can have capital deployed.
+            # Count runners with capital at risk (pending bid or inventory).
+            from kalshi_mm.mm_config import MAX_CONCURRENT_POSITIONS
+            active_count = sum(
+                1 for r in runners
+                if r.inv.has_inventory() or r.inv.pending_bid_id is not None
+            )
 
             for runner in runners:
-                if active_holder is None:
-                    # Nobody has capital deployed — tick all (only 1 will place a bid)
-                    runner.tick()
-                    if runner.inv.pending_bid_id is not None or runner.inv.has_inventory():
-                        active_holder = runner  # this one just placed a bid, block the rest
-                elif runner is active_holder:
-                    runner.tick()  # always tick the one with capital at risk
-                elif runner.inv.state in (IDLE, DARK):
-                    pass  # don't tick — wait for active holder to free up
-                elif runner.inv.state == DISCOVERING:
-                    pass  # don't transition to quoting while another holds capital
-                else:
-                    runner.tick()  # tick EXITING runners to unwind
+                has_capital = runner.inv.has_inventory() or runner.inv.pending_bid_id is not None
+                if has_capital:
+                    runner.tick()  # always tick runners with capital at risk
+                elif active_count < MAX_CONCURRENT_POSITIONS:
+                    runner.tick()  # room for more — let it discover/quote
+                    # Check if this runner just deployed capital
+                    if runner.inv.has_inventory() or runner.inv.pending_bid_id is not None:
+                        active_count += 1
+                elif runner.inv.state == EXITING:
+                    runner.tick()  # always unwind
+                # else: skip — at capacity
 
             # Get balance for dashboard
             balance_cents = 10000 if dry_run else _fetch_balance(client)
