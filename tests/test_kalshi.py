@@ -116,8 +116,8 @@ class TestKalshiPredictor:
 
         assert signal is not None
         assert signal.direction == "UP"
-        # RSI < 25 = 30pts, price < bb_lower = 20pts = at least 50
-        assert signal.confidence >= 50
+        # RSI < 25 = 30pts, price < bb_lower = 20pts; normalized: 50*100/110 = 45
+        assert signal.confidence >= 40
         assert signal.components["rsi"]["up"] == 30
         assert signal.components["bb"]["up"] == 20
 
@@ -129,7 +129,8 @@ class TestKalshiPredictor:
 
         assert signal is not None
         assert signal.direction == "DOWN"
-        assert signal.confidence >= 50
+        # RSI > 75 = 30pts, price > bb_upper = 20pts; normalized: 50*100/110 = 45
+        assert signal.confidence >= 40
         assert signal.components["rsi"]["down"] == 30
         assert signal.components["bb"]["down"] == 20
 
@@ -148,7 +149,7 @@ class TestKalshiPredictor:
     def test_all_components_contribute(self):
         """Every signal component fires for a perfect UP setup."""
         # RSI < 25 = 30, BB below = 20, MACD hist positive+increasing = 15,
-        # Volume 2x = 10, Momentum 3 green candles = 15, RSI trend recovering = 10
+        # Volume 2x = 10, ROC > 1.5% = 10, RSI trend recovering = 10, StochRSI < 10 = 15
         df = _make_df(
             rsi=22.0,
             close=86400.0,
@@ -156,8 +157,8 @@ class TestKalshiPredictor:
             macd_hist=5.0,
             volume=2500.0,
             vol_sma_20=1000.0,
-            # 3 ascending closes for momentum
-            close_trend=[86200.0, 86300.0, 86350.0, 86400.0],
+            roc_5=2.0,
+            stochrsi_k=8.0,
             # MACD hist increasing
             macd_hist_trend=[2.0, 3.0, 4.0, 5.0],
             # RSI recovering from oversold
@@ -173,9 +174,10 @@ class TestKalshiPredictor:
         assert signal.components["bb"]["up"] == 20
         assert signal.components["macd"]["up"] == 15
         assert signal.components["volume"]["score"] == 10
-        assert signal.components["momentum"]["up"] == 15
+        assert signal.components["roc"]["up"] == 10
         assert signal.components["rsi_trend"]["up"] == 10
-        # Total = 30 + 20 + 15 + 10 + 15 + 10 = 100
+        assert signal.components["stochrsi"]["up"] == 15
+        # Total = 30 + 20 + 15 + 10 + 10 + 10 + 15 = 110
         assert signal.confidence == 100
 
     def test_confidence_capped_at_100(self):
@@ -237,17 +239,47 @@ class TestKalshiPredictor:
         assert signal.components["volume"]["score"] == 10
 
     def test_momentum_three_red_candles(self):
-        """Three consecutive down candles give 15 DOWN momentum points."""
-        df = _make_df(
-            rsi=68.0,  # mild overbought = 10 DOWN pts
-            close_trend=[87300.0, 87200.0, 87100.0, 87000.0],
-        )
+        """Strong negative ROC gives DOWN points (replaces old candle-color momentum)."""
+        df = _make_df(rsi=68.0, roc_5=-2.0)  # mild overbought + strong negative ROC
         predictor = KalshiPredictor()
         signal = predictor.score(df)
 
         assert signal is not None
         assert signal.direction == "DOWN"
-        assert signal.components["momentum"]["down"] == 15
+        assert signal.components["roc"]["down"] == 10
+
+    def test_roc_strong_up_momentum(self):
+        """ROC > 1.5% gives 10 UP points."""
+        df = _make_df(rsi=50.0, roc_5=2.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["roc"]["up"] == 10
+
+    def test_roc_moderate_up_momentum(self):
+        """ROC between 0.5% and 1.5% gives 5 UP points."""
+        df = _make_df(rsi=50.0, roc_5=0.8)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["roc"]["up"] == 5
+
+    def test_roc_strong_down_momentum(self):
+        """ROC < -1.5% gives 10 DOWN points."""
+        df = _make_df(rsi=50.0, roc_5=-2.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["roc"]["down"] == 10
+
+    def test_roc_neutral(self):
+        """ROC between -0.5% and 0.5% gives 0 points."""
+        df = _make_df(rsi=50.0, roc_5=0.1)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        if signal is not None:
+            assert signal.components["roc"]["up"] == 0
+            assert signal.components["roc"]["down"] == 0
 
     def test_stochrsi_oversold_gives_up_points(self):
         """StochRSI K < 10 gives 15 UP points."""
@@ -423,7 +455,7 @@ class TestKalshiPredictorEnhanced:
         df = _make_df(
             rsi=22.0, close=86400.0, bb_lower=86500.0,
             macd_hist=5.0, volume=2500.0, vol_sma_20=1000.0,
-            close_trend=[86200.0, 86300.0, 86350.0, 86400.0],
+            roc_5=2.0, stochrsi_k=8.0,
             macd_hist_trend=[2.0, 3.0, 4.0, 5.0],
             rsi_trend=[18.0, 19.0, 20.0, 22.0],
         )
@@ -437,8 +469,8 @@ class TestKalshiPredictorEnhanced:
         assert signal is not None
         assert signal.direction == "UP"
         assert signal.confidence <= 100
-        # All components fire: lagging 100 + leading 65 = 165 raw
-        # Normalized: 165 * 100 / 165 = 100
+        # All components fire: lagging 110 + leading 65 = 175 raw
+        # Normalized: 175 * 100 / 175 = 100
         assert signal.confidence == 100
 
     def test_leading_only_signal_works(self):

@@ -14,11 +14,11 @@ from dataclasses import dataclass
 
 
 # Maximum raw score from lagging signals (components 1-6)
-_MAX_LAGGING = 100
+_MAX_LAGGING = 110  # was 100: +StochRSI(15) +ROC(10) -OldMomentum(15) = +10, ATR(+10) added in Task 4
 # Maximum raw score from leading signals (components 7-11)
 _MAX_LEADING = 65
 # Combined max before normalization
-_MAX_RAW = _MAX_LAGGING + _MAX_LEADING  # 165
+_MAX_RAW = _MAX_LAGGING + _MAX_LEADING  # 110 + 65 = 175
 
 
 @dataclass
@@ -193,25 +193,21 @@ class KalshiPredictor:
             down_score += vol_score
         components["volume"] = {"score": vol_score, "ratio": vol / vol_sma if vol_sma > 0 else 0}
 
-        # 5. Price Momentum -- last 3 candles (0-15)
-        mom_up = 0
-        mom_down = 0
-        if len(df) >= 4:
-            c1 = float(df.iloc[-1]["close"])
-            c2 = float(df.iloc[-2]["close"])
-            c3 = float(df.iloc[-3]["close"])
-            c4 = float(df.iloc[-4]["close"])
-            if c1 > c2 > c3:
-                mom_up = 15
-            elif c1 > c2:
-                mom_up = 8
-            if c1 < c2 < c3:
-                mom_down = 15
-            elif c1 < c2:
-                mom_down = 8
-        up_score += mom_up
-        down_score += mom_down
-        components["momentum"] = {"up": mom_up, "down": mom_down}
+        # 5. Rate of Change ROC-5 (0-10) — replaces old Price Momentum
+        roc_up = 0
+        roc_down = 0
+        roc_val = float(last.get("roc_5", 0)) if pd.notna(last.get("roc_5")) else 0
+        if roc_val > 1.5:
+            roc_up = 10
+        elif roc_val > 0.5:
+            roc_up = 5
+        elif roc_val < -1.5:
+            roc_down = 10
+        elif roc_val < -0.5:
+            roc_down = 5
+        up_score += roc_up
+        down_score += roc_down
+        components["roc"] = {"up": roc_up, "down": roc_down, "value": roc_val}
 
         # 6. RSI Trend (0-10) -- is RSI recovering from extreme?
         rsi_trend_up = 0
