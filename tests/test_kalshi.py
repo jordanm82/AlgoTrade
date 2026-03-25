@@ -63,7 +63,8 @@ class TestKalshiClient:
 
 def _make_df(n=50, close=87000.0, rsi=50.0, bb_lower=86500.0, bb_middle=87000.0,
              bb_upper=87500.0, macd_hist=0.0, volume=1000.0, vol_sma_20=1000.0,
-             close_trend=None, rsi_trend=None, macd_hist_trend=None):
+             close_trend=None, rsi_trend=None, macd_hist_trend=None,
+             stochrsi_k=50.0, roc_5=0.0, atr=200.0):
     """Build a synthetic DataFrame for predictor testing.
 
     close_trend: list of last N close values (overrides tail of close column)
@@ -97,6 +98,9 @@ def _make_df(n=50, close=87000.0, rsi=50.0, bb_lower=86500.0, bb_middle=87000.0,
         "bb_upper": np.full(n, bb_upper),
         "macd_hist": macd_hists,
         "vol_sma_20": np.full(n, vol_sma_20),
+        "stochrsi_k": np.full(n, stochrsi_k),
+        "roc_5": np.full(n, roc_5),
+        "atr": np.full(n, atr),
     }, index=pd.date_range("2025-01-01", periods=n, freq="15min"))
     return df
 
@@ -112,8 +116,8 @@ class TestKalshiPredictor:
 
         assert signal is not None
         assert signal.direction == "UP"
-        # RSI < 25 = 30pts, price < bb_lower = 20pts = at least 50
-        assert signal.confidence >= 50
+        # RSI < 25 = 30pts, price < bb_lower = 20pts; normalized: 50*100/110 = 45
+        assert signal.confidence >= 40
         assert signal.components["rsi"]["up"] == 30
         assert signal.components["bb"]["up"] == 20
 
@@ -125,7 +129,8 @@ class TestKalshiPredictor:
 
         assert signal is not None
         assert signal.direction == "DOWN"
-        assert signal.confidence >= 50
+        # RSI > 75 = 30pts, price > bb_upper = 20pts; normalized: 50*100/110 = 45
+        assert signal.confidence >= 40
         assert signal.components["rsi"]["down"] == 30
         assert signal.components["bb"]["down"] == 20
 
@@ -144,7 +149,8 @@ class TestKalshiPredictor:
     def test_all_components_contribute(self):
         """Every signal component fires for a perfect UP setup."""
         # RSI < 25 = 30, BB below = 20, MACD hist positive+increasing = 15,
-        # Volume 2x = 10, Momentum 3 green candles = 15, RSI trend recovering = 10
+        # Volume 2x = 10, ROC > 1.5% = 10, RSI trend recovering = 10, StochRSI < 10 = 15
+        # ATR move > 1.5x in UP direction = 10
         df = _make_df(
             rsi=22.0,
             close=86400.0,
@@ -152,13 +158,16 @@ class TestKalshiPredictor:
             macd_hist=5.0,
             volume=2500.0,
             vol_sma_20=1000.0,
-            # 3 ascending closes for momentum
-            close_trend=[86200.0, 86300.0, 86350.0, 86400.0],
+            roc_5=2.0,
+            stochrsi_k=8.0,
+            atr=200.0,
             # MACD hist increasing
             macd_hist_trend=[2.0, 3.0, 4.0, 5.0],
             # RSI recovering from oversold
             rsi_trend=[18.0, 19.0, 20.0, 22.0],
         )
+        # Big UP candle: move = 350, ratio = 1.75 > 1.5 → +10 ATR
+        df.iloc[-1, df.columns.get_loc("open")] = df.iloc[-1]["close"] - 350
         predictor = KalshiPredictor()
         signal = predictor.score(df)
 
@@ -169,9 +178,11 @@ class TestKalshiPredictor:
         assert signal.components["bb"]["up"] == 20
         assert signal.components["macd"]["up"] == 15
         assert signal.components["volume"]["score"] == 10
-        assert signal.components["momentum"]["up"] == 15
+        assert signal.components["roc"]["up"] == 10
         assert signal.components["rsi_trend"]["up"] == 10
-        # Total = 30 + 20 + 15 + 10 + 15 + 10 = 100
+        assert signal.components["stochrsi"]["up"] == 15
+        assert signal.components["atr_move"]["score"] == 10
+        # Total = 30 + 20 + 15 + 10 + 10 + 10 + 15 + 10 = 120
         assert signal.confidence == 100
 
     def test_confidence_capped_at_100(self):
@@ -233,17 +244,109 @@ class TestKalshiPredictor:
         assert signal.components["volume"]["score"] == 10
 
     def test_momentum_three_red_candles(self):
-        """Three consecutive down candles give 15 DOWN momentum points."""
-        df = _make_df(
-            rsi=68.0,  # mild overbought = 10 DOWN pts
-            close_trend=[87300.0, 87200.0, 87100.0, 87000.0],
-        )
+        """Strong negative ROC gives DOWN points (replaces old candle-color momentum)."""
+        df = _make_df(rsi=68.0, roc_5=-2.0)  # mild overbought + strong negative ROC
         predictor = KalshiPredictor()
         signal = predictor.score(df)
 
         assert signal is not None
         assert signal.direction == "DOWN"
-        assert signal.components["momentum"]["down"] == 15
+        assert signal.components["roc"]["down"] == 10
+
+    def test_roc_strong_up_momentum(self):
+        """ROC > 1.5% gives 10 UP points."""
+        df = _make_df(rsi=50.0, roc_5=2.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["roc"]["up"] == 10
+
+    def test_roc_moderate_up_momentum(self):
+        """ROC between 0.5% and 1.5% gives 5 UP points."""
+        df = _make_df(rsi=50.0, roc_5=0.8)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["roc"]["up"] == 5
+
+    def test_roc_strong_down_momentum(self):
+        """ROC < -1.5% gives 10 DOWN points."""
+        df = _make_df(rsi=50.0, roc_5=-2.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["roc"]["down"] == 10
+
+    def test_roc_neutral(self):
+        """ROC between -0.5% and 0.5% gives 0 points."""
+        df = _make_df(rsi=50.0, roc_5=0.1)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        if signal is not None:
+            assert signal.components["roc"]["up"] == 0
+            assert signal.components["roc"]["down"] == 0
+
+    def test_stochrsi_oversold_gives_up_points(self):
+        """StochRSI K < 10 gives 15 UP points."""
+        df = _make_df(rsi=50.0, stochrsi_k=8.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["stochrsi"]["up"] == 15
+
+    def test_stochrsi_overbought_gives_down_points(self):
+        """StochRSI K > 90 gives 15 DOWN points."""
+        df = _make_df(rsi=50.0, stochrsi_k=92.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["stochrsi"]["down"] == 15
+
+    def test_stochrsi_moderate_oversold(self):
+        """StochRSI K between 10-20 gives 8 UP points."""
+        df = _make_df(rsi=50.0, stochrsi_k=15.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["stochrsi"]["up"] == 8
+
+    def test_stochrsi_moderate_overbought(self):
+        """StochRSI K between 80-90 gives 8 DOWN points."""
+        df = _make_df(rsi=50.0, stochrsi_k=85.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["stochrsi"]["down"] == 8
+
+    def test_atr_move_ratio_confirms_signal(self):
+        """Candle move > 1.5x ATR in dominant direction gives +10."""
+        df = _make_df(rsi=32.0, atr=200.0)  # RSI gives 10 UP
+        # Override last candle to have big UP move (close > open by 350)
+        df.iloc[-1, df.columns.get_loc("open")] = df.iloc[-1]["close"] - 350
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.components["atr_move"]["score"] == 10
+
+    def test_atr_move_ratio_penalizes_overextension(self):
+        """Candle move > 2.0x ATR against dominant direction gives -5 penalty."""
+        df = _make_df(rsi=22.0, atr=200.0)  # RSI gives 30 UP
+        # DOWN candle opposing dominant UP direction
+        df.iloc[-1, df.columns.get_loc("open")] = df.iloc[-1]["close"] + 450
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["atr_move"]["score"] == -5
+
+    def test_atr_move_ratio_no_effect_small_move(self):
+        """Candle move < 1.5x ATR gives 0."""
+        df = _make_df(rsi=32.0, atr=200.0)
+        # Default _make_df sets open = close, so move is 0
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["atr_move"]["score"] == 0
 
     def test_signal_dataclass_fields(self):
         """KalshiSignal has all required fields."""
@@ -387,10 +490,12 @@ class TestKalshiPredictorEnhanced:
         df = _make_df(
             rsi=22.0, close=86400.0, bb_lower=86500.0,
             macd_hist=5.0, volume=2500.0, vol_sma_20=1000.0,
-            close_trend=[86200.0, 86300.0, 86350.0, 86400.0],
+            roc_5=2.0, stochrsi_k=8.0, atr=200.0,
             macd_hist_trend=[2.0, 3.0, 4.0, 5.0],
             rsi_trend=[18.0, 19.0, 20.0, 22.0],
         )
+        # Big UP candle: move = 350, ratio = 1.75 > 1.5 → +10 ATR
+        df.iloc[-1, df.columns.get_loc("open")] = df.iloc[-1]["close"] - 350
         predictor = KalshiPredictor()
         market_data = {
             "order_book": {"imbalance": 0.5, "spread_pct": 0.15},
@@ -401,9 +506,10 @@ class TestKalshiPredictorEnhanced:
         assert signal is not None
         assert signal.direction == "UP"
         assert signal.confidence <= 100
-        # All components fire: lagging 100 + leading 65 = 165 raw
-        # Normalized: 165 * 100 / 165 = 100
-        assert signal.confidence == 100
+        # All lagging + leading components fire: 120 + 65 = 185 raw
+        # _MAX_RAW = 200 (lagging 120 + leading 65 + MTF 15); no df_1h → MTF = 0
+        # Normalized: 185 * 100 / 200 = 92
+        assert signal.confidence == 92
 
     def test_leading_only_signal_works(self):
         """With neutral lagging but strong leading data, still produces signal."""
@@ -420,3 +526,111 @@ class TestKalshiPredictorEnhanced:
         # Order book 20 + trade flow 20 + large trade 10 + spread 5 + cross 10 = 65
         # Normalized: 65 * 100 / 165 = 39
         assert signal.confidence >= 30
+
+
+# ---------------------------------------------------------------------------
+# MTF (1-hour trend alignment) tests
+# ---------------------------------------------------------------------------
+
+class TestKalshiPredictorMTF:
+    def test_1h_trend_agrees_gives_bonus(self):
+        """1h trend agreeing with 15m signal gives +15."""
+        df = _make_df(rsi=22.0)  # strong UP signal from 15m
+        df_1h = _make_df(n=50, rsi=65.0, macd_hist=5.0)  # 1h bullish
+        predictor = KalshiPredictor()
+        signal = predictor.score(df, df_1h=df_1h)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.components["mtf"]["score"] == 15
+
+    def test_1h_trend_disagrees_gives_penalty(self):
+        """1h trend opposing 15m signal gives -15 penalty."""
+        df = _make_df(rsi=22.0)  # 15m says UP
+        df_1h = _make_df(n=50, rsi=35.0, macd_hist=-5.0)  # 1h bearish
+        predictor = KalshiPredictor()
+        signal = predictor.score(df, df_1h=df_1h)
+        assert signal is not None
+        assert signal.components["mtf"]["score"] == -15
+
+    def test_1h_trend_neutral_gives_zero(self):
+        """1h trend neutral (RSI 40-60, MACD near zero) gives 0."""
+        df = _make_df(rsi=22.0)
+        df_1h = _make_df(n=50, rsi=50.0, macd_hist=0.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df, df_1h=df_1h)
+        assert signal is not None
+        assert signal.components["mtf"]["score"] == 0
+
+    def test_no_1h_data_backward_compatible(self):
+        """Calling score() without df_1h still works, MTF score = 0."""
+        df = _make_df(rsi=22.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["mtf"]["score"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Signal quality filter tests
+# ---------------------------------------------------------------------------
+
+class TestKalshiFilters:
+    """Tests for signal quality filters."""
+
+    def test_directional_conflict_rejects_signal(self):
+        """When lagging UP but leading DOWN (both >= 15), signal is rejected."""
+        df = _make_df(rsi=22.0)  # lagging UP = 30 pts
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": -0.35, "spread_pct": 0.01},  # 20 DOWN
+            "trade_flow": {"net_flow": -0.25, "buy_ratio": 0.38, "large_trade_bias": -0.4},  # 20+10 DOWN
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is None
+
+    def test_no_conflict_when_aligned(self):
+        """When lagging and leading agree, no conflict rejection."""
+        df = _make_df(rsi=22.0)  # lagging UP
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0.35, "spread_pct": 0.01},  # 20 UP
+            "trade_flow": {"net_flow": 0.25, "buy_ratio": 0.6, "large_trade_bias": 0.4},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "UP"
+
+    def test_volatility_too_high_rejects(self):
+        """ATR in 90th+ percentile of its history rejects signal."""
+        df = _make_df(n=250, rsi=22.0, atr=200.0)
+        df.iloc[-1, df.columns.get_loc("atr")] = 2000.0
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is None
+
+    def test_volatility_too_low_rejects(self):
+        """ATR in sub-10th percentile of its history rejects signal."""
+        df = _make_df(n=250, rsi=22.0, atr=200.0)
+        df.iloc[-1, df.columns.get_loc("atr")] = 5.0
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is None
+
+    def test_margin_auto_passes_when_loser_zero(self):
+        """When loser score is 0 or negative, margin filter auto-passes."""
+        df = _make_df(rsi=22.0)  # 30 UP, 0 DOWN
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.direction == "UP"
+
+    def test_normal_volatility_passes(self):
+        """ATR in normal range (10th-90th percentile) passes filter."""
+        df = _make_df(n=250, rsi=22.0, atr=200.0)
+        # Set a range of ATR values so percentile is meaningful
+        atr_values = np.linspace(100, 300, 250)
+        df["atr"] = atr_values  # last value is 300, percentile ~100%
+        df.iloc[-1, df.columns.get_loc("atr")] = 200.0  # median = ~50th percentile
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None

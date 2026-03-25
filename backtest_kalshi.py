@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Backtest Kalshi confidence-based predictor across 6 months of 15m data.
+"""Iterative backtest for Kalshi 15m predictor optimization.
 
-Fetches BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT from Binance US,
-applies indicators, scores confidence at each candle, and evaluates
-whether the predicted direction matches the next candle's actual movement.
+Runs multiple iterations to measure the effect of each improvement:
+1. Baseline — current predictor with filters active
+2. Without filters — same predictor but skip _apply_filters()
+3. With 1h MTF — add multi-timeframe confirmation
+4. Threshold sweep — find optimal confidence threshold
 
-Tests thresholds from 30 to 80 (step 5) and reports:
-- Total bets placed
-- Win rate
-- Estimated P&L (simulating Kalshi-style payouts)
+Uses realistic P&L model:
+  entry_price = min(50, confidence - 10) cents
+  5% of balance per bet, compounding
 
-Payout simulation:
-  buy_price_cents = min(85, confidence - 10)
-  If correct: profit = (100 - buy_price_cents) per contract
-  If wrong:   loss   = buy_price_cents per contract
+Usage:
+    ./venv/bin/python backtest_kalshi.py [--days N] [--threshold T]
 """
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -22,7 +22,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.fetcher import DataFetcher
@@ -35,39 +34,42 @@ ASSETS = {
     "ETH": "ETH/USDT",
     "SOL": "SOL/USDT",
     "XRP": "XRP/USDT",
+    "BNB": "BNB/USDT",
 }
 
-TIMEFRAME = "15m"
-SIX_MONTHS_CANDLES = 6 * 30 * 24 * 4  # ~17,280 candles per asset
-THRESHOLDS = list(range(30, 85, 5))
+TIMEFRAME_15M = "15m"
+TIMEFRAME_1H = "1h"
 
 
-def fetch_6months(fetcher: DataFetcher, symbol: str) -> pd.DataFrame:
-    """Fetch ~6 months of 15m candles via paginated requests (max 1000/req)."""
+def fetch_candles(fetcher: DataFetcher, symbol: str, timeframe: str, days: int) -> pd.DataFrame:
+    """Fetch N days of candles via paginated requests."""
     all_frames = []
     now_ms = int(time.time() * 1000)
-    six_months_ms = 6 * 30 * 24 * 60 * 60 * 1000
-    since = now_ms - six_months_ms
+    period_ms = days * 24 * 60 * 60 * 1000
+    since = now_ms - period_ms
     batch_size = 1000
-    candle_ms = 15 * 60 * 1000  # 15 minutes in ms
 
-    print(f"  Fetching {symbol} from {pd.Timestamp(since, unit='ms')} ...")
+    if timeframe == "15m":
+        candle_ms = 15 * 60 * 1000
+    elif timeframe == "1h":
+        candle_ms = 60 * 60 * 1000
+    else:
+        candle_ms = 15 * 60 * 1000
 
     while since < now_ms:
         try:
-            df = fetcher.ohlcv(symbol, TIMEFRAME, limit=batch_size, since=since)
-            if df.empty:
+            df = fetcher.ohlcv(symbol, timeframe, limit=batch_size, since=since)
+            if df is None or df.empty:
                 break
             all_frames.append(df)
-            # Advance past the last candle we received
             last_ts = int(df.index[-1].timestamp() * 1000)
             since = last_ts + candle_ms
             if len(df) < batch_size:
                 break
-            time.sleep(0.3)  # rate limit courtesy
+            time.sleep(0.3)
         except Exception as e:
-            print(f"    Warning: fetch error at {pd.Timestamp(since, unit='ms')}: {e}")
-            since += batch_size * candle_ms  # skip ahead
+            print(f"    Warning: fetch error: {e}")
+            since += batch_size * candle_ms
             time.sleep(1)
 
     if not all_frames:
@@ -75,171 +77,344 @@ def fetch_6months(fetcher: DataFetcher, symbol: str) -> pd.DataFrame:
 
     combined = pd.concat(all_frames)
     combined = combined[~combined.index.duplicated(keep="first")].sort_index()
-    print(f"    Got {len(combined)} candles ({combined.index[0]} to {combined.index[-1]})")
     return combined
 
 
-def backtest_asset(asset_name: str, df_raw: pd.DataFrame, predictor: KalshiPredictor) -> list[dict]:
-    """Run predictor on every candle, record results."""
-    df = add_indicators(df_raw)
+def run_predictor_on_candles(
+    asset_name: str,
+    df_15m: pd.DataFrame,
+    df_1h: pd.DataFrame | None,
+    predictor: KalshiPredictor,
+    use_filters: bool = True,
+    use_mtf: bool = True,
+) -> list[dict]:
+    """Run predictor on every candle, return list of signal results.
+
+    Iteration isolation:
+    - use_filters=False: monkey-patch _apply_filters to always return False
+    - use_mtf=False: pass df_1h=None to score()
+    """
+    df = add_indicators(df_15m.copy())
+    df_1h_ind = None
+    if df_1h is not None and use_mtf:
+        df_1h_ind = add_indicators(df_1h.copy())
+
     results = []
 
-    # We need at least 20 candles of history, and 1 future candle for result
-    for i in range(20, len(df) - 1):
-        window = df.iloc[:i + 1]
-        signal = predictor.score(window)
+    # Save original filter method
+    original_filters = predictor._apply_filters
+    if not use_filters:
+        predictor._apply_filters = lambda *args, **kwargs: False
 
-        if signal is None:
-            continue
+    try:
+        for i in range(50, len(df) - 1):  # 50 candle warmup for indicators
+            window = df.iloc[:i + 1]
 
-        # Actual direction: did the NEXT candle close higher or lower?
-        current_close = float(df.iloc[i]["close"])
-        next_close = float(df.iloc[i + 1]["close"])
-        actual_direction = "UP" if next_close > current_close else "DOWN"
+            # Find matching 1h candle
+            mtf_window = None
+            if df_1h_ind is not None and not df_1h_ind.empty:
+                current_time = df.index[i]
+                mask = df_1h_ind.index <= current_time
+                if mask.sum() >= 20:
+                    mtf_window = df_1h_ind.loc[mask]
 
-        results.append({
-            "asset": asset_name,
-            "timestamp": df.index[i],
-            "price": current_close,
-            "direction": signal.direction,
-            "confidence": signal.confidence,
-            "actual": actual_direction,
-            "correct": signal.direction == actual_direction,
-            "rsi": signal.rsi,
-        })
+            signal = predictor.score(window, df_1h=mtf_window)
+
+            if signal is None:
+                continue
+
+            current_close = float(df.iloc[i]["close"])
+            next_close = float(df.iloc[i + 1]["close"])
+            actual_direction = "UP" if next_close > current_close else "DOWN"
+
+            results.append({
+                "asset": asset_name,
+                "timestamp": df.index[i],
+                "price": current_close,
+                "direction": signal.direction,
+                "confidence": signal.confidence,
+                "actual": actual_direction,
+                "correct": signal.direction == actual_direction,
+                "rsi": signal.rsi,
+            })
+    finally:
+        predictor._apply_filters = original_filters
 
     return results
 
 
-def analyze_threshold(results: list[dict], threshold: float) -> dict:
-    """Analyze performance at a given confidence threshold."""
+def simulate_pnl(
+    results: list[dict],
+    threshold: int,
+    starting_balance: float = 100.0,
+    risk_pct: float = 0.05,
+    fixed_entry: int | None = None,
+    max_concurrent: int = 3,
+) -> dict:
+    """Simulate realistic P&L with compounding and concurrency limits.
+
+    Models real trading constraints:
+    - Max 3 concurrent Kalshi bets (each settles in 15 minutes)
+    - Only 1 bet per asset per 15m window (no duplicate bets)
+    - 5% of balance risked per bet
+    - Entry price capped at 50c
+
+    Args:
+        fixed_entry: If set, use this fixed entry price (cents) instead of confidence-based.
+        max_concurrent: Max concurrent active bets (default 3).
+    """
+    balance = starting_balance
+    peak_balance = starting_balance
+    max_drawdown = 0.0
+    total_wins = 0
+    total_bets = 0
+    gross_wins = 0.0
+    gross_losses = 0.0
+    per_asset = {}
+
     filtered = [r for r in results if r["confidence"] >= threshold]
 
-    if not filtered:
-        return {
-            "threshold": threshold,
-            "bets": 0,
-            "wins": 0,
-            "win_rate": 0.0,
-            "total_pnl_cents": 0,
-            "avg_pnl_per_bet": 0.0,
-            "roi_pct": 0.0,
-        }
-
-    wins = sum(1 for r in filtered if r["correct"])
-    total = len(filtered)
-    win_rate = wins / total * 100
-
-    # Simulate P&L with Kalshi-style payouts
-    total_pnl = 0
-    total_risked = 0
+    # Group signals by timestamp, rank by confidence within each group
+    from collections import defaultdict
+    by_time = defaultdict(list)
     for r in filtered:
-        buy_price = min(85, r["confidence"] - 10)
-        total_risked += buy_price
-        if r["correct"]:
-            total_pnl += (100 - buy_price)  # profit on win
-        else:
-            total_pnl -= buy_price  # loss on loss
+        by_time[r["timestamp"]].append(r)
 
-    roi = (total_pnl / total_risked * 100) if total_risked > 0 else 0
+    # Sort timestamps, and within each timestamp sort by confidence descending
+    sorted_signals = []
+    for ts in sorted(by_time.keys()):
+        group = sorted(by_time[ts], key=lambda r: r["confidence"], reverse=True)
+        sorted_signals.extend(group)
+
+    # Track active bets: list of (settle_time, asset)
+    active_bets = []
+
+    for r in sorted_signals:
+        ts = r["timestamp"]
+
+        # Prune settled bets (15 min settlement)
+        active_bets = [(t, a) for t, a in active_bets
+                       if (ts - t).total_seconds() < 900]
+
+        # Skip if at max concurrent bets
+        if len(active_bets) >= max_concurrent:
+            continue
+
+        # Skip if already have an active bet on this asset
+        active_assets = {a for _, a in active_bets}
+        if r["asset"] in active_assets:
+            continue
+
+        if fixed_entry is not None:
+            entry_cents = fixed_entry
+        else:
+            entry_cents = min(50, r["confidence"] - 10)
+
+        if entry_cents > 50 or entry_cents <= 0:
+            continue
+
+        risk_budget_cents = int(balance * risk_pct * 100)  # convert dollars to cents
+        if risk_budget_cents < entry_cents:
+            continue
+
+        num_contracts = min(risk_budget_cents // entry_cents, 20)  # cap at 20 contracts
+        if num_contracts < 1:
+            continue
+
+        total_bets += 1
+        asset = r["asset"]
+        if asset not in per_asset:
+            per_asset[asset] = {"bets": 0, "wins": 0}
+        per_asset[asset]["bets"] += 1
+
+        # Track this bet as active
+        active_bets.append((ts, asset))
+
+        if r["correct"]:
+            profit_cents = num_contracts * (100 - entry_cents)
+            balance += profit_cents / 100  # cents to dollars
+            gross_wins += profit_cents / 100
+            total_wins += 1
+            per_asset[asset]["wins"] += 1
+        else:
+            loss_cents = num_contracts * entry_cents
+            balance -= loss_cents / 100
+            gross_losses += loss_cents / 100
+
+        if balance > peak_balance:
+            peak_balance = balance
+        drawdown = (peak_balance - balance) / peak_balance * 100 if peak_balance > 0 else 0
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+
+        if balance <= 0:
+            break
+
+    win_rate = (total_wins / total_bets * 100) if total_bets > 0 else 0
+    roi = ((balance - starting_balance) / starting_balance * 100) if starting_balance > 0 else 0
+    profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else float('inf') if gross_wins > 0 else 0
+
+    per_asset_wr = {}
+    for a, stats in per_asset.items():
+        per_asset_wr[a] = round(stats["wins"] / stats["bets"] * 100, 1) if stats["bets"] > 0 else 0
 
     return {
         "threshold": threshold,
-        "bets": total,
-        "wins": wins,
-        "win_rate": round(win_rate, 2),
-        "total_pnl_cents": total_pnl,
-        "avg_pnl_per_bet": round(total_pnl / total, 2) if total else 0,
-        "roi_pct": round(roi, 2),
+        "total_bets": total_bets,
+        "wins": total_wins,
+        "win_rate": round(win_rate, 1),
+        "final_balance": round(balance, 2),
+        "roi_pct": round(roi, 1),
+        "max_drawdown": round(max_drawdown, 1),
+        "profit_factor": round(profit_factor, 2),
+        "per_asset_wr": per_asset_wr,
+        "per_asset_bets": {a: s["bets"] for a, s in per_asset.items()},
     }
 
 
+def print_metrics(name: str, m: dict):
+    """Print formatted metrics for one iteration."""
+    print(f"\n{'─' * 60}")
+    print(f"  {name}")
+    print(f"{'─' * 60}")
+    print(f"  Win Rate:       {m['win_rate']}%  ({m['wins']}/{m['total_bets']} bets)")
+    print(f"  Final Balance:  ${m['final_balance']:.2f}  (from $100)")
+    print(f"  ROI:            {m['roi_pct']}%")
+    print(f"  Max Drawdown:   {m['max_drawdown']}%")
+    print(f"  Profit Factor:  {m['profit_factor']}")
+    if m['per_asset_wr']:
+        print(f"  Per-Asset WR:   ", end="")
+        parts = [f"{a}: {wr}% ({m['per_asset_bets'].get(a, 0)})" for a, wr in sorted(m['per_asset_wr'].items())]
+        print(", ".join(parts))
+
+
 def main():
-    print("=" * 70)
-    print("KALSHI CONFIDENCE PREDICTOR BACKTEST")
-    print("6 months | 15m candles | BTC, ETH, SOL, XRP")
-    print("=" * 70)
+    parser = argparse.ArgumentParser(description="Kalshi predictor iterative backtest")
+    parser.add_argument("--days", type=int, default=30, help="Backtest period in days (default: 30)")
+    parser.add_argument("--threshold", type=int, default=30, help="Default confidence threshold (default: 30)")
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("KALSHI PREDICTOR ITERATIVE BACKTEST")
+    print(f"{args.days} days | 15m candles | {', '.join(ASSETS.keys())}")
+    print("=" * 60)
 
     fetcher = DataFetcher()
     predictor = KalshiPredictor()
-    all_results = []
 
-    # Fetch data for all assets
+    # Fetch all data once
+    data_15m = {}
+    data_1h = {}
+
     for asset_name, symbol in ASSETS.items():
-        print(f"\n--- {asset_name} ---")
-        df_raw = fetch_6months(fetcher, symbol)
-        if df_raw.empty:
-            print(f"  Skipping {asset_name}: no data")
+        print(f"\nFetching {asset_name}...")
+        df_15m = fetch_candles(fetcher, symbol, TIMEFRAME_15M, args.days)
+        if df_15m.empty:
+            print(f"  Skipping {asset_name}: no 15m data")
             continue
+        data_15m[asset_name] = df_15m
+        print(f"  15m: {len(df_15m)} candles ({df_15m.index[0]} to {df_15m.index[-1]})")
 
-        print(f"  Running predictor on {len(df_raw)} candles ...")
-        results = backtest_asset(asset_name, df_raw, predictor)
-        print(f"  Generated {len(results)} signals")
-        all_results.extend(results)
+        df_1h = fetch_candles(fetcher, symbol, TIMEFRAME_1H, args.days)
+        if not df_1h.empty:
+            data_1h[asset_name] = df_1h
+            print(f"  1h:  {len(df_1h)} candles")
 
-    if not all_results:
-        print("\nNo results generated. Check data availability.")
+    if not data_15m:
+        print("\nNo data fetched. Check connectivity.")
         return
 
-    # Per-asset breakdown
-    print("\n" + "=" * 70)
-    print("PER-ASSET RESULTS (threshold=50)")
-    print("=" * 70)
-    for asset_name in ASSETS:
-        asset_results = [r for r in all_results if r["asset"] == asset_name]
-        if not asset_results:
-            continue
-        stats = analyze_threshold(asset_results, 50)
-        print(f"\n  {asset_name}: {stats['bets']} bets, "
-              f"{stats['win_rate']}% win rate, "
-              f"ROI: {stats['roi_pct']}%, "
-              f"P&L: {stats['total_pnl_cents']}c")
+    # ── Iteration 1: With filters, no MTF ──
+    print("\n" + "=" * 60)
+    print("ITERATION 1: Filters ON, no MTF")
+    print("=" * 60)
 
-    # Threshold sweep
-    print("\n" + "=" * 70)
-    print("THRESHOLD SWEEP (all assets combined)")
-    print("=" * 70)
-    print(f"{'Threshold':>10} {'Bets':>8} {'Wins':>8} {'Win%':>8} "
-          f"{'P&L(c)':>10} {'Avg P&L':>10} {'ROI%':>10}")
-    print("-" * 70)
+    results_filtered_no_mtf = []
+    for asset_name, df_15m in data_15m.items():
+        r = run_predictor_on_candles(asset_name, df_15m, None, predictor,
+                                     use_filters=True, use_mtf=False)
+        results_filtered_no_mtf.extend(r)
+
+    m1 = simulate_pnl(results_filtered_no_mtf, args.threshold)
+    print_metrics("Filters ON, no MTF", m1)
+
+    # ── Iteration 2: Without filters, no MTF ──
+    print("\n" + "=" * 60)
+    print("ITERATION 2: Filters OFF, no MTF (baseline comparison)")
+    print("=" * 60)
+
+    results_no_filters = []
+    for asset_name, df_15m in data_15m.items():
+        r = run_predictor_on_candles(asset_name, df_15m, None, predictor,
+                                     use_filters=False, use_mtf=False)
+        results_no_filters.extend(r)
+
+    m2 = simulate_pnl(results_no_filters, args.threshold)
+    print_metrics("Filters OFF, no MTF", m2)
+
+    # ── Iteration 3: With filters + MTF ──
+    print("\n" + "=" * 60)
+    print("ITERATION 3: Filters ON + 1h MTF")
+    print("=" * 60)
+
+    results_full = []
+    for asset_name, df_15m in data_15m.items():
+        df_1h = data_1h.get(asset_name)
+        r = run_predictor_on_candles(asset_name, df_15m, df_1h, predictor,
+                                     use_filters=True, use_mtf=True)
+        results_full.extend(r)
+
+    m3 = simulate_pnl(results_full, args.threshold)
+    print_metrics("Filters ON + 1h MTF", m3)
+
+    # ── Iteration 4: Threshold sweep on best version ──
+    print("\n" + "=" * 60)
+    print("THRESHOLD SWEEP (Filters ON + MTF)")
+    print("=" * 60)
+    print(f"{'Thresh':>7} {'Bets':>6} {'Wins':>6} {'WR%':>7} {'Balance':>10} {'ROI%':>8} {'MaxDD%':>8} {'PF':>6}")
+    print("─" * 60)
 
     best = None
-    for t in THRESHOLDS:
-        stats = analyze_threshold(all_results, t)
-        print(f"{stats['threshold']:>10} {stats['bets']:>8} {stats['wins']:>8} "
-              f"{stats['win_rate']:>7.1f}% {stats['total_pnl_cents']:>10} "
-              f"{stats['avg_pnl_per_bet']:>10.2f} {stats['roi_pct']:>9.1f}%")
+    for t in range(25, 75, 5):
+        m = simulate_pnl(results_full, t)
+        if m['total_bets'] > 0:
+            print(f"{t:>7} {m['total_bets']:>6} {m['wins']:>6} {m['win_rate']:>6.1f}% "
+                  f"${m['final_balance']:>8.2f} {m['roi_pct']:>7.1f}% {m['max_drawdown']:>7.1f}% "
+                  f"{m['profit_factor']:>5.2f}")
+            if m['total_bets'] >= 5:
+                if best is None or m['roi_pct'] > best['roi_pct']:
+                    best = m
 
-        if stats["bets"] >= 10:  # need minimum sample size
-            if best is None or stats["roi_pct"] > best["roi_pct"]:
-                best = stats
+    # ── Sensitivity: fixed 40c entry ──
+    print("\n" + "=" * 60)
+    print("SENSITIVITY: Fixed 40c entry price")
+    print("=" * 60)
 
-    # Optimal threshold
-    print("\n" + "=" * 70)
     if best:
-        print(f"OPTIMAL THRESHOLD: {best['threshold']}")
-        print(f"  Bets: {best['bets']}")
-        print(f"  Win Rate: {best['win_rate']}%")
-        print(f"  ROI: {best['roi_pct']}%")
-        print(f"  Total P&L: {best['total_pnl_cents']} cents")
-        print(f"  Avg P&L per bet: {best['avg_pnl_per_bet']} cents")
-    else:
-        print("No threshold with enough bets found.")
+        m_fixed = simulate_pnl(results_full, best['threshold'], fixed_entry=40)
+        print_metrics(f"Fixed 40c @ threshold={best['threshold']}", m_fixed)
 
-    # Per-asset at optimal threshold
+    # ── Summary ──
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+
+    print(f"\n  {'Iteration':<35} {'WR%':>7} {'Bets':>6} {'ROI%':>8} {'PF':>6}")
+    print(f"  {'─' * 55}")
+    print(f"  {'Filters OFF, no MTF':<35} {m2['win_rate']:>6.1f}% {m2['total_bets']:>6} {m2['roi_pct']:>7.1f}% {m2['profit_factor']:>5.2f}")
+    print(f"  {'Filters ON, no MTF':<35} {m1['win_rate']:>6.1f}% {m1['total_bets']:>6} {m1['roi_pct']:>7.1f}% {m1['profit_factor']:>5.2f}")
+    print(f"  {'Filters ON + 1h MTF':<35} {m3['win_rate']:>6.1f}% {m3['total_bets']:>6} {m3['roi_pct']:>7.1f}% {m3['profit_factor']:>5.2f}")
+
     if best:
-        print(f"\nPER-ASSET AT OPTIMAL THRESHOLD ({best['threshold']})")
-        print("-" * 70)
-        for asset_name in ASSETS:
-            asset_results = [r for r in all_results if r["asset"] == asset_name]
-            if not asset_results:
-                continue
-            stats = analyze_threshold(asset_results, best["threshold"])
-            print(f"  {asset_name}: {stats['bets']} bets, "
-                  f"{stats['win_rate']}% win rate, "
-                  f"ROI: {stats['roi_pct']}%")
+        print(f"\n  Optimal threshold: {best['threshold']}")
+        print(f"  At optimal: {best['win_rate']}% WR, {best['total_bets']} bets, "
+              f"{best['roi_pct']}% ROI, PF={best['profit_factor']}")
+        print(f"\n  Per-asset at optimal:")
+        for a, wr in sorted(best['per_asset_wr'].items()):
+            bets = best['per_asset_bets'].get(a, 0)
+            print(f"    {a}: {wr}% WR ({bets} bets)")
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 60)
     print("Backtest complete.")
 
 

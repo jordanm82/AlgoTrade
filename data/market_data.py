@@ -5,7 +5,7 @@ import ccxt
 
 exchange = ccxt.binanceus({"enableRateLimit": True})
 
-TRACKED_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+TRACKED_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT"]
 
 
 def get_order_book_imbalance(symbol: str, depth: int = 20) -> dict:

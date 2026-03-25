@@ -24,6 +24,7 @@ from config.pair_config import (
 )
 from config.production import (
     MAX_CONCURRENT_POSITIONS,
+    MAX_CONCURRENT_KALSHI_BETS,
     POSITION_SIZE_PCT,
     STOP_LOSS_PCT,
 )
@@ -57,8 +58,9 @@ SNAPSHOT_INTERVAL = 900  # save snapshot every 15 minutes
 class LiveDaemon:
     """Production daemon that runs BB Grid + RSI MR on validated pairs."""
 
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = False, kalshi_only: bool = False):
         self.dry_run = dry_run
+        self.kalshi_only = kalshi_only
         self.fetcher = DataFetcher()
         self.store = DataStore(DATA_DIR)
         self.tracker = PositionTracker(max_concurrent=MAX_CONCURRENT_POSITIONS)
@@ -94,6 +96,7 @@ class LiveDaemon:
         self.kalshi_client = None  # lazy init
         self.kalshi_threshold = 30  # minimum confidence to bet (lowered from 40 — conf 25-35 with flow confirmation is the sweet spot)
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
+        self._active_kalshi_bets = {}  # {ticker: placement_time}
 
     # ------------------------------------------------------------------
     # Position sync from exchanges
@@ -524,6 +527,19 @@ class LiveDaemon:
         "ETH/USDT": "KXETH15M",
         "SOL/USDT": "KXSOL15M",
         "XRP/USDT": "KXXRP15M",
+        "BNB/USDT": "KXBNB15M",
+    }
+
+    # Per-asset minimum confidence thresholds (from 3-month backtest optimization)
+    # Class A (threshold 30): BTC — strong at lower confidence
+    # Class A (threshold 35): ETH, SOL, BNB — best WR at moderate confidence
+    # Class B (threshold 30): XRP — degrades at higher thresholds
+    KALSHI_THRESHOLDS = {
+        "BTC/USDT": 30,
+        "ETH/USDT": 35,
+        "SOL/USDT": 35,
+        "XRP/USDT": 30,
+        "BNB/USDT": 35,
     }
 
     def _init_kalshi_client(self):
@@ -543,8 +559,19 @@ class LiveDaemon:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
     def _kalshi_cycle(self):
-        """Run Kalshi predictions for BTC/ETH/SOL/XRP and optionally place bets."""
+        """Run Kalshi predictions for BTC/ETH/SOL/XRP/BNB and optionally place bets."""
+        # Prune expired bets (Kalshi 15m contracts settle in 15 minutes)
+        now = time.time()
+        self._active_kalshi_bets = {
+            t: placed for t, placed in self._active_kalshi_bets.items()
+            if now - placed < 900  # 15 minutes
+        }
+        if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
+            print(colored("  Kalshi: at max concurrent bets, skipping cycle", "yellow"))
+            return
+
         predictions = []
+        valid_signals = []
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
             # Kalshi pairs may not be in our Coinbase trading set — fetch independently
             df = self._dataframes.get(symbol)
@@ -573,7 +600,17 @@ class LiveDaemon:
             except Exception:
                 pass
 
-            signal = self.kalshi_predictor.score(df, market_data=market_data)
+            # Fetch 1h data for multi-timeframe confirmation
+            df_1h = None
+            try:
+                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
+                if df_1h is not None and not df_1h.empty:
+                    from data.indicators import add_indicators
+                    df_1h = add_indicators(df_1h)
+            except Exception as e:
+                print(colored(f"  Warning: 1h data fetch failed for {symbol}: {e}", "yellow"))
+
+            signal = self.kalshi_predictor.score(df, market_data=market_data, df_1h=df_1h)
             if signal is None:
                 predictions.append({
                     "symbol": symbol, "asset": symbol.split("/")[0],
@@ -595,8 +632,37 @@ class LiveDaemon:
                 "reason": "",
             }
 
-            if signal.confidence < self.kalshi_threshold:
-                pred["reason"] = f"below threshold ({self.kalshi_threshold})"
+            asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, self.kalshi_threshold)
+            if signal.confidence < asset_threshold:
+                pred["reason"] = f"below threshold ({asset_threshold})"
+                predictions.append(pred)
+                continue
+
+            # Signal cleared threshold — collect for confidence-ranked execution
+            valid_signals.append({
+                "symbol": symbol,
+                "series_ticker": series_ticker,
+                "signal": signal,
+                "market_data": market_data,
+                "pred": pred,
+            })
+
+        # Sort by confidence descending — highest conviction bets get priority
+        valid_signals.sort(key=lambda x: x["signal"].confidence, reverse=True)
+
+        # Execute top signals up to concurrency limit
+        for vs in valid_signals:
+            symbol = vs["symbol"]
+            series_ticker = vs["series_ticker"]
+            signal = vs["signal"]
+            market_data = vs["market_data"]
+            pred = vs["pred"]
+
+            ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
+            net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
+
+            if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
+                pred["reason"] = "at max concurrent bets (lower confidence skipped)"
                 predictions.append(pred)
                 continue
 
@@ -770,6 +836,7 @@ class LiveDaemon:
                         f"| filled={fill_count} status={order_status}",
                         "magenta",
                     ))
+                    self._active_kalshi_bets[ticker] = time.time()
                 except Exception as e:
                     pred["reason"] = f"order failed: {e}"
                     print(colored(f"  [KALSHI ERR] {pred['asset']}: {e}", "red"))
@@ -1333,9 +1400,10 @@ class LiveDaemon:
     def startup(self):
         """Fetch initial data on startup."""
         mode = "DRY-RUN" if self.dry_run else "LIVE"
+        kalshi_tag = " (KALSHI-ONLY)" if self.kalshi_only else ""
         print(colored(f"{'='*70}", "cyan"))
-        print(colored(f"  Production Trading Daemon — {mode} MODE", "cyan"))
-        print(colored(f"  Strategies: BB Grid + RSI MR (per-pair config)", "cyan"))
+        print(colored(f"  Production Trading Daemon — {mode} MODE{kalshi_tag}", "cyan"))
+        print(colored(f"  Strategies: {'Kalshi 15m Predictions only' if self.kalshi_only else 'BB Grid + RSI MR (per-pair config)'}", "cyan"))
         print(colored(f"  Pairs: {', '.join(ALL_PAIRS)}", "cyan"))
         print(colored(f"  Timeframe: 15m | Equity: ${self._equity:,.2f}", "cyan"))
         print(colored(f"  Stop-loss: {STOP_LOSS_PCT:.0%} | Position size: {POSITION_SIZE_PCT:.0%}", "cyan"))
@@ -1363,21 +1431,27 @@ class LiveDaemon:
             print(colored("[HALT] Daily drawdown limit reached — skipping signal generation", "red"))
             return []
 
-        signals = self._collect_all_signals()
+        signals = []
 
-        if signals:
-            print(f"[CYCLE] {len(signals)} signals detected (sorted by confidence):")
-            for sig in signals:
-                conf = sig.get("_confidence", 0)
-                action = sig.get("action", "?")
-                sym = sig.get("symbol", "?")
-                # Skip new entries if at max positions (closes always execute)
-                if action in ("BUY", "SHORT") and not self.tracker.can_open():
-                    print(colored(f"  [SKIP] {action} {sym} (conf={conf:.0f}) — max {MAX_CONCURRENT_POSITIONS} positions reached", "yellow"))
-                    continue
-                self._execute_signal(sig)
+        # Spot trading (Coinbase) — skip when kalshi_only mode
+        if not self.kalshi_only:
+            signals = self._collect_all_signals()
+
+            if signals:
+                print(f"[CYCLE] {len(signals)} signals detected (sorted by confidence):")
+                for sig in signals:
+                    conf = sig.get("_confidence", 0)
+                    action = sig.get("action", "?")
+                    sym = sig.get("symbol", "?")
+                    # Skip new entries if at max positions (closes always execute)
+                    if action in ("BUY", "SHORT") and not self.tracker.can_open():
+                        print(colored(f"  [SKIP] {action} {sym} (conf={conf:.0f}) — max {MAX_CONCURRENT_POSITIONS} positions reached", "yellow"))
+                        continue
+                    self._execute_signal(sig)
+            else:
+                print("[CYCLE] No signals")
         else:
-            print("[CYCLE] No signals")
+            print("[CYCLE] Kalshi-only mode — skipping spot signals")
 
         # Kalshi prediction cycle
         try:
@@ -1394,8 +1468,9 @@ class LiveDaemon:
     def tick(self):
         """Minute tick: update prices, enforce stops, check profit taking."""
         self._update_prices()
-        self._enforce_stops()
-        self._check_profit_taking()
+        if not self.kalshi_only:
+            self._enforce_stops()
+            self._check_profit_taking()
         self._update_equity()
 
     def run(self):
@@ -1450,9 +1525,13 @@ def main():
         "--dry-run", action="store_true",
         help="Print signals without executing trades",
     )
+    parser.add_argument(
+        "--kalshi-only", action="store_true",
+        help="Run only Kalshi 15m predictions, skip Coinbase spot trading",
+    )
     args = parser.parse_args()
 
-    daemon = LiveDaemon(dry_run=args.dry_run)
+    daemon = LiveDaemon(dry_run=args.dry_run, kalshi_only=args.kalshi_only)
     daemon.run()
 
 

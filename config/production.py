@@ -34,4 +34,5 @@ RSI_MR_CONFIG = {
 POSITION_SIZE_PCT = 0.10   # 10% of equity per trade, compounding
 MAX_LEVERAGE = 2           # 2x max on validated pairs, 1x on others
 MAX_CONCURRENT_POSITIONS = 3  # max 3 at a time, highest confidence takes priority
+MAX_CONCURRENT_KALSHI_BETS = 3  # separate limit from spot positions
 STOP_LOSS_PCT = 0.03       # 3% hard stop

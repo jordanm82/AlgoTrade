@@ -13,12 +13,14 @@ import numpy as np
 from dataclasses import dataclass
 
 
-# Maximum raw score from lagging signals (components 1-6)
-_MAX_LAGGING = 100
-# Maximum raw score from leading signals (components 7-11)
+# Maximum raw score from lagging signals (components 1-8)
+_MAX_LAGGING = 120  # was 110: +ATR(10)
+# Maximum raw score from leading signals (components 9-13)
 _MAX_LEADING = 65
+# Maximum raw score from MTF (1-hour trend alignment) component
+_MAX_MTF = 15
 # Combined max before normalization
-_MAX_RAW = _MAX_LAGGING + _MAX_LEADING  # 165
+_MAX_RAW = _MAX_LAGGING + _MAX_LEADING + _MAX_MTF  # 120 + 65 + 15 = 200
 
 
 @dataclass
@@ -34,7 +36,8 @@ class KalshiSignal:
 class KalshiPredictor:
     """Scores confidence for short-term crypto direction predictions."""
 
-    def score(self, df: pd.DataFrame, market_data: dict | None = None) -> KalshiSignal | None:
+    def score(self, df: pd.DataFrame, market_data: dict | None = None,
+              df_1h: pd.DataFrame | None = None) -> KalshiSignal | None:
         """Score confidence for the next 15-minute direction.
 
         Args:
@@ -120,6 +123,10 @@ class KalshiPredictor:
 
         up_score = 0
         down_score = 0
+        lagging_up = 0
+        lagging_down = 0
+        leading_up = 0
+        leading_down = 0
         components = {}
 
         # 1. RSI Signal (0-30)
@@ -139,6 +146,8 @@ class KalshiPredictor:
             rsi_down = 10
         up_score += rsi_up
         down_score += rsi_down
+        lagging_up += rsi_up
+        lagging_down += rsi_down
         components["rsi"] = {"up": rsi_up, "down": rsi_down, "value": rsi}
 
         # 2. Bollinger Band Signal (0-20)
@@ -158,6 +167,8 @@ class KalshiPredictor:
                 bb_down = 10
         up_score += bb_up
         down_score += bb_down
+        lagging_up += bb_up
+        lagging_down += bb_down
         components["bb"] = {"up": bb_up, "down": bb_down}
 
         # 3. MACD Momentum (0-15)
@@ -175,6 +186,8 @@ class KalshiPredictor:
             macd_down = 8
         up_score += macd_up
         down_score += macd_down
+        lagging_up += macd_up
+        lagging_down += macd_down
         components["macd"] = {"up": macd_up, "down": macd_down}
 
         # 4. Volume Confirmation (0-10)
@@ -189,29 +202,29 @@ class KalshiPredictor:
         # Volume confirms the dominant direction
         if up_score > down_score:
             up_score += vol_score
+            lagging_up += vol_score
         else:
             down_score += vol_score
+            lagging_down += vol_score
         components["volume"] = {"score": vol_score, "ratio": vol / vol_sma if vol_sma > 0 else 0}
 
-        # 5. Price Momentum -- last 3 candles (0-15)
-        mom_up = 0
-        mom_down = 0
-        if len(df) >= 4:
-            c1 = float(df.iloc[-1]["close"])
-            c2 = float(df.iloc[-2]["close"])
-            c3 = float(df.iloc[-3]["close"])
-            c4 = float(df.iloc[-4]["close"])
-            if c1 > c2 > c3:
-                mom_up = 15
-            elif c1 > c2:
-                mom_up = 8
-            if c1 < c2 < c3:
-                mom_down = 15
-            elif c1 < c2:
-                mom_down = 8
-        up_score += mom_up
-        down_score += mom_down
-        components["momentum"] = {"up": mom_up, "down": mom_down}
+        # 5. Rate of Change ROC-5 (0-10) — replaces old Price Momentum
+        roc_up = 0
+        roc_down = 0
+        roc_val = float(last.get("roc_5", 0)) if pd.notna(last.get("roc_5")) else 0
+        if roc_val > 1.5:
+            roc_up = 10
+        elif roc_val > 0.5:
+            roc_up = 5
+        elif roc_val < -1.5:
+            roc_down = 10
+        elif roc_val < -0.5:
+            roc_down = 5
+        up_score += roc_up
+        down_score += roc_down
+        lagging_up += roc_up
+        lagging_down += roc_down
+        components["roc"] = {"up": roc_up, "down": roc_down, "value": roc_val}
 
         # 6. RSI Trend (0-10) -- is RSI recovering from extreme?
         rsi_trend_up = 0
@@ -227,7 +240,57 @@ class KalshiPredictor:
                 rsi_trend_down = 10  # RSI declining from overbought
         up_score += rsi_trend_up
         down_score += rsi_trend_down
+        lagging_up += rsi_trend_up
+        lagging_down += rsi_trend_down
         components["rsi_trend"] = {"up": rsi_trend_up, "down": rsi_trend_down}
+
+        # 7. Stochastic RSI (0-15)
+        stoch_up = 0
+        stoch_down = 0
+        stochrsi_k = float(last.get("stochrsi_k", 50)) if pd.notna(last.get("stochrsi_k")) else 50
+        if stochrsi_k < 10:
+            stoch_up = 15
+        elif stochrsi_k < 20:
+            stoch_up = 8
+        elif stochrsi_k > 90:
+            stoch_down = 15
+        elif stochrsi_k > 80:
+            stoch_down = 8
+        up_score += stoch_up
+        down_score += stoch_down
+        lagging_up += stoch_up
+        lagging_down += stoch_down
+        components["stochrsi"] = {"up": stoch_up, "down": stoch_down, "value": stochrsi_k}
+
+        # 8. ATR Move Ratio (0-10, can apply -5 penalty)
+        atr_score = 0
+        atr_val = float(last.get("atr", 0)) if pd.notna(last.get("atr")) else 0
+        candle_move = abs(close - float(last.get("open", close)))
+        candle_is_up = close > float(last.get("open", close))
+        dominant_is_up = up_score > down_score
+
+        if atr_val > 0:
+            move_ratio = candle_move / atr_val
+            if move_ratio > 2.0 and candle_is_up != dominant_is_up:
+                atr_score = -5  # overextended against dominant direction
+            elif move_ratio > 1.5 and candle_is_up == dominant_is_up:
+                atr_score = 10  # strong move confirming direction
+
+        if atr_score > 0:
+            if dominant_is_up:
+                up_score += atr_score
+                lagging_up += atr_score
+            else:
+                down_score += atr_score
+                lagging_down += atr_score
+        elif atr_score < 0:
+            if dominant_is_up:
+                up_score += atr_score  # penalty reduces dominant side
+                lagging_up += atr_score
+            else:
+                down_score += atr_score
+                lagging_down += atr_score
+        components["atr_move"] = {"score": atr_score, "move_ratio": candle_move / atr_val if atr_val > 0 else 0}
 
         # --- Leading indicator components (only when market_data provided) ---
         has_leading = market_data is not None
@@ -249,6 +312,8 @@ class KalshiPredictor:
             ob_down = 10
         up_score += ob_up
         down_score += ob_down
+        leading_up += ob_up
+        leading_down += ob_down
         components["order_book"] = {"up": ob_up, "down": ob_down, "imbalance": imbalance}
 
         # 8. Trade Flow (0-20)
@@ -266,6 +331,8 @@ class KalshiPredictor:
             tf_down = 10
         up_score += tf_up
         down_score += tf_down
+        leading_up += tf_up
+        leading_down += tf_down
         components["trade_flow"] = {"up": tf_up, "down": tf_down, "net_flow": net_flow}
 
         # 9. Large Trade Bias (0-10)
@@ -278,6 +345,8 @@ class KalshiPredictor:
             lt_down = 10
         up_score += lt_up
         down_score += lt_down
+        leading_up += lt_up
+        leading_down += lt_down
         components["large_trade"] = {"up": lt_up, "down": lt_down, "bias": large_bias}
 
         # 10. Spread Signal (0-5) — wide spread confirms the dominant direction
@@ -287,8 +356,10 @@ class KalshiPredictor:
             spread_score = 5
         if up_score > down_score:
             up_score += spread_score
+            leading_up += spread_score
         else:
             down_score += spread_score
+            leading_down += spread_score
         components["spread"] = {"score": spread_score, "spread_pct": spread_pct}
 
         # 11. Cross-Asset / BTC leader signal (0-10)
@@ -303,12 +374,57 @@ class KalshiPredictor:
             ca_up = 10
         up_score += ca_up
         down_score += ca_down
+        leading_up += ca_up
+        leading_down += ca_down
         components["cross_asset"] = {"up": ca_up, "down": ca_down, "btc_dir": btc_dir}
 
+        # 12. 1-Hour Trend Alignment (-15 to +15)
+        mtf_score = 0
+        if df_1h is not None and len(df_1h) >= 20:
+            last_1h = df_1h.iloc[-1]
+            rsi_1h = float(last_1h.get("rsi", 50)) if pd.notna(last_1h.get("rsi")) else 50
+            macd_1h = float(last_1h.get("macd_hist", 0)) if pd.notna(last_1h.get("macd_hist")) else 0
+
+            trend_1h_up = rsi_1h > 60 and macd_1h > 0
+            trend_1h_down = rsi_1h < 40 and macd_1h < 0
+            dominant_is_up = up_score > down_score
+
+            if trend_1h_up and dominant_is_up:
+                mtf_score = 15
+            elif trend_1h_down and not dominant_is_up:
+                mtf_score = 15
+            elif trend_1h_up and not dominant_is_up:
+                mtf_score = -15
+            elif trend_1h_down and dominant_is_up:
+                mtf_score = -15
+            # else: neutral, mtf_score stays 0
+
+            if mtf_score > 0:
+                if dominant_is_up:
+                    up_score += mtf_score
+                else:
+                    down_score += mtf_score
+            elif mtf_score < 0:
+                if dominant_is_up:
+                    up_score += mtf_score
+                else:
+                    down_score += mtf_score
+
+        components["mtf"] = {"score": mtf_score}
+
+        # Apply quality filters
+        if self._apply_filters(up_score, down_score, lagging_up, lagging_down,
+                               leading_up, leading_down, df, components):
+            return None
+
         # --- Determine direction and confidence ---
-        # When leading indicators are present the raw max is higher (~165),
-        # so we normalize to keep the 0-100 scale.
-        max_possible = _MAX_RAW if has_leading else _MAX_LAGGING
+        # Normalize to 0-100 scale based on which data sources are present.
+        if has_leading:
+            max_possible = _MAX_RAW  # 200 (lagging + leading + MTF)
+        elif df_1h is not None:
+            max_possible = _MAX_LAGGING + _MAX_MTF  # 135
+        else:
+            max_possible = _MAX_LAGGING  # 120
 
         if up_score > down_score and up_score > 0:
             confidence = min(100, int(up_score * 100 / max_possible))
@@ -323,3 +439,40 @@ class KalshiPredictor:
                 components=components, price=close, rsi=rsi,
             )
         return None
+
+    def _apply_filters(self, up_score: int, down_score: int,
+                       lagging_up: int, lagging_down: int,
+                       leading_up: int, leading_down: int,
+                       df: pd.DataFrame, components: dict) -> bool:
+        """Return True if signal should be rejected by quality filters."""
+
+        # Filter 1: Directional conflict
+        lagging_dir = "UP" if lagging_up > lagging_down else "DOWN"
+        leading_dir = "UP" if leading_up > leading_down else "DOWN"
+        lagging_strength = max(lagging_up, lagging_down)
+        leading_strength = max(leading_up, leading_down)
+
+        if (lagging_dir != leading_dir
+                and lagging_strength >= 15
+                and leading_strength >= 15):
+            components["filter_conflict"] = True
+            return True
+
+        # Filter 2: Volatility regime (ATR percentile over 200-period window)
+        if "atr" in df.columns and len(df) >= 200:
+            atr_series = df["atr"].dropna().tail(200)
+            if len(atr_series) >= 50:
+                current_atr = float(atr_series.iloc[-1])
+                percentile = (atr_series < current_atr).sum() / len(atr_series) * 100
+                if percentile > 90 or percentile < 10:
+                    components["filter_volatility"] = True
+                    return True
+
+        # Filter 3: Minimum margin of victory
+        winner = max(up_score, down_score)
+        loser = min(up_score, down_score)
+        if loser > 0 and winner < loser * 1.5:
+            components["filter_margin"] = True
+            return True
+
+        return False
