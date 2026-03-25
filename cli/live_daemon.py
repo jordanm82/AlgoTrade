@@ -859,8 +859,8 @@ class LiveDaemon:
 
             # --- CONFIRMED / DOUBLE_CONFIRMED: re-score 15m with fresh leading indicators ---
             elif state in ("CONFIRMED", "DOUBLE_CONFIRMED"):
-                if not pending:
-                    # No SETUP signal — nothing to re-score
+                if not pending and self.kalshi_predictor_version != "v3":
+                    # No SETUP signal — nothing to re-score (V1/V2 only)
                     predictions.append({
                         "symbol": symbol, "asset": asset,
                         "direction": "--", "confidence": 0,
