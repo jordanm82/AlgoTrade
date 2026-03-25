@@ -426,56 +426,70 @@ def main():
     except Exception:
         console.print("[yellow]Could not connect to Kalshi[/yellow]")
 
-    # Approach: alternate between rendering and reading input.
-    # On each cycle: clear screen, render dashboard, show prompt, wait for input
-    # with a short timeout. If no input, re-render. If input, process command.
-    #
-    # The key insight: we only clear+redraw when NO input is happening.
-    # When the user is typing, we wait patiently on their input.
+    # Approach: raw terminal mode captures individual keystrokes.
+    # We build the input buffer character by character, and redraw
+    # the dashboard on a timer WITHOUT losing the user's partial input.
+    # The input buffer is always preserved and re-rendered with the prompt.
 
     import tty
     import termios
 
     input_buffer = ""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
 
-    def render(extra_line=""):
-        """Clear screen and render dashboard + prompt."""
-        sys.stdout.write("\033[2J\033[H")  # ANSI clear screen + cursor to top
+    def render():
+        """Clear screen and render dashboard + current input buffer."""
+        sys.stdout.write("\033[2J\033[H")  # clear screen + cursor home
         sys.stdout.flush()
         console.print(build_layout(state))
-        prompt_text = f"[bold cyan]k15>[/bold cyan] {extra_line}"
-        console.print(prompt_text, end="")
+        # Show prompt with whatever the user has typed so far
+        sys.stdout.write(f"\033[1;36mk15>\033[0m {input_buffer}")
         sys.stdout.flush()
 
-    render()
-
     try:
+        tty.setcbreak(fd)  # char-by-char input, no echo needed (we handle it)
+        render()
+
         while True:
-            # Wait for input with 2-second timeout
+            # Check for input with 2-second timeout
             ready, _, _ = select.select([sys.stdin], [], [], 2.0)
 
             if ready:
-                # User is typing — read one line
-                try:
-                    line = sys.stdin.readline()
-                    if not line:  # EOF
-                        break
-                    cmd = line.strip()
+                ch = sys.stdin.read(1)
+
+                if ch == '\n' or ch == '\r':
+                    # Enter pressed — process command
+                    cmd = input_buffer.strip()
+                    input_buffer = ""
                     if cmd:
-                        # Process command (temporarily below the dashboard)
-                        console.print()  # newline after prompt
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
                         if handle_command(cmd, state, console):
                             break
-                        time.sleep(0.5)  # brief pause to see command output
-                except (KeyboardInterrupt, EOFError):
+                        time.sleep(0.3)
+                elif ch == '\x7f' or ch == '\x08':
+                    # Backspace
+                    if input_buffer:
+                        input_buffer = input_buffer[:-1]
+                elif ch == '\x03':
+                    # Ctrl+C
                     break
+                elif ch == '\x04':
+                    # Ctrl+D
+                    break
+                elif ch >= ' ':
+                    # Regular character
+                    input_buffer += ch
 
-            # Re-render dashboard (either after timeout or after command)
+            # Redraw dashboard (preserves input_buffer in the prompt)
             render()
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         pass
     finally:
+        # Restore terminal settings
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         if state.running:
             state.running = False
             if state.daemon:
