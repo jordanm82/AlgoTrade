@@ -151,16 +151,18 @@ class KalshiClient:
     # --- Trading ---
 
     def place_order(self, ticker: str, side: str, count: int,
-                    price_cents: int | None = None, order_type: str = "market") -> dict:
+                    price_cents: int | None = None, order_type: str = "market",
+                    action: str = "buy") -> dict:
         """Place an order.
         side: 'yes' or 'no'
         count: number of contracts
         price_cents: 1-99 for limit orders
         order_type: 'market' or 'limit'
+        action: 'buy' or 'sell'
         """
         data = {
             "ticker": ticker,
-            "action": "buy",
+            "action": action,
             "side": side,
             "type": order_type,
             "count": count,
@@ -184,6 +186,19 @@ class KalshiClient:
 
     def cancel_order(self, order_id: str) -> dict:
         return self._delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+
+    def get_order_status(self, order_id: str) -> dict:
+        """Get status of a specific order."""
+        return self._get(f"/trade-api/v2/portfolio/orders/{order_id}")
+
+    def cancel_order_safe(self, order_id: str) -> dict:
+        """Cancel an order. Returns filled status on 404 (order already filled)."""
+        try:
+            return self._delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return {"status": "filled"}
+            raise
 
     # --- Portfolio ---
 
