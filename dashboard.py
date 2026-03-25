@@ -369,20 +369,15 @@ class Dashboard:
                 ob = pred.get("ob", 0)
                 flow = pred.get("flow", 0)
                 reason = pred.get("reason", "")
-                threshold = getattr(self.daemon, "kalshi_threshold", 40)
+                state = pred.get("state", "")
+                state_tag = f" [{state}]" if state else ""
                 if direction == "--" or conf == 0:
-                    lines.append(f"    {asset:<5} {'--':<5} conf={conf:<3}")
-                elif conf < threshold:
-                    lines.append(
-                        f"    {asset:<5} {direction:<5} conf={conf:<3} |  "
-                        f"enhanced: OB={ob:+.2f} flow={flow:+.2f}  |  "
-                        f"below threshold ({threshold})"
-                    )
+                    lines.append(f"    {asset:<5} {'--':<5} conf={conf:<3}{state_tag}")
                 else:
                     lines.append(
                         f"    {asset:<5} {direction:<5} conf={conf:<3} |  "
-                        f"enhanced: OB={ob:+.2f} flow={flow:+.2f}  |  "
-                        f"{reason}"
+                        f"OB={ob:+.2f} flow={flow:+.2f}  |  "
+                        f"{reason}{state_tag}"
                     )
 
         # Footer
