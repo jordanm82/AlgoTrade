@@ -852,8 +852,16 @@ class LiveDaemon:
                 except Exception:
                     pass
 
-                # Re-score on cached 15m data with fresh leading indicators
+                # Use cached 15m data, or fetch fresh if no cache (late start)
                 df_15m = self._kalshi_cached_dataframes.get(symbol)
+                if df_15m is None or len(df_15m) < 50:
+                    try:
+                        df_15m = self.fetcher.ohlcv(symbol, "15m", limit=200)
+                        if df_15m is not None and not df_15m.empty:
+                            df_15m = add_indicators(df_15m)
+                            self._kalshi_cached_dataframes[symbol] = df_15m
+                    except Exception:
+                        pass
                 if df_15m is None or len(df_15m) < 50:
                     predictions.append({
                         "symbol": symbol, "asset": asset,
@@ -929,7 +937,7 @@ class LiveDaemon:
                             pending = self._kalshi_pending_signals[asset]
                     else:
                         signal = None
-                elif not self.kalshi_predictor_version == "v3":
+                else:
                     signal = self.kalshi_predictor.score(df_15m, market_data=market_data, df_1h=df_1h)
 
                 if signal is None:
