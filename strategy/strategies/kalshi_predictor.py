@@ -13,12 +13,12 @@ import numpy as np
 from dataclasses import dataclass
 
 
-# Maximum raw score from lagging signals (components 1-6)
-_MAX_LAGGING = 110  # was 100: +StochRSI(15) +ROC(10) -OldMomentum(15) = +10, ATR(+10) added in Task 4
-# Maximum raw score from leading signals (components 7-11)
+# Maximum raw score from lagging signals (components 1-8)
+_MAX_LAGGING = 120  # was 110: +ATR(10)
+# Maximum raw score from leading signals (components 9-13)
 _MAX_LEADING = 65
 # Combined max before normalization
-_MAX_RAW = _MAX_LAGGING + _MAX_LEADING  # 110 + 65 = 175
+_MAX_RAW = _MAX_LAGGING + _MAX_LEADING  # 120 + 65 = 185
 
 
 @dataclass
@@ -240,6 +240,32 @@ class KalshiPredictor:
         up_score += stoch_up
         down_score += stoch_down
         components["stochrsi"] = {"up": stoch_up, "down": stoch_down, "value": stochrsi_k}
+
+        # 8. ATR Move Ratio (0-10, can apply -5 penalty)
+        atr_score = 0
+        atr_val = float(last.get("atr", 0)) if pd.notna(last.get("atr")) else 0
+        candle_move = abs(close - float(last.get("open", close)))
+        candle_is_up = close > float(last.get("open", close))
+        dominant_is_up = up_score > down_score
+
+        if atr_val > 0:
+            move_ratio = candle_move / atr_val
+            if move_ratio > 2.0 and candle_is_up != dominant_is_up:
+                atr_score = -5  # overextended against dominant direction
+            elif move_ratio > 1.5 and candle_is_up == dominant_is_up:
+                atr_score = 10  # strong move confirming direction
+
+        if atr_score > 0:
+            if dominant_is_up:
+                up_score += atr_score
+            else:
+                down_score += atr_score
+        elif atr_score < 0:
+            if dominant_is_up:
+                up_score += atr_score  # penalty reduces dominant side
+            else:
+                down_score += atr_score
+        components["atr_move"] = {"score": atr_score, "move_ratio": candle_move / atr_val if atr_val > 0 else 0}
 
         # --- Leading indicator components (only when market_data provided) ---
         has_leading = market_data is not None

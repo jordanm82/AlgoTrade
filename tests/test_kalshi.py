@@ -150,6 +150,7 @@ class TestKalshiPredictor:
         """Every signal component fires for a perfect UP setup."""
         # RSI < 25 = 30, BB below = 20, MACD hist positive+increasing = 15,
         # Volume 2x = 10, ROC > 1.5% = 10, RSI trend recovering = 10, StochRSI < 10 = 15
+        # ATR move > 1.5x in UP direction = 10
         df = _make_df(
             rsi=22.0,
             close=86400.0,
@@ -159,11 +160,14 @@ class TestKalshiPredictor:
             vol_sma_20=1000.0,
             roc_5=2.0,
             stochrsi_k=8.0,
+            atr=200.0,
             # MACD hist increasing
             macd_hist_trend=[2.0, 3.0, 4.0, 5.0],
             # RSI recovering from oversold
             rsi_trend=[18.0, 19.0, 20.0, 22.0],
         )
+        # Big UP candle: move = 350, ratio = 1.75 > 1.5 → +10 ATR
+        df.iloc[-1, df.columns.get_loc("open")] = df.iloc[-1]["close"] - 350
         predictor = KalshiPredictor()
         signal = predictor.score(df)
 
@@ -177,7 +181,8 @@ class TestKalshiPredictor:
         assert signal.components["roc"]["up"] == 10
         assert signal.components["rsi_trend"]["up"] == 10
         assert signal.components["stochrsi"]["up"] == 15
-        # Total = 30 + 20 + 15 + 10 + 10 + 10 + 15 = 110
+        assert signal.components["atr_move"]["score"] == 10
+        # Total = 30 + 20 + 15 + 10 + 10 + 10 + 15 + 10 = 120
         assert signal.confidence == 100
 
     def test_confidence_capped_at_100(self):
@@ -312,6 +317,36 @@ class TestKalshiPredictor:
         signal = predictor.score(df)
         assert signal is not None
         assert signal.components["stochrsi"]["down"] == 8
+
+    def test_atr_move_ratio_confirms_signal(self):
+        """Candle move > 1.5x ATR in dominant direction gives +10."""
+        df = _make_df(rsi=32.0, atr=200.0)  # RSI gives 10 UP
+        # Override last candle to have big UP move (close > open by 350)
+        df.iloc[-1, df.columns.get_loc("open")] = df.iloc[-1]["close"] - 350
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.components["atr_move"]["score"] == 10
+
+    def test_atr_move_ratio_penalizes_overextension(self):
+        """Candle move > 2.0x ATR against dominant direction gives -5 penalty."""
+        df = _make_df(rsi=22.0, atr=200.0)  # RSI gives 30 UP
+        # DOWN candle opposing dominant UP direction
+        df.iloc[-1, df.columns.get_loc("open")] = df.iloc[-1]["close"] + 450
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["atr_move"]["score"] == -5
+
+    def test_atr_move_ratio_no_effect_small_move(self):
+        """Candle move < 1.5x ATR gives 0."""
+        df = _make_df(rsi=32.0, atr=200.0)
+        # Default _make_df sets open = close, so move is 0
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["atr_move"]["score"] == 0
 
     def test_signal_dataclass_fields(self):
         """KalshiSignal has all required fields."""
@@ -455,10 +490,12 @@ class TestKalshiPredictorEnhanced:
         df = _make_df(
             rsi=22.0, close=86400.0, bb_lower=86500.0,
             macd_hist=5.0, volume=2500.0, vol_sma_20=1000.0,
-            roc_5=2.0, stochrsi_k=8.0,
+            roc_5=2.0, stochrsi_k=8.0, atr=200.0,
             macd_hist_trend=[2.0, 3.0, 4.0, 5.0],
             rsi_trend=[18.0, 19.0, 20.0, 22.0],
         )
+        # Big UP candle: move = 350, ratio = 1.75 > 1.5 → +10 ATR
+        df.iloc[-1, df.columns.get_loc("open")] = df.iloc[-1]["close"] - 350
         predictor = KalshiPredictor()
         market_data = {
             "order_book": {"imbalance": 0.5, "spread_pct": 0.15},
@@ -469,8 +506,8 @@ class TestKalshiPredictorEnhanced:
         assert signal is not None
         assert signal.direction == "UP"
         assert signal.confidence <= 100
-        # All components fire: lagging 110 + leading 65 = 175 raw
-        # Normalized: 175 * 100 / 175 = 100
+        # All components fire: lagging 120 + leading 65 = 185 raw
+        # Normalized: 185 * 100 / 185 = 100
         assert signal.confidence == 100
 
     def test_leading_only_signal_works(self):
