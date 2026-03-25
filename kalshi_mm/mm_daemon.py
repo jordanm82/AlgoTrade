@@ -1021,27 +1021,41 @@ def main():
             if args.cycles > 0 and cycle > args.cycles:
                 break
 
-            # Tick runners — max MAX_CONCURRENT_POSITIONS can have capital deployed.
-            # "Active" = has inventory, has pending bid, OR is in a quoting/discovering
-            # state (about to deploy capital). Only truly idle/dark runners are "free".
+            # Tick runners with position limiting.
+            # Safe mode: only tick ONE runner per cycle. Pick the first one
+            # that has capital deployed, or the first idle one if none do.
+            # Normal mode: up to MAX_CONCURRENT_POSITIONS runners active.
             from kalshi_mm.mm_config import MAX_CONCURRENT_POSITIONS
 
-            def _is_active(r):
-                """Runner has capital deployed or is about to."""
-                return (r.inv.has_inventory()
-                        or r.inv.pending_bid_id is not None
-                        or r.inv.state in (DISCOVERING, QUOTING_BID, QUOTING_ASK))
+            if args.safe_mode:
+                # Safe mode: strictly one runner. Find the one with capital,
+                # or pick the first idle one to advance.
+                active_runner = None
+                for r in runners:
+                    if r.inv.has_inventory() or r.inv.pending_bid_id is not None:
+                        active_runner = r
+                        break
+                if active_runner:
+                    active_runner.tick()
+                else:
+                    # Nobody has capital — tick just the first runner
+                    runners[0].tick()
+            else:
+                # Normal mode: max N concurrent
+                def _has_capital(r):
+                    return r.inv.has_inventory() or r.inv.pending_bid_id is not None
 
-            active_count = sum(1 for r in runners if _is_active(r))
+                active_count = sum(1 for r in runners if _has_capital(r))
 
-            for runner in runners:
-                if _is_active(runner):
-                    runner.tick()  # always tick active runners
-                elif active_count < MAX_CONCURRENT_POSITIONS:
-                    runner.tick()  # room for one more — let it advance from IDLE
-                    if _is_active(runner):
-                        active_count += 1
-                # else: at capacity, skip this idle/dark runner
+                for runner in runners:
+                    if _has_capital(runner):
+                        runner.tick()
+                    elif runner.inv.state == EXITING:
+                        runner.tick()
+                    elif active_count < MAX_CONCURRENT_POSITIONS:
+                        runner.tick()
+                        if _has_capital(runner):
+                            active_count += 1
 
             # Get balance for dashboard
             balance_cents = 10000 if dry_run else _fetch_balance(client)
