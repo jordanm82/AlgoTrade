@@ -229,6 +229,22 @@ class KalshiPredictor:
         down_score += rsi_trend_down
         components["rsi_trend"] = {"up": rsi_trend_up, "down": rsi_trend_down}
 
+        # 7. Stochastic RSI (0-15)
+        stoch_up = 0
+        stoch_down = 0
+        stochrsi_k = float(last.get("stochrsi_k", 50)) if pd.notna(last.get("stochrsi_k")) else 50
+        if stochrsi_k < 10:
+            stoch_up = 15
+        elif stochrsi_k < 20:
+            stoch_up = 8
+        elif stochrsi_k > 90:
+            stoch_down = 15
+        elif stochrsi_k > 80:
+            stoch_down = 8
+        up_score += stoch_up
+        down_score += stoch_down
+        components["stochrsi"] = {"up": stoch_up, "down": stoch_down, "value": stochrsi_k}
+
         # --- Leading indicator components (only when market_data provided) ---
         has_leading = market_data is not None
         ob = (market_data or {}).get("order_book", {})

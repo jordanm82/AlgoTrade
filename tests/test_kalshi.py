@@ -63,7 +63,8 @@ class TestKalshiClient:
 
 def _make_df(n=50, close=87000.0, rsi=50.0, bb_lower=86500.0, bb_middle=87000.0,
              bb_upper=87500.0, macd_hist=0.0, volume=1000.0, vol_sma_20=1000.0,
-             close_trend=None, rsi_trend=None, macd_hist_trend=None):
+             close_trend=None, rsi_trend=None, macd_hist_trend=None,
+             stochrsi_k=50.0, roc_5=0.0, atr=200.0):
     """Build a synthetic DataFrame for predictor testing.
 
     close_trend: list of last N close values (overrides tail of close column)
@@ -97,6 +98,9 @@ def _make_df(n=50, close=87000.0, rsi=50.0, bb_lower=86500.0, bb_middle=87000.0,
         "bb_upper": np.full(n, bb_upper),
         "macd_hist": macd_hists,
         "vol_sma_20": np.full(n, vol_sma_20),
+        "stochrsi_k": np.full(n, stochrsi_k),
+        "roc_5": np.full(n, roc_5),
+        "atr": np.full(n, atr),
     }, index=pd.date_range("2025-01-01", periods=n, freq="15min"))
     return df
 
@@ -244,6 +248,38 @@ class TestKalshiPredictor:
         assert signal is not None
         assert signal.direction == "DOWN"
         assert signal.components["momentum"]["down"] == 15
+
+    def test_stochrsi_oversold_gives_up_points(self):
+        """StochRSI K < 10 gives 15 UP points."""
+        df = _make_df(rsi=50.0, stochrsi_k=8.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["stochrsi"]["up"] == 15
+
+    def test_stochrsi_overbought_gives_down_points(self):
+        """StochRSI K > 90 gives 15 DOWN points."""
+        df = _make_df(rsi=50.0, stochrsi_k=92.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["stochrsi"]["down"] == 15
+
+    def test_stochrsi_moderate_oversold(self):
+        """StochRSI K between 10-20 gives 8 UP points."""
+        df = _make_df(rsi=50.0, stochrsi_k=15.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["stochrsi"]["up"] == 8
+
+    def test_stochrsi_moderate_overbought(self):
+        """StochRSI K between 80-90 gives 8 DOWN points."""
+        df = _make_df(rsi=50.0, stochrsi_k=85.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["stochrsi"]["down"] == 8
 
     def test_signal_dataclass_fields(self):
         """KalshiSignal has all required fields."""
