@@ -455,7 +455,6 @@ class Dashboard:
         # Fetch initial live prices
         self._fetch_live_prices()
 
-        import signal
         def _handle_sigint(*_):
             print("\n\n  [SHUTDOWN] Ctrl+C received — stopping...")
             self.daemon._running = False
