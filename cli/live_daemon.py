@@ -567,13 +567,13 @@ class LiveDaemon:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
     def _kalshi_eval(self):
-        """5-minute Kalshi evaluation cycle with progressive confirmation.
+        """Kalshi evaluation cycle with 15m base scoring + 5m booster (v2).
 
         Lifecycle within each 15m window:
-        - SETUP (min 0-4): Score direction, no betting
-        - CONFIRMED (min 5-9): First 5m candle confirms, eligible to bet
-        - DOUBLE_CONFIRMED (min 10-11): Second 5m candle, highest conviction
-        - LAST_LOOK (min 12): 1m momentum check, elevated threshold
+        - SETUP (min 0-4): Score on 15m candles (base confidence + direction), cache 5m data
+        - CONFIRMED (min 5-9): Compute 5m booster on fresh 5m candles, add to base confidence
+        - DOUBLE_CONFIRMED (min 10-11): Fresh 5m booster, highest conviction
+        - LAST_LOOK (min 12): 1m momentum check on boosted confidence, elevated threshold
         - EXPIRED (min 13+): No new bets
         """
         from data.market_data import get_order_book_imbalance, get_trade_flow
@@ -704,60 +704,73 @@ class LiveDaemon:
                     })
                 continue
 
-            # --- SETUP / CONFIRMED / DOUBLE_CONFIRMED: fetch 5m data + score ---
-
-            # Fetch 5m candles
-            try:
-                df_5m = self.fetcher.ohlcv(symbol, "5m", limit=200)
-                if df_5m is not None and not df_5m.empty:
-                    # Drop partial candle: if last candle started less than 5 min ago, it's still forming
-                    last_candle_age = (now_utc - df_5m.index[-1].to_pydatetime().replace(tzinfo=timezone.utc)).total_seconds()
-                    if last_candle_age < 300:  # less than 5 minutes old = partial
-                        df_5m = df_5m.iloc[:-1]
-                    df_5m = add_indicators(df_5m)
-                    self._kalshi_5m_dataframes[symbol] = df_5m
-            except Exception:
-                df_5m = self._kalshi_5m_dataframes.get(symbol)
-
-            if df_5m is None or len(df_5m) < 50:
-                predictions.append({
-                    "symbol": symbol, "asset": asset,
-                    "direction": "--", "confidence": 0,
-                    "reason": "no 5m data", "ob": 0, "flow": 0, "state": state,
-                })
-                continue
-
-            # Fetch 1h data for MTF
-            df_1h = None
-            try:
-                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
-                if df_1h is not None and not df_1h.empty:
-                    df_1h = add_indicators(df_1h)
-            except Exception:
-                pass
-
-            # Fetch leading indicators
-            market_data = None
-            try:
-                ob = get_order_book_imbalance(symbol)
-                tf = get_trade_flow(symbol, limit=100)
-                market_data = {"order_book": ob, "trade_flow": tf}
-            except Exception:
-                pass
-
-            # Score
-            signal = self.kalshi_predictor.score(df_5m, market_data=market_data, df_1h=df_1h)
-
-            ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
-            net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
-
+            # --- SETUP: 15m base scoring ---
             if state == "SETUP":
+                # Fetch 15m candles for base scoring
+                df_15m = None
+                try:
+                    df_15m = self.fetcher.ohlcv(symbol, "15m", limit=200)
+                    if df_15m is not None and not df_15m.empty:
+                        df_15m = add_indicators(df_15m)
+                except Exception:
+                    df_15m = None
+
+                if df_15m is None or len(df_15m) < 50:
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": "--", "confidence": 0,
+                        "reason": "no 15m data", "ob": 0, "flow": 0, "state": state,
+                    })
+                    continue
+
+                # Also fetch + cache 5m candles for booster use later
+                try:
+                    df_5m = self.fetcher.ohlcv(symbol, "5m", limit=200)
+                    if df_5m is not None and not df_5m.empty:
+                        last_candle_age = (now_utc - df_5m.index[-1].to_pydatetime().replace(tzinfo=timezone.utc)).total_seconds()
+                        if last_candle_age < 300:
+                            df_5m = df_5m.iloc[:-1]
+                        df_5m = add_indicators(df_5m)
+                        self._kalshi_5m_dataframes[symbol] = df_5m
+                except Exception:
+                    pass
+
+                # Fetch 1h data for MTF
+                df_1h = None
+                try:
+                    df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
+                    if df_1h is not None and not df_1h.empty:
+                        df_1h = add_indicators(df_1h)
+                except Exception:
+                    pass
+
+                # Fetch leading indicators
+                market_data = None
+                try:
+                    ob = get_order_book_imbalance(symbol)
+                    tf = get_trade_flow(symbol, limit=100)
+                    market_data = {"order_book": ob, "trade_flow": tf}
+                except Exception:
+                    pass
+
+                # Score on 15m data
+                signal = self.kalshi_predictor.score(df_15m, market_data=market_data, df_1h=df_1h)
+
+                ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
+                net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
+
+                # Capture window open price (last 15m candle close = this window's open)
+                window_open_price = float(df_15m.iloc[-1]["close"]) if len(df_15m) > 0 else 0
+
                 # Store direction + confidence, no betting
                 if signal is not None and asset not in self._kalshi_pending_signals:
                     self._kalshi_pending_signals[asset] = {
                         "direction": signal.direction,
                         "base_conf": signal.confidence,
                         "last_5m_conf": signal.confidence,
+                        "boosted_conf": signal.confidence,
+                        "last_booster": 0,
+                        "window_open_price": window_open_price,
                         "setup_time": now_utc,
                         "confirmed": False,
                         "bet_placed": False,
@@ -767,80 +780,83 @@ class LiveDaemon:
                     "symbol": symbol, "asset": asset,
                     "direction": signal.direction if signal else "--",
                     "confidence": signal.confidence if signal else 0,
-                    "reason": "setup — waiting for confirmation",
+                    "reason": "setup — waiting for 5m confirmation",
                     "ob": ob_imb, "flow": net_flow, "state": state,
                 })
 
+            # --- CONFIRMED / DOUBLE_CONFIRMED: 5m booster only ---
             elif state in ("CONFIRMED", "DOUBLE_CONFIRMED"):
-                if signal is None:
-                    # None = skip, signal survives
-                    predictions.append({
-                        "symbol": symbol, "asset": asset,
-                        "direction": pending["direction"] if pending else "--",
-                        "confidence": 0,
-                        "reason": f"{state.lower()}: score returned None, signal survives",
-                        "ob": ob_imb, "flow": net_flow, "state": state,
-                    })
-                    continue
-
-                # If no pending signal exists (SETUP returned None), treat as late SETUP
                 if not pending:
-                    self._kalshi_pending_signals[asset] = {
-                        "direction": signal.direction,
-                        "base_conf": signal.confidence,
-                        "last_5m_conf": signal.confidence,
-                        "setup_time": now_utc,
-                        "confirmed": False,
-                        "bet_placed": False,
-                        "window_start": current_window_start,
-                    }
+                    # No SETUP signal — skip, nothing to boost
                     predictions.append({
                         "symbol": symbol, "asset": asset,
-                        "direction": signal.direction,
-                        "confidence": signal.confidence,
-                        "reason": f"{state.lower()}: late setup (no prior SETUP), waiting for next eval",
-                        "ob": ob_imb, "flow": net_flow, "state": "LATE_SETUP",
+                        "direction": "--", "confidence": 0,
+                        "reason": f"{state.lower()}: no SETUP signal to boost",
+                        "ob": 0, "flow": 0, "state": state,
                     })
                     continue
 
-                if signal.direction != pending["direction"]:
-                    # Direction flipped — kill signal
-                    self._kalshi_pending_signals.pop(asset, None)
+                # Fetch fresh 5m candles + indicators
+                df_5m = None
+                try:
+                    df_5m = self.fetcher.ohlcv(symbol, "5m", limit=200)
+                    if df_5m is not None and not df_5m.empty:
+                        last_candle_age = (now_utc - df_5m.index[-1].to_pydatetime().replace(tzinfo=timezone.utc)).total_seconds()
+                        if last_candle_age < 300:
+                            df_5m = df_5m.iloc[:-1]
+                        df_5m = add_indicators(df_5m)
+                        self._kalshi_5m_dataframes[symbol] = df_5m
+                except Exception:
+                    df_5m = self._kalshi_5m_dataframes.get(symbol)
+
+                if df_5m is None or len(df_5m) < 2:
                     predictions.append({
                         "symbol": symbol, "asset": asset,
-                        "direction": signal.direction,
-                        "confidence": signal.confidence,
-                        "reason": f"{state.lower()}: direction flipped ({pending['direction']}→{signal.direction}), signal killed",
-                        "ob": ob_imb, "flow": net_flow, "state": state,
+                        "direction": pending["direction"],
+                        "confidence": pending.get("boosted_conf", pending["base_conf"]),
+                        "reason": f"{state.lower()}: no 5m data for booster",
+                        "ob": 0, "flow": 0, "state": state,
                     })
                     continue
 
-                # Update last_5m_conf
-                pending["last_5m_conf"] = signal.confidence
+                # Compute 5m booster
+                booster = self.kalshi_predictor.compute_5m_booster(
+                    df_5m, pending["direction"], pending.get("window_open_price", 0)
+                )
+                boosted_conf = pending["base_conf"] + booster
+                pending["boosted_conf"] = boosted_conf
+                pending["last_5m_conf"] = boosted_conf
+                pending["last_booster"] = booster
                 pending["confirmed"] = True
 
                 asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, self.kalshi_threshold)
-                if signal.confidence >= asset_threshold:
+                if boosted_conf >= asset_threshold:
                     # Actionable!
+                    from strategy.strategies.kalshi_predictor import KalshiSignal
+                    boosted_signal = KalshiSignal(
+                        asset=asset, direction=pending["direction"],
+                        confidence=boosted_conf, components={},
+                        price=float(df_5m.iloc[-1]["close"]), rsi=0,
+                    )
                     actionable_signals.append({
                         "symbol": symbol, "series_ticker": series_ticker,
-                        "signal": signal, "market_data": market_data,
+                        "signal": boosted_signal, "market_data": None,
                         "state": state,
                     })
                     predictions.append({
                         "symbol": symbol, "asset": asset,
-                        "direction": signal.direction,
-                        "confidence": signal.confidence,
-                        "reason": f"{state.lower()}: conf {signal.confidence} >= threshold {asset_threshold}",
-                        "ob": ob_imb, "flow": net_flow, "state": state,
+                        "direction": pending["direction"],
+                        "confidence": boosted_conf,
+                        "reason": f"{state.lower()}: base={pending['base_conf']} + booster={booster} = {boosted_conf} >= {asset_threshold}",
+                        "ob": 0, "flow": 0, "state": state,
                     })
                 else:
                     predictions.append({
                         "symbol": symbol, "asset": asset,
-                        "direction": signal.direction,
-                        "confidence": signal.confidence,
-                        "reason": f"{state.lower()}: conf {signal.confidence} < threshold {asset_threshold}",
-                        "ob": ob_imb, "flow": net_flow, "state": state,
+                        "direction": pending["direction"],
+                        "confidence": boosted_conf,
+                        "reason": f"{state.lower()}: base={pending['base_conf']} + booster={booster} = {boosted_conf} < {asset_threshold}",
+                        "ob": 0, "flow": 0, "state": state,
                     })
 
         # Execute top actionable signals by confidence
