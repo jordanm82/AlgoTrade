@@ -440,6 +440,24 @@ class KalshiPredictor:
             )
         return None
 
+    def check_1m_momentum(self, df_1m: pd.DataFrame, direction: str, lookback: int = 3) -> bool:
+        """Check if recent 1m candles confirm the direction.
+
+        Returns True if at least 2 of the last `lookback` candles moved in
+        the expected direction (close > open for UP, close < open for DOWN).
+        Simple majority rule avoids single noisy 1m candle killing the signal.
+        """
+        if df_1m is None or len(df_1m) < lookback:
+            return False
+
+        recent = df_1m.iloc[-lookback:]
+        if direction == "UP":
+            confirming = (recent["close"] > recent["open"]).sum()
+        else:
+            confirming = (recent["close"] < recent["open"]).sum()
+
+        return bool(confirming >= 2)
+
     def _apply_filters(self, up_score: int, down_score: int,
                        lagging_up: int, lagging_down: int,
                        leading_up: int, leading_down: int,

@@ -636,3 +636,48 @@ class TestKalshiFilters:
         predictor = KalshiPredictor()
         signal = predictor.score(df)
         assert signal is not None
+
+
+# ---------------------------------------------------------------------------
+# 1-minute momentum check tests
+# ---------------------------------------------------------------------------
+
+class TestKalshi1mMomentum:
+    """Tests for 1-minute momentum check."""
+
+    def test_up_momentum_confirmed(self):
+        """2 of 3 green candles confirms UP."""
+        df = pd.DataFrame({
+            "open":  [100.0, 101.0, 102.0, 101.5, 103.0],
+            "close": [101.0, 102.0, 101.0, 103.0, 104.0],
+        }, index=pd.date_range("2026-01-01", periods=5, freq="1min"))
+        predictor = KalshiPredictor()
+        assert predictor.check_1m_momentum(df, "UP", lookback=3) is True
+
+    def test_down_momentum_confirmed(self):
+        """2 of 3 red candles confirms DOWN."""
+        df = pd.DataFrame({
+            "open":  [104.0, 103.0, 102.0, 103.0, 101.0],
+            "close": [103.0, 102.0, 103.0, 101.0, 100.0],
+        }, index=pd.date_range("2026-01-01", periods=5, freq="1min"))
+        predictor = KalshiPredictor()
+        assert predictor.check_1m_momentum(df, "DOWN", lookback=3) is True
+
+    def test_momentum_not_confirmed(self):
+        """All candles against direction fails."""
+        df = pd.DataFrame({
+            "open":  [100.0, 101.0, 102.0, 103.0, 104.0],
+            "close": [101.0, 100.5, 101.5, 102.0, 103.5],
+        }, index=pd.date_range("2026-01-01", periods=5, freq="1min"))
+        predictor = KalshiPredictor()
+        # Last 3: 102->101.5 DOWN, 103->102 DOWN, 104->103.5 DOWN
+        assert predictor.check_1m_momentum(df, "UP", lookback=3) is False
+
+    def test_insufficient_data_returns_false(self):
+        """Less than lookback candles returns False."""
+        df = pd.DataFrame({
+            "open": [100.0],
+            "close": [101.0],
+        }, index=pd.date_range("2026-01-01", periods=1, freq="1min"))
+        predictor = KalshiPredictor()
+        assert predictor.check_1m_momentum(df, "UP", lookback=3) is False
