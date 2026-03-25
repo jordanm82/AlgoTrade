@@ -177,13 +177,13 @@ class KalshiPredictorV3:
 
     def _decide_bet(self, adjusted_prob: float) -> tuple[str, int]:
         """Decide bet side and max price from adjusted probability."""
-        if adjusted_prob >= 0.55:
+        if adjusted_prob >= 0.65:
             # Bet YES — price likely closes above strike
             fair_price = int(adjusted_prob * 100)
             max_price = min(MAX_BET_PRICE, fair_price - int(EDGE_MARGIN * 100))
             if max_price >= 5:  # minimum viable price
                 return "YES", max_price
-        elif adjusted_prob <= 0.45:
+        elif adjusted_prob <= 0.35:
             # Bet NO — price likely closes below strike
             no_prob = 1.0 - adjusted_prob
             fair_price = int(no_prob * 100)
