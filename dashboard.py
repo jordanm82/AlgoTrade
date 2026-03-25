@@ -462,12 +462,23 @@ class Dashboard:
 
         if self.daemon.kalshi_only:
             # ── Kalshi-only mode: simple 1-minute tick loop ──
+            # Fetch 15m data first (needed for V3 scoring)
+            print("  [K15] Fetching initial data...")
+            self.daemon._fetch_all()
+            print(f"  [K15] Loaded {len(self.daemon._dataframes)} pairs")
+
             # Run initial eval immediately
+            print("  [K15] Running initial Kalshi eval...")
             try:
                 self.daemon._kalshi_eval()
                 self.daemon._last_kalshi_eval = time.time()
+                print(f"  [K15] Eval complete: {len(self.daemon.kalshi_predictions)} predictions")
+                for p in self.daemon.kalshi_predictions:
+                    print(f"    {p.get('asset','?')} conf={p.get('confidence',0)} state={p.get('state','')}")
             except Exception as e:
+                import traceback
                 print(f"  [KALSHI EVAL ERR] {e}")
+                traceback.print_exc()
             self._draw_dashboard(is_signal_cycle=True, signals=None)
 
             total_ticks = self.max_cycles * 15  # convert cycles to minutes
