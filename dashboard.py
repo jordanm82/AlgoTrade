@@ -404,13 +404,17 @@ class Dashboard:
                     f"{state:<18}"
                 )
 
-        # Footer
-        remaining = self.max_cycles - self._cycle_count
-        if is_signal_cycle:
-            lines.append(f"\n  Next signal cycle in ~15 min | {remaining} cycles remaining")
-        else:
-            mins_to_cycle = 15 - (self._tick_count % 15)
-            lines.append(f"\n  Next signal cycle in ~{mins_to_cycle} min | {remaining} cycles remaining")
+        # Footer — show time to next Kalshi window
+        now_utc = datetime.now(timezone.utc)
+        min_in_window = now_utc.minute % 15
+        mins_to_next_window = 15 - min_in_window
+        window_start = now_utc.minute - min_in_window
+        window_end = (window_start + 15) % 60
+        next_eval_mins = 5 - (min_in_window % 5)
+        if next_eval_mins == 0:
+            next_eval_mins = 5
+        lines.append(f"\n  Window: :{window_start:02d}-:{window_end:02d} (min {min_in_window}/15)  |  "
+                     f"Next eval: ~{next_eval_mins} min  |  Next window: ~{mins_to_next_window} min")
         lines.append("=" * 78)
 
         self._write_log(lines)
@@ -507,6 +511,7 @@ class Dashboard:
                 if not self.daemon._running:
                     break
                 tick += 1
+                self._tick_count += 1
 
                 # Kalshi eval every tick — let the eval method decide if it's time
                 current_minute = datetime.now(timezone.utc).minute
