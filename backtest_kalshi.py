@@ -417,6 +417,47 @@ def main():
             bets = best['per_asset_bets'].get(a, 0)
             print(f"    {a}: {wr}% WR ({bets} bets)")
 
+    # ── V2 Continuation Predictor comparison ──
+    print("\n" + "=" * 60)
+    print("V2 CONTINUATION PREDICTOR (vs V1 baseline)")
+    print("=" * 60)
+
+    from strategy.strategies.kalshi_predictor_v2 import KalshiPredictorV2
+    predictor_v2 = KalshiPredictorV2()
+
+    # Run V2 on same data
+    results_v2 = []
+    for asset_name, df_15m in data_15m.items():
+        df_1h = data_1h.get(asset_name)
+        r = run_predictor_on_candles(asset_name, df_15m, df_1h, predictor_v2,
+                                     use_filters=True, use_mtf=True)
+        results_v2.extend(r)
+
+    # Per-asset breakdown with V1 thresholds
+    PER_ASSET_THRESH_V2 = {"BTC": 30, "ETH": 35, "SOL": 35, "XRP": 30, "BNB": 35}
+    print("\n  Per-asset (using V1 thresholds as starting point):")
+    for asset_name in ASSETS:
+        r_asset = [r for r in results_v2 if r["asset"] == asset_name]
+        thresh = PER_ASSET_THRESH_V2.get(asset_name, 30)
+        filtered = [r for r in r_asset if r["confidence"] >= thresh]
+        if filtered:
+            wins = sum(1 for r in filtered if r["correct"])
+            wr = wins / len(filtered) * 100
+            print(f"    {asset_name}: {wr:.1f}% WR ({len(filtered)} bets) @ threshold {thresh}")
+
+    # V2 threshold sweep
+    print(f"\n  V2 THRESHOLD SWEEP:")
+    print(f"  {'Thresh':>7} {'Bets':>6} {'Wins':>6} {'WR%':>7} {'PF':>6}")
+    print(f"  {'─' * 35}")
+    for t in [20, 25, 30, 35, 40, 45, 50, 55]:
+        m = simulate_pnl(results_v2, t)
+        if m['total_bets'] > 0:
+            print(f"  {t:>7} {m['total_bets']:>6} {m['wins']:>6} {m['win_rate']:>6.1f}% {m['profit_factor']:>5.2f}")
+
+    # V2 overall at threshold 30
+    m_v2 = simulate_pnl(results_v2, 30)
+    print_metrics("V2 Continuation @ threshold=30", m_v2)
+
     print("\n" + "=" * 60)
     print("Backtest complete.")
 

@@ -49,8 +49,10 @@ def compute_ask_cents(entry_price_cents: int, spread_cents: int) -> int | None:
 
 
 def parse_ob_total_volume(levels: list) -> int:
-    """Sum contract quantities from orderbook levels."""
+    """Sum contract quantities from orderbook levels.
+    Count strings may be float-formatted (e.g., '10001.00'), so parse via float first.
+    """
     total = 0
     for level in levels:
-        total += int(level[1])
+        total += int(float(level[1]))
     return total

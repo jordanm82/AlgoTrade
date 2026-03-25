@@ -146,7 +146,8 @@ class MMAssetRunner:
             return
 
         # Parse expiry
-        exp_str = market.get("expiration_time") or market.get("close_time", "")
+        # close_time = actual 15m window end; expiration_time = settlement (days later)
+        exp_str = market.get("close_time") or market.get("expiration_time", "")
         try:
             exp_ts = datetime.fromisoformat(
                 exp_str.replace("Z", "+00:00")
@@ -415,7 +416,8 @@ class MMAssetRunner:
         best_mins = 999.0
 
         for m in markets:
-            exp_str = m.get("expiration_time") or m.get("close_time", "")
+            # close_time = actual 15m window end; expiration_time = settlement (days later)
+            exp_str = m.get("close_time") or m.get("expiration_time", "")
             if not exp_str:
                 continue
             try:
@@ -726,9 +728,7 @@ class MMAssetRunner:
     # -- balance / orderbook helpers ----------------------------------------
 
     def _get_balance_cents(self) -> int | None:
-        """Get Kalshi balance in cents."""
-        if self.dry_run:
-            return 10000  # $100 simulated
+        """Get Kalshi balance in cents (real balance even in dry-run)."""
         try:
             resp = self.client.get_balance()
             return resp.get("balance", 0)
