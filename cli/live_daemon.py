@@ -876,25 +876,60 @@ class LiveDaemon:
                 ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
                 net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
 
-                if self.kalshi_predictor_version == "v3" and pending:
-                    strike = pending.get("strike_price")
-                    close_time_dt = pending.get("close_time")
+                if self.kalshi_predictor_version == "v3":
+                    # V3: get strike from pending or query Kalshi fresh
+                    strike = pending.get("strike_price") if pending else None
+                    close_time_dt = pending.get("close_time") if pending else None
+
+                    if not strike:
+                        # No SETUP ran — query Kalshi for strike (late start)
+                        self._init_kalshi_client()
+                        if self.kalshi_client:
+                            try:
+                                v3_markets = self.kalshi_client.get_markets(series_ticker=series_ticker, status="open")
+                                if v3_markets:
+                                    v3_market = v3_markets[0]
+                                    strike = float(v3_market.get("floor_strike", 0))
+                                    ct = v3_market.get("close_time") or v3_market.get("expiration_time", "")
+                                    if ct and "T" in ct:
+                                        close_time_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                            except Exception:
+                                pass
+
                     if strike and close_time_dt:
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
                         signal = self.kalshi_predictor.predict(
-                            df_15m, strike_price=strike,
+                            df_15m, strike_price=float(strike),
                             minutes_remaining=mins_left,
                             market_data=market_data, df_1h=df_1h
                         )
-                        if signal:
+                        if signal and pending:
                             pending["probability"] = signal.probability
                             pending["recommended_side"] = signal.recommended_side
                             pending["max_price_cents"] = signal.max_price_cents
                             pending["last_5m_conf"] = int(signal.probability * 100)
                             pending["confirmed"] = True
+                        elif signal and not pending:
+                            # Create pending signal on the fly (late start)
+                            self._kalshi_pending_signals[asset] = {
+                                "strike_price": float(strike),
+                                "close_time": close_time_dt,
+                                "probability": signal.probability,
+                                "recommended_side": signal.recommended_side,
+                                "max_price_cents": signal.max_price_cents,
+                                "distance_atr": signal.distance_atr,
+                                "bet_placed": False,
+                                "window_start": current_window_start,
+                                "direction": signal.recommended_side if signal.recommended_side != "SKIP" else "--",
+                                "base_conf": int(signal.probability * 100),
+                                "last_5m_conf": int(signal.probability * 100),
+                                "setup_time": now_utc,
+                                "confirmed": True,
+                            }
+                            pending = self._kalshi_pending_signals[asset]
                     else:
                         signal = None
-                else:
+                elif not self.kalshi_predictor_version == "v3":
                     signal = self.kalshi_predictor.score(df_15m, market_data=market_data, df_1h=df_1h)
 
                 if signal is None:
