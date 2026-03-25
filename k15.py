@@ -217,13 +217,20 @@ def daemon_worker(state: K15State):
         return
 
     try:
-        daemon.startup()
+        # Suppress daemon stdout — it conflicts with rich Live display
+        import io
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            daemon.startup()
+
         state.log("[bold green]Bot started[/bold green]")
 
-        # Initial eval
+        # Initial eval — also suppress stdout
         try:
-            daemon._kalshi_eval()
+            with contextlib.redirect_stdout(io.StringIO()):
+                daemon._kalshi_eval()
             daemon._last_kalshi_eval = time.time()
+            state.log("[green]Initial eval complete[/green]")
         except Exception as e:
             state.log(f"[red]Eval error: {e}[/red]")
 
@@ -233,10 +240,11 @@ def daemon_worker(state: K15State):
             if not state.running:
                 break
 
-            # Update prices + equity
+            # Update prices + equity (suppress stdout)
             try:
-                daemon._update_prices()
-                daemon._update_equity()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    daemon._update_prices()
+                    daemon._update_equity()
             except Exception:
                 pass
 
@@ -248,7 +256,8 @@ def daemon_worker(state: K15State):
                        or (current_minute % 15 == 1 and now_ts - daemon._last_kalshi_eval >= 50)
             if should_eval:
                 try:
-                    daemon._kalshi_eval()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        daemon._kalshi_eval()
 
                     # Check for new bets and log them
                     for pred in getattr(daemon, 'kalshi_predictions', []):
@@ -456,7 +465,7 @@ def main():
         tty.setcbreak(fd)
 
         with Live(build_layout(state, input_buffer), console=console,
-                  refresh_per_second=0, screen=True) as live:
+                  refresh_per_second=1, screen=True) as live:
 
             last_refresh = time.time()
 
