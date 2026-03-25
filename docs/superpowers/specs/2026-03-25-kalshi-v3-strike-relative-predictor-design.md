@@ -34,8 +34,9 @@ Strike-Relative Probability Model:
 
 **Table structure:** 2D grid of (distance_bucket, time_bucket) → historical win rate.
 
-**Distance buckets (in ATR units):**
-`[-3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0, +0.25, +0.5, +1.0, +1.5, +2.0, +3.0]`
+**Distance buckets (in ATR units) — assigned by nearest-center:**
+Centers: `[-3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0, +0.25, +0.5, +1.0, +1.5, +2.0, +3.0]`
+Bucket assignment: `bucket = min(centers, key=lambda c: abs(distance - c))`. Values beyond ±3.0 are clamped to ±3.0.
 
 **Time buckets (minutes remaining):**
 `[14, 12, 10, 8, 6, 4, 2]`
@@ -59,7 +60,11 @@ Each cell contains the historical probability that price closes >= strike, given
 
 **Refresh cadence:** Rebuild weekly or monthly. The underlying statistics (how far price moves in 15m relative to ATR) are stable across market regimes.
 
-**Minimum sample size:** Require at least 30 observations per cell to trust the probability. Cells with fewer observations interpolate from neighboring cells.
+**ATR computation:** Aggregate 1m candles to 15m (resample), compute ATR(14) on the 15m series. Requires 14 prior 15m candles (~3.5 hours warmup) before the first valid observation.
+
+**Minimum sample size:** Require at least 30 observations per cell. Cells with fewer observations use 0.5 (neutral) as the default — no interpolation from neighbors to keep it simple. In practice, 90 days of data across 5 assets provides ~45,000 15m windows × multiple time observations each, so most cells will have adequate samples.
+
+**Data quality:** The build script should report any gaps in 1m data (missing candles) per asset before building.
 
 ### 2. Technical Adjustments
 
@@ -177,18 +182,42 @@ class KalshiPredictorV3:
 
 **`_kalshi_eval()` changes for `--predictor v3`:**
 
-The SETUP and CONFIRMED states need additional data:
-1. Query Kalshi API for the active 15m contract → get `floor_strike`, `close_time`
-2. Compute `minutes_remaining = (close_time - now).total_seconds() / 60`
-3. Call `predictor.predict(df, strike, minutes_remaining, market_data, df_1h)`
-4. Use `signal.recommended_side` and `signal.max_price_cents` for bet execution
+**Contract discovery at SETUP:** Query `client.get_markets(series_ticker=..., status="open")` for each asset. Extract `floor_strike` and `close_time` from the first result. Use `close_time` field, fall back to `expiration_time` if missing. If no contract is available (market closed, gap between contracts), skip the asset for this window — log and continue.
 
-The bet execution path changes too:
-- V1/V2: always bet YES or NO based on direction
-- V3: `recommended_side` tells us which side, `max_price_cents` caps our bid
-- The `_kalshi_execute_bet()` method needs a small update to accept the recommended side and max price from V3's signal instead of deriving them from direction
+**Strike is constant per window:** Once discovered at SETUP, the strike and close_time are cached in the pending signal dict for CONFIRMED/DOUBLE_CONFIRMED. No need to re-query Kalshi at each eval — the contract doesn't change within a 15m window.
 
-**Lifecycle still applies:** SETUP (minute 0-4, no bet), CONFIRMED (minute 5-9, bet if edge), etc. The wall-clock aligned timer and confirmation gate work the same way. V3 just computes a probability at each evaluation instead of a confidence score.
+**Pending signal state for V3:**
+```python
+{
+    "strike_price": 70975.23,    # from floor_strike
+    "close_time": datetime,       # from close_time
+    "probability": 0.72,          # latest adjusted probability
+    "recommended_side": "YES",    # latest recommendation
+    "max_price_cents": 45,        # latest max price
+    "distance_atr": 1.5,          # latest distance
+    "bet_placed": False,
+    "window_start": datetime,
+}
+```
+
+**SETUP (minute 0-4):** Query Kalshi for contract, extract strike + close_time. Fetch 15m candles + indicators. Call `predictor.predict(df, strike, minutes_remaining, market_data, df_1h)`. Store signal in pending. No betting.
+
+**CONFIRMED (minute 5-9):** Fetch fresh 15m candles + leading indicators. Compute `minutes_remaining` from cached `close_time`. Call `predictor.predict()` with fresh data + same strike. If `recommended_side` != "SKIP" → actionable.
+
+**DOUBLE_CONFIRMED (minute 10-11):** Same as CONFIRMED with even less time remaining.
+
+**LAST_LOOK (minute 12):** V3 already accounts for time remaining in its probability. Just re-run `predict()` with `minutes_remaining=3`. No need for `check_1m_momentum()` — V3's model handles the time dimension directly. If V3, skip the 1m momentum check.
+
+**`_kalshi_execute_bet()` changes for V3:**
+When signal is a `KalshiV3Signal`:
+- `side` = `"yes"` if `recommended_side == "YES"` else `"no"`
+- `fill_price` = `min(signal.max_price_cents, MAX_ENTRY_CENTS)` — use V3's max price directly instead of the orderbook pricing logic
+- Still query the orderbook to verify we can actually get filled at that price — if best ask > max_price, skip
+- Rest of execution (balance check, order placement, fill verification) stays the same
+
+**Lifecycle still applies:** SETUP (minute 0-4, no bet), CONFIRMED (minute 5-9, bet if edge), etc. The wall-clock aligned timer and confirmation gate work the same way. V3 computes a probability at each evaluation instead of a confidence score.
+
+**No-contract handling:** If `get_markets()` returns empty for an asset, the SETUP stores nothing for that asset. CONFIRMED sees no pending signal and skips. This is the existing "no SETUP" handling.
 
 ### 7. Backtest Methodology
 
@@ -241,7 +270,7 @@ The bet execution path changes too:
 |------|--------|
 | `strategy/strategies/kalshi_predictor.py` | V1 stays untouched |
 | `strategy/strategies/kalshi_predictor_v2.py` | V2 stays (shelved but available) |
-| `exchange/kalshi.py` | Already has `get_markets()`, `floor_strike` field access, `get_orderbook()` |
+| `exchange/kalshi.py` | `get_markets()` returns raw dicts that contain `floor_strike` and `close_time`. No parsing changes needed — the daemon extracts these fields directly from the dict. |
 | `data/indicators.py` | All needed indicators already present (RSI, MACD, BB, ATR, etc.) |
 
 ## Success Criteria
