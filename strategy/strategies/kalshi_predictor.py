@@ -17,8 +17,10 @@ from dataclasses import dataclass
 _MAX_LAGGING = 120  # was 110: +ATR(10)
 # Maximum raw score from leading signals (components 9-13)
 _MAX_LEADING = 65
+# Maximum raw score from MTF (1-hour trend alignment) component
+_MAX_MTF = 15
 # Combined max before normalization
-_MAX_RAW = _MAX_LAGGING + _MAX_LEADING  # 120 + 65 = 185
+_MAX_RAW = _MAX_LAGGING + _MAX_LEADING + _MAX_MTF  # 120 + 65 + 15 = 200
 
 
 @dataclass
@@ -34,7 +36,8 @@ class KalshiSignal:
 class KalshiPredictor:
     """Scores confidence for short-term crypto direction predictions."""
 
-    def score(self, df: pd.DataFrame, market_data: dict | None = None) -> KalshiSignal | None:
+    def score(self, df: pd.DataFrame, market_data: dict | None = None,
+              df_1h: pd.DataFrame | None = None) -> KalshiSignal | None:
         """Score confidence for the next 15-minute direction.
 
         Args:
@@ -343,10 +346,48 @@ class KalshiPredictor:
         down_score += ca_down
         components["cross_asset"] = {"up": ca_up, "down": ca_down, "btc_dir": btc_dir}
 
+        # 12. 1-Hour Trend Alignment (-15 to +15)
+        mtf_score = 0
+        if df_1h is not None and len(df_1h) >= 20:
+            last_1h = df_1h.iloc[-1]
+            rsi_1h = float(last_1h.get("rsi", 50)) if pd.notna(last_1h.get("rsi")) else 50
+            macd_1h = float(last_1h.get("macd_hist", 0)) if pd.notna(last_1h.get("macd_hist")) else 0
+
+            trend_1h_up = rsi_1h > 60 and macd_1h > 0
+            trend_1h_down = rsi_1h < 40 and macd_1h < 0
+            dominant_is_up = up_score > down_score
+
+            if trend_1h_up and dominant_is_up:
+                mtf_score = 15
+            elif trend_1h_down and not dominant_is_up:
+                mtf_score = 15
+            elif trend_1h_up and not dominant_is_up:
+                mtf_score = -15
+            elif trend_1h_down and dominant_is_up:
+                mtf_score = -15
+            # else: neutral, mtf_score stays 0
+
+            if mtf_score > 0:
+                if dominant_is_up:
+                    up_score += mtf_score
+                else:
+                    down_score += mtf_score
+            elif mtf_score < 0:
+                if dominant_is_up:
+                    up_score += mtf_score
+                else:
+                    down_score += mtf_score
+
+        components["mtf"] = {"score": mtf_score}
+
         # --- Determine direction and confidence ---
-        # When leading indicators are present the raw max is higher (~165),
-        # so we normalize to keep the 0-100 scale.
-        max_possible = _MAX_RAW if has_leading else _MAX_LAGGING
+        # Normalize to 0-100 scale based on which data sources are present.
+        if has_leading:
+            max_possible = _MAX_RAW  # 200 (lagging + leading + MTF)
+        elif df_1h is not None:
+            max_possible = _MAX_LAGGING + _MAX_MTF  # 135
+        else:
+            max_possible = _MAX_LAGGING  # 120
 
         if up_score > down_score and up_score > 0:
             confidence = min(100, int(up_score * 100 / max_possible))

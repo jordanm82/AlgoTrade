@@ -506,9 +506,10 @@ class TestKalshiPredictorEnhanced:
         assert signal is not None
         assert signal.direction == "UP"
         assert signal.confidence <= 100
-        # All components fire: lagging 120 + leading 65 = 185 raw
-        # Normalized: 185 * 100 / 185 = 100
-        assert signal.confidence == 100
+        # All lagging + leading components fire: 120 + 65 = 185 raw
+        # _MAX_RAW = 200 (lagging 120 + leading 65 + MTF 15); no df_1h → MTF = 0
+        # Normalized: 185 * 100 / 200 = 92
+        assert signal.confidence == 92
 
     def test_leading_only_signal_works(self):
         """With neutral lagging but strong leading data, still produces signal."""
@@ -525,3 +526,45 @@ class TestKalshiPredictorEnhanced:
         # Order book 20 + trade flow 20 + large trade 10 + spread 5 + cross 10 = 65
         # Normalized: 65 * 100 / 165 = 39
         assert signal.confidence >= 30
+
+
+# ---------------------------------------------------------------------------
+# MTF (1-hour trend alignment) tests
+# ---------------------------------------------------------------------------
+
+class TestKalshiPredictorMTF:
+    def test_1h_trend_agrees_gives_bonus(self):
+        """1h trend agreeing with 15m signal gives +15."""
+        df = _make_df(rsi=22.0)  # strong UP signal from 15m
+        df_1h = _make_df(n=50, rsi=65.0, macd_hist=5.0)  # 1h bullish
+        predictor = KalshiPredictor()
+        signal = predictor.score(df, df_1h=df_1h)
+        assert signal is not None
+        assert signal.direction == "UP"
+        assert signal.components["mtf"]["score"] == 15
+
+    def test_1h_trend_disagrees_gives_penalty(self):
+        """1h trend opposing 15m signal gives -15 penalty."""
+        df = _make_df(rsi=22.0)  # 15m says UP
+        df_1h = _make_df(n=50, rsi=35.0, macd_hist=-5.0)  # 1h bearish
+        predictor = KalshiPredictor()
+        signal = predictor.score(df, df_1h=df_1h)
+        assert signal is not None
+        assert signal.components["mtf"]["score"] == -15
+
+    def test_1h_trend_neutral_gives_zero(self):
+        """1h trend neutral (RSI 40-60, MACD near zero) gives 0."""
+        df = _make_df(rsi=22.0)
+        df_1h = _make_df(n=50, rsi=50.0, macd_hist=0.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df, df_1h=df_1h)
+        assert signal is not None
+        assert signal.components["mtf"]["score"] == 0
+
+    def test_no_1h_data_backward_compatible(self):
+        """Calling score() without df_1h still works, MTF score = 0."""
+        df = _make_df(rsi=22.0)
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.components["mtf"]["score"] == 0
