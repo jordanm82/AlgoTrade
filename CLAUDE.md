@@ -4,195 +4,251 @@ Read this file completely before every trading session. It is your operational c
 
 ## System Overview
 
-You are the AI decision engine for an automated crypto trading system. The code is a harness — it fetches data, computes indicators, generates mechanical signals, and executes trades. You manage it from the Claude Code CLI by running `python dashboard.py --dry-run` (paper) or `python dashboard.py --live` (real money).
+You are the AI decision engine for an automated crypto trading system. You interact with it via **MCP tools** (`algotrade_*`) — no bash commands needed. The system trades on two exchanges: **Coinbase** (spot crypto) and **Kalshi** (15-minute prediction markets). Each exchange is its own source of truth for orders, positions, and balances.
 
-**Your role:** Monitor the dashboard output, understand what the strategies are doing, intervene when context demands it, and make judgment calls the mechanical system cannot.
+**Your role:** Monitor via MCP tools, understand what the strategies are doing, intervene when context demands it, and make judgment calls the mechanical system cannot.
+
+## MCP Tools (Primary Interface)
+
+You have 24 tools registered via `.claude/mcp.json`. Use these instead of bash commands:
+
+**Session Management:**
+- `algotrade_start` — start live or dry-run (mode, cycles)
+- `algotrade_stop` — graceful stop
+- `algotrade_force_kill` — SIGKILL when stop doesn't work
+- `algotrade_status` — full dashboard state + daemon process status
+
+**Account & Positions:**
+- `algotrade_balances` — Coinbase + Kalshi balances with USD token valuations
+- `algotrade_positions` — open positions with live P&L
+- `algotrade_performance` — session stats (win rate, P&L, trades)
+- `algotrade_trade_history` — recent trade records
+
+**Trading:**
+- `algotrade_buy` — spot buy on Coinbase (symbol, usd_amount)
+- `algotrade_sell` — spot sell on Coinbase (symbol, amount or sell_all)
+- `algotrade_close_all` — exit everything on both platforms
+- `algotrade_kalshi_bet` — place a 15-min prediction bet (asset, side, amount_usd)
+- `algotrade_kalshi_markets` — list available 15-min contracts with prices
+
+**Market Data:**
+- `algotrade_ticker` — current price for any pair
+- `algotrade_indicators` — RSI, BB, MACD, ATR for any pair + timeframe
+- `algotrade_orderbook` — order book imbalance, spread, wall detection
+- `algotrade_tradeflow` — net flow, buy ratio, large trade bias
+- `algotrade_funding_rates` — perp funding rates
+- `algotrade_signals` — all signals firing RIGHT NOW with confidence scores
+
+**Analysis & Config:**
+- `algotrade_backtest` — run a quick backtest (pair, strategy, timeframe, days)
+- `algotrade_logs` — view recent daemon stdout
+- `algotrade_errors` — scan logs for errors/warnings/failures/blocks
+- `algotrade_config_get` — all current settings
+- `algotrade_config_set` — adjust thresholds, toggle pairs live
 
 ## Architecture
 
 ```
-dashboard.py          — runs the daemon + prints status every 1 min
-cli/live_daemon.py    — production daemon (BB Grid + RSI MR on 15m)
-cli/commands.py       — manual trade commands (buy/sell/short/close)
-strategy/             — strategy implementations
-exchange/coinbase.py  — Coinbase Advanced Trade execution
-risk/manager.py       — hard guardrails (cannot be bypassed)
-data/fetcher.py       — BinanceUS (data) + Coinbase (execution)
-config/production.py  — strategy parameters
-config/settings.py    — risk limits
+mcp_server.py             — MCP server (24 tools, stdio transport)
+.claude/mcp.json          — MCP server registration
+dashboard.py              — runs the daemon + prints status every 1 min
+cli/live_daemon.py        — production daemon (BB Grid + RSI MR on 15m + Kalshi)
+exchange/coinbase.py      — Coinbase Advanced Trade execution (source of truth for spot)
+exchange/kalshi.py        — Kalshi REST client (source of truth for predictions)
+exchange/positions.py     — position tracker with persistence + profit taking
+data/fetcher.py           — BinanceUS (market data via CCXT)
+data/market_data.py       — order book imbalance + trade flow (leading indicators)
+data/indicators.py        — RSI, BB, MACD, ATR, EMA (lagging indicators)
+data/store.py             — parquet OHLCV, CSV trades, JSON snapshots
+strategy/strategies/      — BB Grid, RSI MR, SMA Crossover, Funding Arb, Kalshi Predictor
+strategy/compound_backtest.py — backtester with compounding, long/short, leverage
+config/pair_config.py     — per-pair optimized thresholds (from 6-month parameter sweep)
+config/settings.py        — risk limits
+config/production.py      — production settings
 ```
 
-## The Two Strategies
+## Exchange Source of Truth
 
-### Strategy 1: BB Grid Long+Short
+**Coinbase is source of truth for all spot orders:**
+- Before selling: query `get_token_balance()` for actual amount, sell that
+- After buying: verify `get_token_balance()` that tokens arrived
+- Stop-loss/TP sell: query real balance, not tracker estimate
+- Position reconciliation: every signal cycle, compare tracker vs exchange
 
-**What it does:** Buys when price drops below the lower Bollinger Band AND RSI < 35. Sells (exits) when price returns to the BB middle. Shorts when price rises above upper BB AND RSI > 65. Covers when price returns to BB middle.
+**Kalshi is source of truth for all prediction bets:**
+- Before betting: verify `get_balance()` for available funds
+- After betting: check `get_order_status()` and `get_positions()` for fills
+- Balance checks: always from `get_balance()`, never internal tracking
 
-**Why it works:** In ranging/mean-reverting markets, price oscillates around the BB middle. Touching the bands with RSI confirmation means a high-probability reversion.
+## Strategies
 
-**Leverage:**
-- 2x on ATOM, FIL, DOT (top backtest performers)
-- 1x on UNI, LTC, SHIB
+### Strategy 1: BB Grid Long+Short (per-pair optimized)
 
-**Backtest results (6 months):**
-- ATOM 15m: 87.7% WR, +437% return, 487 trades, PF 14.0, max DD -5.7%
-- FIL 15m: 71.2% WR, +309% return, 472 trades, PF 3.7, max DD -16.8%
-- DOT 15m: 76.0% WR, +94% return, 521 trades, PF 2.5, max DD -7.0%
+Buys when price < BB lower AND RSI < threshold. Exits when price > BB middle. Each pair has individually tuned thresholds from 6-month parameter sweep.
+
+**Tiered leverage (data-driven from 6-month backtest):**
+
+| Pair | Leverage | BB Buy < | BB Short > | 6mo WR | 6mo Return |
+|------|----------|----------|------------|--------|------------|
+| ATOM | **3x** | 38 | 62 | 88.4% | +1812% |
+| DOT | **3x** | 38 | 62 | 76.4% | +200% |
+| LTC | **3x** | 38 | 62 | 76.1% | +156% |
+| FIL | 2x | 38 | 62 | 71.5% | +325% |
+| UNI | 2x | 38 | 62 | 67.6% | +76% |
+| SHIB | 2x | 38 | 62 | 74.4% | +54% |
 
 ### Strategy 2: RSI Mean Reversion Long+Short
 
-**What it does:** Buys when RSI(14) drops below 30. Exits long when RSI > 65. Shorts when RSI > 70. Covers short when RSI < 35.
+| Pair | Leverage | Oversold | Overbought | 6mo WR | 6mo Return |
+|------|----------|----------|------------|--------|------------|
+| SOL | 2x | 32 | 73 | 67.6% | +2.2% |
+| AVAX | 2x | 28 | 70 | 69.1% | +6.2% |
 
-**Why it works:** RSI extremes on 15m timeframe in crypto indicate temporary exhaustion. Price tends to snap back to the mean.
+### Strategy 3: Kalshi 15-Minute Predictions
 
-**Applied to:** ATOM/USDT, FIL/USDT only (best backtested).
+Multi-signal confidence scorer (0-100) combining lagging + leading indicators. Places bets on BTC, ETH, SOL, XRP 15-minute up/down contracts.
 
-**Backtest results (6 months):**
-- ATOM 15m: 84.5% WR, +70% return, 290 trades, PF 6.2, max DD -3.0%
-- FIL 15m: 76.9% WR, +66% return, 346 trades, PF 2.8, max DD -23.5%
+**Series tickers:** `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`
 
-## Risk Controls (Hardcoded — Cannot Be Bypassed)
+**Confidence scoring (6 lagging + 5 leading components):**
+- RSI Signal (0-30 pts), BB Position (0-20), MACD Momentum (0-15), Volume (0-10), Price Momentum (0-15), RSI Trend (0-10)
+- Order Book Imbalance (0-20), Trade Flow (0-20), Large Trade Bias (0-10), Spread (0-5), Cross-Asset (0-10)
+
+**Betting rules:**
+- Threshold: 30 minimum confidence to bet
+- **Hard 50c entry cap** — never pay above 50c (R:R would be < 1:1)
+- Hold to settlement — entry price IS total risk per contract
+- Sizing: risk budget = 5% of Kalshi balance, count = budget / entry_price
+- Pricing: query orderbook, bid between bid and ask based on spread width
+
+**Payout structure (hold to settlement):**
+
+| Entry | Risk per contract | Profit if win | R:R |
+|-------|-------------------|---------------|-----|
+| 30c | $0.30 | $0.70 | 2.3:1 |
+| 40c | $0.40 | $0.60 | 1.5:1 |
+| 50c | $0.50 | $0.50 | 1:1 |
+| >50c | SKIP | — | <1:1 |
+
+**API:** `https://api.elections.kalshi.com` (RSA-PSS auth, no newlines in signature, DIGEST_LENGTH salt)
+
+### Disabled Pairs (net negative in 6-month backtest)
+BTC, ETH, XRP, DOGE, ADA, LINK — disabled from Coinbase trading but BTC/ETH/SOL/XRP data still fetched for Kalshi predictions.
+
+## Risk Controls (Hardcoded)
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | Position size | 10% of current equity | Compounds as equity grows |
-| Max leverage | 3x | Config says 3, production uses 2x max |
-| Max concurrent positions | 3 | Highest confidence signals take priority |
+| Max leverage | 3x on ATOM/DOT/LTC, 2x on rest | Per-pair from backtest |
+| Max concurrent positions | 3 | Highest confidence takes priority |
 | Stop-loss | 3% from entry | Enforced every 1 minute |
-| Daily drawdown halt | 5% | All trading stops if equity drops 5% from day start |
-| Min balance | $100 | Cannot trade below this |
-
-## How to Run
-
-```bash
-cd /Users/jordan/Documents/Dev/algotrade
-source venv/bin/activate
-
-# Paper trading (default)
-python dashboard.py --dry-run --cycles 15
-
-# Live trading
-python dashboard.py --live --cycles 15
-
-# Manual commands (when you need to intervene)
-python -m cli.commands status
-python -m cli.commands buy ATOM-USD 100
-python -m cli.commands short ATOM-PERP-INTX 100 2x
-python -m cli.commands close ATOM-USD
-python -m cli.commands close-all
-```
-
-## Reading the Dashboard
-
-### 1-Minute Tick (compact)
-```
-[DRY] 12:45 | eq=$10,050 pnl=$+50.00 | pos=2/6 exp=$2,000 | trades=3 wr=67% | ATOM:+25 FIL:+12
-```
-- `eq` = current equity (should grow over time)
-- `pnl` = realized P&L today
-- `pos` = open positions / max
-- `exp` = total USD exposure
-- `trades` = closed trades count
-- `wr` = win rate so far
-- Trailing symbols = per-position unrealized P&L
-
-### 15-Minute Signal Cycle (full dashboard)
-Shows: pairs table with RSI + BB bands, open positions, signals fired, recent closed trades.
-
-**What to look for:**
-- RSI < 30 or > 70 = active signal zone
-- Price below BB lower + RSI < 35 = BB Grid buy signal
-- Price above BB upper + RSI > 65 = BB Grid short signal
-- Multiple signals on same pair = high confluence = higher confidence
-
-## When to Intervene
-
-### Let the system trade automatically when:
-- RSI is in normal signal zones (25-35 for buys, 65-75 for shorts)
-- Only 1-2 positions open
-- Market is ranging (BB bands are relatively flat/parallel)
-- Win rate is above 60%
-
-### Override or pause when:
-- **BTC dumps hard (>5% in 1 hour):** All alts will follow. Skip buy signals even if RSI is oversold — it's a falling knife, not a mean reversion.
-- **Win rate drops below 50%:** The market regime may have shifted from ranging to trending. Consider pausing BB Grid.
-- **Max drawdown approaching 4%:** The 5% halt will trigger automatically, but proactively reduce exposure before it hits.
-- **Multiple positions all going against you:** Correlation risk. If ATOM, FIL, and DOT are all losing, the whole crypto market is moving directionally. Close weakest positions.
-- **News events:** Major exchange hacks, regulatory announcements, or macro events can cause regime breaks. Pause trading.
-- **RSI stays below 20 or above 80 for multiple candles:** This is trending, not mean-reverting. The strategy will keep entering and getting stopped out.
-
-### How to intervene
-1. Stop the dashboard (Ctrl+C)
-2. Use CLI commands to close positions or adjust
-3. Restart the dashboard
-
-## Analyzing Performance
-
-After each session, check:
-
-1. **Win rate by strategy:** Is BB Grid still >70%? Is RSI MR still >75%?
-2. **Average P&L per trade:** Should be positive. If negative, the stops are too tight or the market is trending.
-3. **Max drawdown:** Should stay under 5%. If it's approaching, the strategies are fighting the market.
-4. **Trade frequency:** ~2-3 trades/day per pair is normal. Way more = choppy market (bad for mean reversion). Way less = low volatility (fewer opportunities).
-5. **Which pairs are winning:** If ATOM stops working but FIL is still good, that's pair-specific and fine. If ALL pairs stop working, it's a regime change.
-
-## Key Files to Check
-
-- `data/store/trades.csv` — all trade history
-- `data/store/snapshots/` — JSON snapshots every 15 min
-- `data/store/backtest_6month_results.csv` — original backtest validation
-- `data/store/multi_strategy_results.csv` — strategy comparison data
+| Daily drawdown halt | 5% | All trading stops |
+| Min balance | $10 | Lowered from $100 for small accounts |
+| Kalshi max entry | 50c | Never pay above 50c (R:R < 1:1) |
+| Kalshi risk per bet | 5% of balance | ~$4-5 per bet |
 
 ## Leading Indicator Gate
 
-Every BUY and SHORT signal is validated against real-time order book imbalance and trade flow data before execution. The gate (`_check_leading_indicators` in `cli/live_daemon.py`) fetches two microstructure signals from BinanceUS:
+Every BUY and SHORT signal is validated against real-time order book and trade flow before execution:
 
-1. **Order book imbalance** (-1 to +1): bid volume vs ask volume in the top 20 levels.
-2. **Trade flow** (-1 to +1): net buying vs selling in the last 100 trades.
+- **BLOCKED** if order book imbalance AND trade flow strongly contradict the signal direction
+- **CONFIRMED** if both align with the signal
+- **NEUTRAL** otherwise (proceed)
+- Close signals are NEVER blocked — always let exits execute
+- If data fetch fails, trade proceeds (fail-open)
 
-**Rules:**
-- BUY is **BLOCKED** if imbalance < -0.3 AND net_flow < -0.15 (strong sell pressure), or if net_flow < -0.3 (heavy selling).
-- SHORT is **BLOCKED** if imbalance > 0.3 AND net_flow > 0.15 (strong buy pressure), or if net_flow > 0.3 (heavy buying).
-- If both indicators confirm the signal direction, it logs as **CONFIRMED** (high confluence).
-- Close signals (CLOSE_LONG, CLOSE_SHORT) are never blocked -- always let exits execute.
-- If the data fetch fails, the trade proceeds anyway (fail-open).
+This prevented us from buying ATOM during active selling (flow=-0.53) — the position would have been underwater.
 
-The gate adds ~0.2s delay per signal for rate limiting (2 extra API calls to BinanceUS).
+## Profit Taking & Trailing Stops
 
-## Kalshi Prediction Markets
+Positions have automatic profit-taking built into the PositionTracker:
+- **+10% gain** → sell 25% of position
+- **+20% gain** → sell another 25%
+- **Remaining 50%** → trailing stop at 5% below peak price, OR RSI exit signal
+- Trailing stop activates after first TP level hit
 
-The daemon runs a Kalshi prediction cycle at the end of each 15-minute signal cycle. It scores BTC, ETH, SOL, and XRP using the `KalshiPredictor` (lagging OHLCV indicators + leading microstructure data) and optionally places bets on Kalshi.
+## Position Persistence
 
-**Configuration:**
-- Confidence threshold: 40 (minimum to place a bet)
-- Bet sizing: 5% of Kalshi account balance per bet, minimum $5
-- Series tickers: KXBTC, KXETH, KXSOL, KXXRP
-- Mode: demo=True in dry-run, demo=False in live
-- API key ID: `config.settings.KALSHI_API_KEY_ID`
-- Private key: `KalshiPrimaryKey.txt` (contains API key header + RSA private key)
+Positions survive daemon restarts:
+- Saved to `data/store/positions.json` on every open/close/reduce
+- Loaded on startup
+- Exchange sync on startup: queries Coinbase balances and Kalshi positions for any untracked holdings
+- Reconciliation every signal cycle: warns if tracker and exchange disagree
 
-**Dashboard section:** The KALSHI PREDICTIONS block shows direction, confidence, order book / trade flow values, and bet status for each asset.
+## Accounts
 
-**Key files:**
-- `exchange/kalshi.py` -- Kalshi REST client (auth, market discovery, order placement)
-- `strategy/strategies/kalshi_predictor.py` -- Multi-signal confidence scorer (0-100)
-- `KalshiPrimaryKey.txt` -- API key file (line 1 = API key ID, rest = RSA private key PEM)
+| Account | Purpose | Auth |
+|---------|---------|------|
+| **Coinbase** | Spot crypto trading | CDP API key (`cdp_api_key.json`) |
+| **Kalshi** | 15-min prediction markets | RSA key (`KalshiPrimaryKey.txt`, API key ID in settings.py) |
+
+**Note:** Coinbase perp trading returns 403 (Permission Denied) — account doesn't have perp access enabled. Short signals on Coinbase will fail. Only long (spot buy) trades execute on Coinbase. Kalshi is where we take directional short bets.
+
+## Monitoring
+
+Use MCP tools for monitoring — no bash commands or sleep needed:
+- `algotrade_status` — read dashboard state instantly
+- `algotrade_balances` — both account balances
+- `algotrade_positions` — open positions with P&L
+- `algotrade_errors` — scan for issues
+- `algotrade_logs` — raw daemon output
+
+**Monitoring cadence:**
+- Active management: check `algotrade_status` every few minutes
+- Passive: let daemon run, check `algotrade_performance` periodically
+- After issues: check `algotrade_errors` then `algotrade_logs`
+
+## When to Intervene
+
+### Let the system trade when:
+- RSI is in normal signal zones (25-38 for buys, 62-75 for shorts, per pair)
+- Market is RANGING (regime indicator)
+- Win rate above 60%
+- Leading indicators not contradicting
+
+### Override or pause when:
+- **BTC dumps >5% in 1 hour** — all alts follow, skip buy signals
+- **Win rate below 50%** — regime shift from ranging to trending
+- **Multiple positions all losing** — correlation risk, close weakest
+- **RSI stays below 20 or above 80 for multiple candles** — trending, not reverting
+- **Leading indicators show heavy selling on ALL pairs** — market-wide selloff
+
+### How to intervene:
+1. `algotrade_stop` or `algotrade_force_kill`
+2. `algotrade_sell` or `algotrade_close_all`
+3. `algotrade_start` to restart
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `data/store/dashboard.log` | Latest dashboard frame |
+| `data/store/trades.csv` | All trade history |
+| `data/store/positions.json` | Persisted open positions |
+| `data/store/snapshots/` | JSON snapshots every 15 min |
+| `/tmp/dashboard_stdout.log` | Daemon stdout/stderr |
+| `/tmp/dashboard_pid.txt` | Running daemon PID |
+| `config/pair_config.py` | Per-pair thresholds (editable) |
 
 ## Known Limitations
 
-1. **Mean reversion fails in strong trends.** If BTC enters a sustained bull or bear run, these strategies will underperform or lose money. They are designed for ranging/choppy markets.
-2. **Backtests used BinanceUS data, execution is on Coinbase.** Price differences are minimal but exist. Slippage may differ.
-3. **6-month backtest period (Sep 2025 - Mar 2026)** included both a rally and a correction. Results are reasonably robust but not guaranteed.
-4. **15m timeframe means signals happen every few hours, not minutes.** Don't expect constant action.
-5. **Shorts require Coinbase perps** which are only available for BTC, ETH, SOL. Short signals on other pairs are executed as spot sells (closing longs only).
+1. **Mean reversion fails in strong trends.** Designed for ranging/choppy markets.
+2. **Coinbase perps return 403** — no short execution via Coinbase. Use Kalshi for directional down bets.
+3. **Synced positions use current price as entry** — P&L may be under-reported for positions opened before a restart.
+4. **BinanceUS data, Coinbase execution** — minor price differences possible.
+5. **15m timeframe** — signals happen every few hours, not minutes. Be patient.
+6. **Kalshi 15-min contracts** — thin liquidity on some assets. Wide spreads mean our smart pricing helps but fills aren't guaranteed.
 
 ## Session Checklist
 
 Before every trading session:
 - [ ] Read this file
-- [ ] Check current market conditions (is BTC trending or ranging?)
-- [ ] Review last session's trades in `data/store/trades.csv`
-- [ ] Start with `--dry-run` for at least 1 cycle to confirm signals are reasonable
-- [ ] Switch to `--live` only when confident
-- [ ] Monitor the 1-minute ticks for the first 30 minutes actively
-- [ ] After session, review win rate and P&L
+- [ ] `algotrade_balances` — check both accounts
+- [ ] `algotrade_errors` — any issues from last session?
+- [ ] `algotrade_trade_history` — review recent trades
+- [ ] `algotrade_signals` — what's firing right now?
+- [ ] `algotrade_start` with dry-run for 1 cycle to confirm
+- [ ] Switch to live when confident
+- [ ] Monitor with `algotrade_status` periodically
+- [ ] After session: `algotrade_performance` for review
