@@ -190,7 +190,8 @@ class MMAssetRunner:
         # Fix I2: check window loss limit
         if self.inv.is_window_loss_hit():
             self.status_msg = "QUOTING_BID: window loss limit hit -> DARK"
-            self._cancel_pending_bid()
+            if self._safe_cancel_bid_or_manage():
+                return  # bid was filled, now managing position
             self.inv.state = DARK
             return
 
@@ -198,7 +199,8 @@ class MMAssetRunner:
         mins = self.inv.minutes_to_expiry()
         if mins < HARD_CUTOFF_MINUTES:
             self.status_msg = "QUOTING_BID: past hard cutoff -> IDLE"
-            self._cancel_pending_bid()
+            if self._safe_cancel_bid_or_manage():
+                return
             self.inv.state = IDLE
             return
 
@@ -208,7 +210,8 @@ class MMAssetRunner:
         # Fix I1: check volatility spike alongside VPIN
         if self.kill_switch.should_go_dark(self.vpin) or self.kill_switch.volatility_spike():
             self.status_msg = f"QUOTING_BID: toxic flow (VPIN={self.vpin:.2f}) -> DARK"
-            self._cancel_pending_bid()
+            if self._safe_cancel_bid_or_manage():
+                return
             self.inv.state = DARK
             return
 
@@ -216,7 +219,8 @@ class MMAssetRunner:
         spread = compute_spread_cents(self.vpin)
         if spread is None:
             self.status_msg = "QUOTING_BID: spread=None (toxic) -> DARK"
-            self._cancel_pending_bid()
+            if self._safe_cancel_bid_or_manage():
+                return
             self.inv.state = DARK
             return
 
@@ -238,7 +242,8 @@ class MMAssetRunner:
                 f"({abs(mid - self._prev_mid)}c) -> DARK"
             )
             self._prev_mid = mid
-            self._cancel_pending_bid()
+            if self._safe_cancel_bid_or_manage():
+                return
             self.inv.state = DARK
             return
         self._prev_mid = mid
@@ -749,13 +754,28 @@ class MMAssetRunner:
     # -- cancel helpers -----------------------------------------------------
 
     def _cancel_pending_bid(self) -> dict | None:
-        """Cancel pending bid order. Returns cancel result or None."""
+        """Check if bid filled, then cancel if still resting.
+
+        Returns:
+            {"status": "filled"} if already filled (caller must handle inventory)
+            {"status": "cancelled"} if successfully cancelled
+            None on error
+        """
         if self.inv.pending_bid_id is None:
             return None
         if self.dry_run:
             self.inv.pending_bid_id = None
             return {"status": "cancelled"}
         try:
+            # Check fill status BEFORE attempting cancel
+            resp = self.client.get_order_status(self.inv.pending_bid_id)
+            order = resp.get("order", resp)
+            status = order.get("status", "")
+            if status == "filled":
+                logger.info("%s bid %s already filled — must manage position",
+                            self.symbol, self.inv.pending_bid_id)
+                return {"status": "filled", "order": order}
+            # Still resting — safe to cancel
             result = self.client.cancel_order_safe(self.inv.pending_bid_id)
             self.inv.pending_bid_id = None
             return result
@@ -765,13 +785,28 @@ class MMAssetRunner:
             return None
 
     def _cancel_pending_ask(self) -> dict | None:
-        """Cancel pending ask order. Returns cancel result (may be 'filled')."""
+        """Check if ask filled, then cancel if still resting.
+
+        Returns:
+            {"status": "filled"} if already filled
+            {"status": "cancelled"} if successfully cancelled
+            None on error
+        """
         if self.inv.pending_ask_id is None:
             return None
         if self.dry_run:
             self.inv.pending_ask_id = None
             return {"status": "cancelled"}
         try:
+            # Check fill status BEFORE attempting cancel
+            resp = self.client.get_order_status(self.inv.pending_ask_id)
+            order = resp.get("order", resp)
+            status = order.get("status", "")
+            if status == "filled":
+                logger.info("%s ask %s already filled — round trip complete",
+                            self.symbol, self.inv.pending_ask_id)
+                return {"status": "filled", "order": order}
+            # Still resting — safe to cancel
             result = self.client.cancel_order_safe(self.inv.pending_ask_id)
             self.inv.pending_ask_id = None
             return result
@@ -779,6 +814,33 @@ class MMAssetRunner:
             logger.warning("%s cancel ask failed: %s", self.symbol, e)
             self.inv.pending_ask_id = None
             return None
+
+    def _safe_cancel_bid_or_manage(self) -> bool:
+        """Cancel bid, but if already filled, transition to QUOTING_ASK.
+
+        Returns True if bid was filled (caller should return, state is now QUOTING_ASK).
+        Returns False if bid was cancelled or no bid pending (caller continues normally).
+        """
+        result = self._cancel_pending_bid()
+        if result and result.get("status") == "filled":
+            order = result.get("order", {})
+            fill_count = order.get("count", 1) if not self.dry_run else 1
+            if self.safe_mode:
+                fill_count = 1
+            self.inv.record_buy_fill(fill_count, self.inv.bid_price_cents)
+            self._log_trade("buy", self.inv.bid_price_cents, "bid-filled-on-cancel")
+            # Post ask to try to profit, or at least exit
+            spread = compute_spread_cents(self.vpin) or 2
+            ask = compute_ask_cents(self.inv.entry_price_cents, spread)
+            if ask:
+                self._place_ask(ask)
+                self.inv.state = QUOTING_ASK
+                self.status_msg = f"bid filled on cancel — managing position, ask@{ask}c"
+            else:
+                self.inv.state = EXITING
+                self.status_msg = "bid filled on cancel — ask invalid, exiting"
+            return True
+        return False
 
     # -- handle bid fill from cancel (Fix C3) --------------------------------
 
