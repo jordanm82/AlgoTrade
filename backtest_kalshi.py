@@ -49,7 +49,9 @@ def fetch_candles(fetcher: DataFetcher, symbol: str, timeframe: str, days: int) 
     since = now_ms - period_ms
     batch_size = 1000
 
-    if timeframe == "15m":
+    if timeframe == "5m":
+        candle_ms = 5 * 60 * 1000
+    elif timeframe == "15m":
         candle_ms = 15 * 60 * 1000
     elif timeframe == "1h":
         candle_ms = 60 * 60 * 1000
@@ -288,6 +290,145 @@ def print_metrics(name: str, m: dict):
         print(", ".join(parts))
 
 
+def simulate_lifecycle(
+    asset_name: str,
+    df_5m: pd.DataFrame,
+    df_1h: pd.DataFrame | None,
+    predictor: KalshiPredictor,
+    threshold: int,
+) -> list[dict]:
+    """Simulate 5m progressive confirmation lifecycle on historical data.
+
+    For each 15-minute window:
+    1. SETUP at first candle boundary (score, no bet)
+    2. CONFIRMED at second boundary (score, bet if threshold met + direction matches)
+    3. DOUBLE_CONFIRMED at third boundary (bet if still not taken)
+
+    Returns list of bet results (one per window where a bet was placed).
+    """
+    df = add_indicators(df_5m.copy())
+    df_1h_ind = None
+    if df_1h is not None:
+        df_1h_ind = add_indicators(df_1h.copy())
+
+    results = []
+
+    # Group 5m candles into 15-minute windows
+    # Each window has 3 candles. Find window boundaries by minute % 15 == 0
+    # 5m candle timestamps are at :00, :05, :10, :15, :20, etc.
+    # A 15m window starting at :00 has candles at :00, :05, :10
+    # The window result is: open of :00 candle vs close of :10 candle
+
+    warmup = 60  # need enough candles for indicators to stabilize
+
+    i = warmup
+    while i < len(df) - 2:  # need at least 3 candles for a window
+        candle_minute = df.index[i].minute % 15
+
+        # Find the start of a 15m window (minute % 15 == 0)
+        if candle_minute != 0:
+            i += 1
+            continue
+
+        # We have the window start at index i
+        # Need 3 consecutive candles: i (min 0), i+1 (min 5), i+2 (min 10)
+        if i + 2 >= len(df):
+            break
+
+        # Verify the 3 candles span a proper 15m window
+        t0 = df.index[i]
+        t1 = df.index[i + 1]
+        t2 = df.index[i + 2]
+
+        # Check spacing (should be ~5 minutes apart)
+        gap1 = (t1 - t0).total_seconds()
+        gap2 = (t2 - t1).total_seconds()
+        if gap1 > 400 or gap2 > 400:  # allow some tolerance
+            i += 1
+            continue
+
+        # Actual direction for this window
+        window_open = float(df.iloc[i]["open"])
+        window_close = float(df.iloc[i + 2]["close"])
+        actual_direction = "UP" if window_close > window_open else "DOWN"
+
+        setup_direction = None
+        setup_conf = 0
+        bet_placed = False
+
+        # --- SETUP (using data up to and including candle at index i) ---
+        window_data = df.iloc[:i + 1]
+        if len(window_data) >= 50:
+            # Find matching 1h data
+            mtf_window = None
+            if df_1h_ind is not None:
+                mask = df_1h_ind.index <= t0
+                if mask.sum() >= 20:
+                    mtf_window = df_1h_ind.loc[mask]
+
+            signal = predictor.score(window_data, df_1h=mtf_window)
+            if signal is not None:
+                setup_direction = signal.direction
+                setup_conf = signal.confidence
+
+        # --- CONFIRMED (using data through candle at index i+1) ---
+        if not bet_placed and setup_direction is not None:
+            window_data = df.iloc[:i + 2]
+            mtf_window = None
+            if df_1h_ind is not None:
+                mask = df_1h_ind.index <= t1
+                if mask.sum() >= 20:
+                    mtf_window = df_1h_ind.loc[mask]
+
+            signal = predictor.score(window_data, df_1h=mtf_window)
+            if signal is not None:
+                if signal.direction == setup_direction and signal.confidence >= threshold:
+                    results.append({
+                        "asset": asset_name,
+                        "timestamp": t1,
+                        "price": float(df.iloc[i + 1]["close"]),
+                        "direction": signal.direction,
+                        "confidence": signal.confidence,
+                        "actual": actual_direction,
+                        "correct": signal.direction == actual_direction,
+                        "rsi": signal.rsi,
+                        "entry_minute": 5,
+                    })
+                    bet_placed = True
+                elif signal.direction != setup_direction:
+                    # Direction flipped — kill signal
+                    setup_direction = None
+
+        # --- DOUBLE_CONFIRMED (using data through candle at index i+2) ---
+        if not bet_placed and setup_direction is not None:
+            window_data = df.iloc[:i + 3]
+            mtf_window = None
+            if df_1h_ind is not None:
+                mask = df_1h_ind.index <= t2
+                if mask.sum() >= 20:
+                    mtf_window = df_1h_ind.loc[mask]
+
+            signal = predictor.score(window_data, df_1h=mtf_window)
+            if signal is not None:
+                if signal.direction == setup_direction and signal.confidence >= threshold:
+                    results.append({
+                        "asset": asset_name,
+                        "timestamp": t2,
+                        "price": float(df.iloc[i + 2]["close"]),
+                        "direction": signal.direction,
+                        "confidence": signal.confidence,
+                        "actual": actual_direction,
+                        "correct": signal.direction == actual_direction,
+                        "rsi": signal.rsi,
+                        "entry_minute": 10,
+                    })
+                    bet_placed = True
+
+        i += 3  # skip to next window
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi predictor iterative backtest")
     parser.add_argument("--days", type=int, default=30, help="Backtest period in days (default: 30)")
@@ -413,6 +554,55 @@ def main():
         for a, wr in sorted(best['per_asset_wr'].items()):
             bets = best['per_asset_bets'].get(a, 0)
             print(f"    {a}: {wr}% WR ({bets} bets)")
+
+    # ── 5m Lifecycle evaluation ──
+    print("\n" + "=" * 60)
+    print("5m LIFECYCLE EVALUATION (progressive confirmation)")
+    print("=" * 60)
+
+    # Fetch 5m data
+    data_5m = {}
+    for asset_name, symbol in ASSETS.items():
+        print(f"  Fetching {asset_name} 5m candles...")
+        df_5m = fetch_candles(fetcher, symbol, "5m", args.days)
+        if not df_5m.empty:
+            data_5m[asset_name] = df_5m
+            print(f"    {len(df_5m)} candles")
+
+    # Run per-asset with per-asset thresholds
+    PER_ASSET_THRESH = {"BTC": 30, "ETH": 35, "SOL": 35, "XRP": 30, "BNB": 35}
+    lifecycle_results = []
+    for asset_name, df_5m in data_5m.items():
+        df_1h = data_1h.get(asset_name)
+        thresh = PER_ASSET_THRESH.get(asset_name, 30)
+        r = simulate_lifecycle(asset_name, df_5m, df_1h, predictor, thresh)
+        lifecycle_results.extend(r)
+        wins = sum(1 for x in r if x["correct"])
+        wr = wins / len(r) * 100 if r else 0
+        entry_5 = sum(1 for x in r if x.get("entry_minute") == 5)
+        entry_10 = sum(1 for x in r if x.get("entry_minute") == 10)
+        print(f"  {asset_name}: {len(r)} bets ({entry_5} at min5, {entry_10} at min10) | WR: {wr:.1f}%")
+
+    # Overall lifecycle metrics
+    if lifecycle_results:
+        m_life = simulate_pnl(lifecycle_results, threshold=0)  # threshold already applied per-asset
+        print_metrics("5m Lifecycle (per-asset thresholds)", m_life)
+
+    # Threshold sweep on 5m lifecycle (using a single threshold across all)
+    print("\n  5m LIFECYCLE THRESHOLD SWEEP:")
+    print(f"  {'Thresh':>7} {'Bets':>6} {'Wins':>6} {'WR%':>7} {'PF':>6}")
+    print(f"  {'─' * 35}")
+
+    # For sweep, re-run lifecycle with each threshold
+    for t in [25, 30, 35, 40, 45, 50]:
+        sweep_results = []
+        for asset_name, df_5m in data_5m.items():
+            df_1h = data_1h.get(asset_name)
+            r = simulate_lifecycle(asset_name, df_5m, df_1h, predictor, t)
+            sweep_results.extend(r)
+        if sweep_results:
+            m = simulate_pnl(sweep_results, threshold=0)
+            print(f"  {t:>7} {m['total_bets']:>6} {m['wins']:>6} {m['win_rate']:>6.1f}% {m['profit_factor']:>5.2f}")
 
     print("\n" + "=" * 60)
     print("Backtest complete.")
