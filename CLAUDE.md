@@ -106,20 +106,38 @@ Buys when price < BB lower AND RSI < threshold. Exits when price > BB middle. Ea
 
 ### Strategy 3: Kalshi 15-Minute Predictions
 
-Multi-signal confidence scorer (0-100) combining lagging + leading indicators. Places bets on BTC, ETH, SOL, XRP 15-minute up/down contracts.
+Multi-signal confidence scorer (0-100) combining lagging + leading + multi-timeframe indicators. Places bets on BTC, ETH, SOL, XRP, BNB 15-minute up/down contracts.
 
-**Series tickers:** `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`
+**Series tickers:** `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`, `KXBNB15M`
 
-**Confidence scoring (6 lagging + 5 leading components):**
-- RSI Signal (0-30 pts), BB Position (0-20), MACD Momentum (0-15), Volume (0-10), Price Momentum (0-15), RSI Trend (0-10)
+**Confidence scoring (8 lagging + 5 leading + 1 MTF, max raw 200):**
+- RSI Signal (0-30), BB Position (0-20), MACD Momentum (0-15), Volume (0-10), ROC-5 (0-10), RSI Trend (0-10), StochRSI (0-15), ATR Move Ratio (-5 to +10)
 - Order Book Imbalance (0-20), Trade Flow (0-20), Large Trade Bias (0-10), Spread (0-5), Cross-Asset (0-10)
+- 1-Hour Trend Alignment (-15 to +15) — biggest edge, prevents betting against hourly trend
+
+**Signal quality filters (hard gates, any rejection kills the signal):**
+- **Directional conflict** — rejects when lagging and leading indicators disagree (both ≥15 pts)
+- **Volatility regime** — rejects when ATR is in 90th+ or sub-10th percentile (200-period window)
+- **Margin of victory** — rejects when winner < 1.5x loser score
+
+**Per-asset confidence thresholds (from 3-month backtest optimization):**
+
+| Asset | Class | Threshold | 3mo WR | 3mo PF | Series |
+|-------|-------|-----------|--------|--------|--------|
+| BTC | A | 30 | 64.7% | 4.94 | KXBTC15M |
+| ETH | A | 35 | 66.7% | 4.73 | KXETH15M |
+| SOL | A | 35 | 63.7% | 4.08 | KXSOL15M |
+| XRP | B | 30 | 62.2% | 4.33 | KXXRP15M |
+| BNB | A | 35 | 60.9% | 3.67 | KXBNB15M |
 
 **Betting rules:**
-- Threshold: 30 minimum confidence to bet
+- Per-asset thresholds (above) — not a single global threshold
 - **Hard 50c entry cap** — never pay above 50c (R:R would be < 1:1)
 - Hold to settlement — entry price IS total risk per contract
 - Sizing: risk budget = 5% of Kalshi balance, count = budget / entry_price
 - Pricing: query orderbook, bid between bid and ask based on spread width
+- **Max 3 concurrent Kalshi bets** (separate from spot position limit)
+- Priority: highest confidence signals first when slots are limited
 
 **Payout structure (hold to settlement):**
 
@@ -133,7 +151,7 @@ Multi-signal confidence scorer (0-100) combining lagging + leading indicators. P
 **API:** `https://api.elections.kalshi.com` (RSA-PSS auth, no newlines in signature, DIGEST_LENGTH salt)
 
 ### Disabled Pairs (net negative in 6-month backtest)
-BTC, ETH, XRP, DOGE, ADA, LINK — disabled from Coinbase trading but BTC/ETH/SOL/XRP data still fetched for Kalshi predictions.
+BTC, ETH, XRP, DOGE, ADA, LINK — disabled from Coinbase trading but BTC/ETH/SOL/XRP/BNB data still fetched for Kalshi predictions.
 
 ## Risk Controls (Hardcoded)
 
@@ -142,6 +160,7 @@ BTC, ETH, XRP, DOGE, ADA, LINK — disabled from Coinbase trading but BTC/ETH/SO
 | Position size | 10% of current equity | Compounds as equity grows |
 | Max leverage | 3x on ATOM/DOT/LTC, 2x on rest | Per-pair from backtest |
 | Max concurrent positions | 3 | Highest confidence takes priority |
+| Max concurrent Kalshi bets | 3 | Separate from spot limit, confidence-ranked |
 | Stop-loss | 3% from entry | Enforced every 1 minute |
 | Daily drawdown halt | 5% | All trading stops |
 | Min balance | $10 | Lowered from $100 for small accounts |
