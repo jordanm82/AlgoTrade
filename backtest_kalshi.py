@@ -34,7 +34,7 @@ ASSETS = {
     "ETH": "ETH/USDT",
     "SOL": "SOL/USDT",
     "XRP": "XRP/USDT",
-    "DOGE": "DOGE/USDT",
+    "BNB": "BNB/USDT",
 }
 
 TIMEFRAME_15M = "15m"

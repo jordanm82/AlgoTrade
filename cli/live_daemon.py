@@ -526,7 +526,19 @@ class LiveDaemon:
         "ETH/USDT": "KXETH15M",
         "SOL/USDT": "KXSOL15M",
         "XRP/USDT": "KXXRP15M",
-        "DOGE/USDT": "KXDOGE15M",
+        "BNB/USDT": "KXBNB15M",
+    }
+
+    # Per-asset minimum confidence thresholds (from 3-month backtest optimization)
+    # Class A (threshold 30): BTC — strong at lower confidence
+    # Class A (threshold 35): ETH, SOL, BNB — best WR at moderate confidence
+    # Class B (threshold 30): XRP — degrades at higher thresholds
+    KALSHI_THRESHOLDS = {
+        "BTC/USDT": 30,
+        "ETH/USDT": 35,
+        "SOL/USDT": 35,
+        "XRP/USDT": 30,
+        "BNB/USDT": 35,
     }
 
     def _init_kalshi_client(self):
@@ -546,7 +558,7 @@ class LiveDaemon:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
     def _kalshi_cycle(self):
-        """Run Kalshi predictions for BTC/ETH/SOL/XRP/DOGE and optionally place bets."""
+        """Run Kalshi predictions for BTC/ETH/SOL/XRP/BNB and optionally place bets."""
         # Prune expired bets (Kalshi 15m contracts settle in 15 minutes)
         now = time.time()
         self._active_kalshi_bets = {
@@ -558,6 +570,7 @@ class LiveDaemon:
             return
 
         predictions = []
+        valid_signals = []
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
             # Kalshi pairs may not be in our Coinbase trading set — fetch independently
             df = self._dataframes.get(symbol)
@@ -618,8 +631,37 @@ class LiveDaemon:
                 "reason": "",
             }
 
-            if signal.confidence < self.kalshi_threshold:
-                pred["reason"] = f"below threshold ({self.kalshi_threshold})"
+            asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, self.kalshi_threshold)
+            if signal.confidence < asset_threshold:
+                pred["reason"] = f"below threshold ({asset_threshold})"
+                predictions.append(pred)
+                continue
+
+            # Signal cleared threshold — collect for confidence-ranked execution
+            valid_signals.append({
+                "symbol": symbol,
+                "series_ticker": series_ticker,
+                "signal": signal,
+                "market_data": market_data,
+                "pred": pred,
+            })
+
+        # Sort by confidence descending — highest conviction bets get priority
+        valid_signals.sort(key=lambda x: x["signal"].confidence, reverse=True)
+
+        # Execute top signals up to concurrency limit
+        for vs in valid_signals:
+            symbol = vs["symbol"]
+            series_ticker = vs["series_ticker"]
+            signal = vs["signal"]
+            market_data = vs["market_data"]
+            pred = vs["pred"]
+
+            ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
+            net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
+
+            if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
+                pred["reason"] = "at max concurrent bets (lower confidence skipped)"
                 predictions.append(pred)
                 continue
 
