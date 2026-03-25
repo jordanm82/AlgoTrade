@@ -29,7 +29,7 @@ DISCOVERY_RETRY_SECONDS = 10
 FORCED_EXIT_RETRY_SECONDS = 10
 
 # Inventory
-MAX_CONCURRENT_POSITIONS = 2   # max assets with capital deployed at once
+MAX_CONCURRENT_POSITIONS = 1   # max assets with capital deployed at once
 MAX_CONTRACTS_PER_ASSET = 50
 INVENTORY_TIMEOUT_SECONDS = 300
 RISK_BUDGET_PCT = 0.10  # 10% of balance, compounds as balance grows

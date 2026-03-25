@@ -929,6 +929,10 @@ def main():
         "--cycles", type=int, default=0,
         help="Number of poll cycles (0 = infinite)",
     )
+    parser.add_argument(
+        "--safe-mode", action="store_true",
+        help="Stop after first profitable round trip (safety test mode)",
+    )
     args = parser.parse_args()
 
     dry_run = args.mode == "dry-run"
@@ -997,6 +1001,18 @@ def main():
             _write_trades_csv(runners)
             _write_session_json(runners, args.mode, start_time, balance_cents)
             _append_vpin_csv(runners)
+
+            # Safe mode: stop after first profitable round trip
+            if args.safe_mode:
+                total_day_pnl = sum(r.inv.day_pnl_cents for r in runners)
+                total_rts = sum(r.inv.window_round_trips for r in runners)
+                if total_rts > 0 and total_day_pnl > 0:
+                    logger.info("SAFE MODE: profitable round trip completed (pnl=+%dc). Stopping.", total_day_pnl)
+                    # Cancel any resting orders before exit
+                    for r in runners:
+                        r._cancel_pending_bid()
+                        r._cancel_pending_ask()
+                    break
 
             # Clear trade logs after persisting (avoid re-writing)
             for runner in runners:
