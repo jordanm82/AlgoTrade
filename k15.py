@@ -426,38 +426,43 @@ def main():
     except Exception:
         console.print("[yellow]Could not connect to Kalshi[/yellow]")
 
-    # Main loop: auto-refresh every 2 seconds, non-blocking input
-    refresh_interval = 2.0
-    last_refresh = 0
+    # Use rich.live.Live for flicker-free rendering above the input prompt.
+    # Live redraws in-place without touching the lines below it.
+    # Input runs in a separate thread so Live doesn't block on readline.
 
-    while True:
-        # Auto-refresh dashboard
-        now = time.time()
-        if now - last_refresh >= refresh_interval:
+    should_quit = threading.Event()
+
+    def input_thread():
+        """Read commands from stdin in a background thread."""
+        while not should_quit.is_set():
             try:
-                console.clear()
-                layout = build_layout(state)
-                console.print(layout)
-                # Print prompt without newline
-                console.print("[bold cyan]k15>[/bold cyan] ", end="")
-            except Exception:
-                pass
-            last_refresh = now
+                # Use raw input — Live display renders above this
+                cmd = input("")
+                if cmd.strip():
+                    if handle_command(cmd.strip(), state, console):
+                        should_quit.set()
+                        return
+            except (KeyboardInterrupt, EOFError):
+                should_quit.set()
+                return
 
-        # Non-blocking input check (wait up to 0.5s)
-        try:
-            if select.select([sys.stdin], [], [], 0.5)[0]:
-                cmd = sys.stdin.readline().strip()
-                if cmd:
-                    if handle_command(cmd, state, console):
-                        break
-        except (KeyboardInterrupt, EOFError):
-            if state.running:
-                state.running = False
-                if state.daemon:
-                    state.daemon._running = False
-                time.sleep(1)
-            break
+    input_t = threading.Thread(target=input_thread, daemon=True)
+    input_t.start()
+
+    try:
+        with Live(build_layout(state), console=console, refresh_per_second=0.5,
+                  vertical_overflow="crop", screen=False) as live:
+            while not should_quit.is_set():
+                time.sleep(2)
+                live.update(build_layout(state))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if state.running:
+            state.running = False
+            if state.daemon:
+                state.daemon._running = False
+            time.sleep(1)
 
     console.print("[cyan]Goodbye.[/cyan]")
 
