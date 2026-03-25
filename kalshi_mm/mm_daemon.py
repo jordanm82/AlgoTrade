@@ -965,9 +965,29 @@ def main():
             if args.cycles > 0 and cycle > args.cycles:
                 break
 
-            # Tick all runners
+            # Tick runners — only 1 can hold inventory at a time.
+            # If any runner has inventory (QUOTING_ASK or EXITING), only tick
+            # that runner + runners in IDLE/DISCOVERING (no capital at risk).
+            active_holder = None
+            for r in runners:
+                if r.inv.has_inventory() or r.inv.pending_bid_id is not None:
+                    active_holder = r
+                    break
+
             for runner in runners:
-                runner.tick()
+                if active_holder is None:
+                    # Nobody has capital deployed — tick all (only 1 will place a bid)
+                    runner.tick()
+                    if runner.inv.pending_bid_id is not None or runner.inv.has_inventory():
+                        active_holder = runner  # this one just placed a bid, block the rest
+                elif runner is active_holder:
+                    runner.tick()  # always tick the one with capital at risk
+                elif runner.inv.state in (IDLE, DARK):
+                    pass  # don't tick — wait for active holder to free up
+                elif runner.inv.state == DISCOVERING:
+                    pass  # don't transition to quoting while another holds capital
+                else:
+                    runner.tick()  # tick EXITING runners to unwind
 
             # Get balance for dashboard
             balance_cents = 10000 if dry_run else _fetch_balance(client)
