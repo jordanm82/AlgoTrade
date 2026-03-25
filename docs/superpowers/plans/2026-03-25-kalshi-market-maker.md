@@ -12,6 +12,65 @@
 
 ---
 
+## ERRATA — Required Fixes (from plan review)
+
+**Read these BEFORE implementing each task. Apply these fixes during implementation.**
+
+### Critical Fixes (Task 6 — mm_daemon.py)
+
+**Fix C1: Handle ask-cancel-as-fill race condition.** In `_tick_quoting_ask()`, after every `_cancel_pending_ask()` call (hard cutoff, VPIN kill, inventory timeout), check the return value. If it returns `{"status": "filled"}`, the ask was already filled — call `self.inv.record_sell_fill(self.inv.ask_price_cents)` and transition to QUOTING_BID or IDLE (not EXITING). Pattern:
+```python
+result = self._cancel_pending_ask()
+if result and result.get("status") == "filled":
+    self.inv.record_sell_fill(self.inv.ask_price_cents)
+    self.inv.state = IDLE
+    return
+self.inv.state = EXITING
+```
+
+**Fix C2: Capture entry_price before record_sell_fill() in _exit_at_market().** `record_sell_fill()` zeroes `entry_price_cents`. Save it first:
+```python
+entry = self.inv.entry_price_cents
+exit_price = max(1, entry - MAX_EXIT_LOSS_CENTS)
+# ... sell logic ...
+self.inv.record_sell_fill(exit_price)
+self._log_trade("FORCED_EXIT", exit_price, contracts)
+```
+
+**Fix C3: In _handle_bid_fill_from_cancel(), query actual fill count in live mode.** Don't recompute from balance — the balance was already debited. In live mode, call `get_order_status()` on the original bid order ID to get actual fill count and price. Only use `compute_contracts()` in dry-run mode.
+
+### Important Fixes
+
+**Fix I1: Add volatility spike detection to state machine.** In `_compute_vpin()`, also fetch spot price via `DataFetcher.ticker()` and call `self.kill_switch.record_price(price)`. In each quoting state, check `self.kill_switch.volatility_spike()` alongside VPIN checks — if True, cancel and go DARK.
+
+**Fix I2: Check window loss limit.** At the top of `_tick_quoting_bid()` and `_tick_quoting_ask()`, add:
+```python
+if self.inv.is_window_loss_hit():
+    self._cancel_pending_bid()  # or ask
+    self.inv.state = IDLE
+    return
+```
+
+**Fix I3: Track consecutive API errors.** Add `_consecutive_api_errors: int = 0` to `MMAssetRunner.__init__`. On successful API call, reset to 0. On exception, increment. If >= 2, cancel all and go DARK.
+
+**Fix I4: Track exit origin (kill switch vs timeout vs cutoff).** Add `_exit_from_kill_switch: bool = False` to `MMAssetRunner`. Set to True when transitioning to EXITING from VPIN kill switch. In `_tick_exiting()`, after exit completes: if `_exit_from_kill_switch`, transition to DARK instead of QUOTING_BID.
+
+**Fix I5: Progressive exit pricing.** In `_tick_exiting()`, compute exit price as `entry - (exit_attempt_count + 1)` cents (progressively lower), clamped to the `MAX_EXIT_LOSS_CENTS` floor. Don't re-read orderbook for exit pricing — that can give higher prices which defeats the purpose.
+
+**Fix I6: Write persistence files.** In the main loop, after rendering dashboard:
+- Append completed round trips to `data/store/mm_trades.csv` (columns: time, asset, action, buy_cents, sell_cents, contracts, pnl_cents, fees_cents)
+- Write `data/store/mm_session.json` with day_pnl, total_rts, start_time, forced_exits
+- Append VPIN readings to `data/store/mm_vpin.csv` (columns: time, asset, spot_vpin, kalshi_heuristic, blended)
+
+**Fix I7: Add VPIN_WINDOW_SECONDS to mm_config.py** (Task 1):
+```python
+VPIN_WINDOW_SECONDS = 120  # rolling 2-min window
+```
+
+**Fix I8: Verify orderbook depth in DISCOVERING.** In `_tick_discovering()`, after reading the orderbook, check that both yes_bids and no_bids have entries. If empty, stay in IDLE.
+
+---
+
 ## File Map
 
 | File | Responsibility | New/Modify |
