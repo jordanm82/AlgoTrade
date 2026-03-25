@@ -426,35 +426,53 @@ def main():
     except Exception:
         console.print("[yellow]Could not connect to Kalshi[/yellow]")
 
-    # Use rich.live.Live for flicker-free rendering above the input prompt.
-    # Live redraws in-place without touching the lines below it.
-    # Input runs in a separate thread so Live doesn't block on readline.
+    # Approach: alternate between rendering and reading input.
+    # On each cycle: clear screen, render dashboard, show prompt, wait for input
+    # with a short timeout. If no input, re-render. If input, process command.
+    #
+    # The key insight: we only clear+redraw when NO input is happening.
+    # When the user is typing, we wait patiently on their input.
 
-    should_quit = threading.Event()
+    import tty
+    import termios
 
-    def input_thread():
-        """Read commands from stdin in a background thread."""
-        while not should_quit.is_set():
-            try:
-                # Use raw input — Live display renders above this
-                cmd = input("")
-                if cmd.strip():
-                    if handle_command(cmd.strip(), state, console):
-                        should_quit.set()
-                        return
-            except (KeyboardInterrupt, EOFError):
-                should_quit.set()
-                return
+    input_buffer = ""
 
-    input_t = threading.Thread(target=input_thread, daemon=True)
-    input_t.start()
+    def render(extra_line=""):
+        """Clear screen and render dashboard + prompt."""
+        sys.stdout.write("\033[2J\033[H")  # ANSI clear screen + cursor to top
+        sys.stdout.flush()
+        console.print(build_layout(state))
+        prompt_text = f"[bold cyan]k15>[/bold cyan] {extra_line}"
+        console.print(prompt_text, end="")
+        sys.stdout.flush()
+
+    render()
 
     try:
-        with Live(build_layout(state), console=console, refresh_per_second=0.5,
-                  vertical_overflow="crop", screen=False) as live:
-            while not should_quit.is_set():
-                time.sleep(2)
-                live.update(build_layout(state))
+        while True:
+            # Wait for input with 2-second timeout
+            ready, _, _ = select.select([sys.stdin], [], [], 2.0)
+
+            if ready:
+                # User is typing — read one line
+                try:
+                    line = sys.stdin.readline()
+                    if not line:  # EOF
+                        break
+                    cmd = line.strip()
+                    if cmd:
+                        # Process command (temporarily below the dashboard)
+                        console.print()  # newline after prompt
+                        if handle_command(cmd, state, console):
+                            break
+                        time.sleep(0.5)  # brief pause to see command output
+                except (KeyboardInterrupt, EOFError):
+                    break
+
+            # Re-render dashboard (either after timeout or after command)
+            render()
+
     except KeyboardInterrupt:
         pass
     finally:
@@ -464,7 +482,7 @@ def main():
                 state.daemon._running = False
             time.sleep(1)
 
-    console.print("[cyan]Goodbye.[/cyan]")
+    console.print("\n[cyan]Goodbye.[/cyan]")
 
 
 if __name__ == "__main__":
