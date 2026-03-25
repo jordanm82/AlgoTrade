@@ -558,6 +558,190 @@ class LiveDaemon:
         except Exception as e:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
+    def _kalshi_execute_bet(self, symbol: str, series_ticker: str, signal, market_data: dict | None) -> dict:
+        """Execute a single Kalshi bet. Returns a pred dict with outcome details.
+
+        Handles: balance check, market discovery, orderbook pricing,
+        order placement, fill verification, active bet tracking.
+        """
+        asset = symbol.split("/")[0]
+        ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
+        net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
+
+        pred = {
+            "symbol": symbol, "asset": asset,
+            "direction": signal.direction, "confidence": signal.confidence,
+            "ob": ob_imb, "flow": net_flow, "reason": "",
+        }
+
+        MAX_ENTRY_CENTS = 50
+        RISK_PER_BET_PCT = 0.05
+
+        side = "yes" if signal.direction == "UP" else "no"
+        pred["reason"] = f"would bet {side.upper()} (conf={signal.confidence})"
+
+        if self.dry_run:
+            print(colored(
+                f"  [KALSHI DRY] {asset} {signal.direction} "
+                f"conf={signal.confidence} | "
+                f"OB={ob_imb:+.2f} flow={net_flow:+.2f} | "
+                f"bet {side.upper()} (hold to settlement)",
+                "magenta",
+            ))
+            return pred
+
+        # Live: place the bet
+        self._init_kalshi_client()
+        if self.kalshi_client is None:
+            pred["reason"] = "client init failed"
+            return pred
+        try:
+            # Kalshi is source of truth for balance
+            balance_resp = self.kalshi_client.get_balance()
+            balance_cents = balance_resp.get("balance", 0)
+            risk_budget_cents = max(500, int(balance_cents * RISK_PER_BET_PCT))
+
+            # Find the next 15-min market for this series
+            events = self.kalshi_client._get("/trade-api/v2/events", {
+                "series_ticker": series_ticker, "status": "open",
+                "limit": 3, "with_nested_markets": "true",
+            })
+            all_markets = []
+            for evt in events.get("events", []):
+                all_markets.extend(evt.get("markets", []))
+            if not all_markets:
+                pred["reason"] = f"no {series_ticker} markets found"
+                print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
+                return pred
+
+            # Pick the soonest-expiring open market
+            market = all_markets[0]
+            ticker = market.get("ticker", "")
+
+            # Optimal entry: query orderbook for bid-ask spread
+            # Tight spread → bid at ask (instant fill)
+            # Wide spread → bid at midpoint+1c (better price, likely fills)
+            best_bid = None
+            best_ask = None
+            try:
+                book = self.kalshi_client.get_orderbook(ticker)
+                ob = book.get("orderbook", {})
+                our_side = "yes" if side == "yes" else "no"
+                asks = ob.get(our_side, [])
+                # Orderbook format: [[price, qty], ...]
+                # For YES side: asks are offers to sell YES contracts
+                if asks and len(asks) > 0:
+                    best_ask = asks[0][0] if isinstance(asks[0], list) else asks[0]
+                # Get the bid side too for spread calculation
+                other_side = "no" if side == "yes" else "yes"
+                bids = ob.get(other_side, [])
+                if bids and len(bids) > 0:
+                    other_best = bids[0][0] if isinstance(bids[0], list) else bids[0]
+                    best_bid = 100 - other_best  # complement
+            except Exception:
+                pass
+
+            # Fall back to market data if orderbook failed
+            if best_ask is None:
+                if side == "yes":
+                    best_ask = market.get("yes_ask") or 50
+                else:
+                    best_ask = market.get("no_ask") or 50
+
+            best_ask = int(best_ask) if best_ask else 50
+
+            # Calculate optimal bid
+            if best_bid is not None:
+                best_bid = int(best_bid)
+                spread = best_ask - best_bid
+                if spread <= 3:
+                    # Tight spread — bid at ask for instant fill
+                    fill_price = best_ask
+                elif spread <= 10:
+                    # Moderate spread — bid at midpoint + 1c
+                    fill_price = (best_bid + best_ask) // 2 + 1
+                else:
+                    # Wide spread — bid 30% above mid (aggressive but not at ask)
+                    mid = (best_bid + best_ask) // 2
+                    fill_price = mid + max(1, spread // 3)
+            else:
+                # No bid info — bid at ask
+                fill_price = best_ask
+
+            fill_price = max(1, min(99, int(fill_price)))
+
+            # NEVER pay above 50c — above that the R:R is against us
+            if fill_price > MAX_ENTRY_CENTS:
+                pred["reason"] = f"price {fill_price}c > max {MAX_ENTRY_CENTS}c — R:R unfavorable"
+                print(colored(
+                    f"  [KALSHI SKIP] {asset} {side.upper()} @ {fill_price}c "
+                    f"— above {MAX_ENTRY_CENTS}c cap (R:R < 1:1)",
+                    "yellow"))
+                return pred
+
+            # Position size from risk budget: count = max_loss / entry_price
+            # entry_price IS the max loss per contract (we hold to settlement)
+            count = max(1, risk_budget_cents // fill_price)
+            potential_profit = count * (100 - fill_price)
+            potential_loss = count * fill_price
+            rr_ratio = potential_profit / potential_loss if potential_loss > 0 else 0
+
+            # Verify against actual Kalshi balance (exchange is source of truth)
+            cost_cents = count * fill_price
+            if cost_cents > balance_cents:
+                count = max(1, balance_cents // fill_price)
+                if count < 1:
+                    pred["reason"] = f"insufficient Kalshi balance (${balance_cents/100:.2f})"
+                    return pred
+                cost_cents = count * fill_price
+                potential_profit = count * (100 - fill_price)
+                rr_ratio = potential_profit / cost_cents if cost_cents > 0 else 0
+
+            result = self.kalshi_client.place_order(
+                ticker=ticker,
+                side=side,
+                count=count,
+                price_cents=fill_price,
+                order_type="limit",
+            )
+            order = result.get("order", {})
+            order_id = order.get("order_id", "?")
+            fill_count = order.get("fill_count_fp", "0")
+            order_status = order.get("status", "?")
+
+            # Verify fill via Kalshi (exchange is source of truth)
+            if float(fill_count) < count and order_status == "resting":
+                # Partially filled or resting — check positions
+                import time as _t
+                _t.sleep(1)
+                try:
+                    positions = self.kalshi_client.get_positions()
+                    for p in positions:
+                        if p.get("ticker") == ticker and p.get("position", 0) > 0:
+                            fill_count = str(p["position"])
+                            break
+                except Exception:
+                    pass
+
+            pred["reason"] = (
+                f"placed {side.upper()} x{count} @ {fill_price}c "
+                f"risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
+                f"filled={fill_count} status={order_status} (#{order_id})"
+            )
+            print(colored(
+                f"  [KALSHI BET] {asset} {signal.direction} "
+                f"conf={signal.confidence} | {side.upper()} x{count} @ {fill_price}c "
+                f"| risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
+                f"| filled={fill_count} status={order_status}",
+                "magenta",
+            ))
+            self._active_kalshi_bets[ticker] = time.time()
+        except Exception as e:
+            pred["reason"] = f"order failed: {e}"
+            print(colored(f"  [KALSHI ERR] {asset}: {e}", "red"))
+
+        return pred
+
     def _kalshi_cycle(self):
         """Run Kalshi predictions for BTC/ETH/SOL/XRP/BNB and optionally place bets."""
         # Prune expired bets (Kalshi 15m contracts settle in 15 minutes)
@@ -652,195 +836,14 @@ class LiveDaemon:
 
         # Execute top signals up to concurrency limit
         for vs in valid_signals:
-            symbol = vs["symbol"]
-            series_ticker = vs["series_ticker"]
-            signal = vs["signal"]
-            market_data = vs["market_data"]
-            pred = vs["pred"]
-
-            ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
-            net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
-
             if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
-                pred["reason"] = "at max concurrent bets (lower confidence skipped)"
-                predictions.append(pred)
+                vs["pred"]["reason"] = "at max concurrent bets (lower confidence skipped)"
+                predictions.append(vs["pred"])
                 continue
 
-            # Determine bet side
-            # We hold to settlement — entry price IS our risk per contract
-            # Payout: $1 if right, $0 if wrong
-            # Goal: buy below 50c for positive expected value
-            # MAX_ENTRY: never pay more than this (caps risk/reward)
-            MAX_ENTRY_CENTS = 50  # above 50c the R:R is against us
-            # RISK_PER_BET: max dollars to risk on a single bet
-            RISK_PER_BET_PCT = 0.05  # 5% of Kalshi balance
-
-            side = "yes" if signal.direction == "UP" else "no"
-            pred["reason"] = f"would bet {side.upper()} (conf={signal.confidence})"
-
-            if self.dry_run:
-                print(colored(
-                    f"  [KALSHI DRY] {pred['asset']} {signal.direction} "
-                    f"conf={signal.confidence} | "
-                    f"OB={ob_imb:+.2f} flow={net_flow:+.2f} | "
-                    f"bet {side.upper()} (hold to settlement)",
-                    "magenta",
-                ))
-            else:
-                # Live: place the bet
-                self._init_kalshi_client()
-                if self.kalshi_client is None:
-                    pred["reason"] = "client init failed"
-                    predictions.append(pred)
-                    continue
-                try:
-                    # Kalshi is source of truth for balance
-                    balance_resp = self.kalshi_client.get_balance()
-                    balance_cents = balance_resp.get("balance", 0)
-                    risk_budget_cents = max(500, int(balance_cents * RISK_PER_BET_PCT))
-
-                    # Find the next 15-min market for this series
-                    events = self.kalshi_client._get("/trade-api/v2/events", {
-                        "series_ticker": series_ticker, "status": "open",
-                        "limit": 3, "with_nested_markets": "true",
-                    })
-                    all_markets = []
-                    for evt in events.get("events", []):
-                        all_markets.extend(evt.get("markets", []))
-                    if not all_markets:
-                        pred["reason"] = f"no {series_ticker} markets found"
-                        print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
-                        predictions.append(pred)
-                        continue
-
-                    # Pick the soonest-expiring open market
-                    market = all_markets[0]
-                    ticker = market.get("ticker", "")
-
-                    # Optimal entry: query orderbook for bid-ask spread
-                    # Tight spread → bid at ask (instant fill)
-                    # Wide spread → bid at midpoint+1c (better price, likely fills)
-                    best_bid = None
-                    best_ask = None
-                    try:
-                        book = self.kalshi_client.get_orderbook(ticker)
-                        ob = book.get("orderbook", {})
-                        our_side = "yes" if side == "yes" else "no"
-                        asks = ob.get(our_side, [])
-                        # Orderbook format: [[price, qty], ...]
-                        # For YES side: asks are offers to sell YES contracts
-                        if asks and len(asks) > 0:
-                            best_ask = asks[0][0] if isinstance(asks[0], list) else asks[0]
-                        # Get the bid side too for spread calculation
-                        other_side = "no" if side == "yes" else "yes"
-                        bids = ob.get(other_side, [])
-                        if bids and len(bids) > 0:
-                            other_best = bids[0][0] if isinstance(bids[0], list) else bids[0]
-                            best_bid = 100 - other_best  # complement
-                    except Exception:
-                        pass
-
-                    # Fall back to market data if orderbook failed
-                    if best_ask is None:
-                        if side == "yes":
-                            best_ask = market.get("yes_ask") or 50
-                        else:
-                            best_ask = market.get("no_ask") or 50
-
-                    best_ask = int(best_ask) if best_ask else 50
-
-                    # Calculate optimal bid
-                    if best_bid is not None:
-                        best_bid = int(best_bid)
-                        spread = best_ask - best_bid
-                        if spread <= 3:
-                            # Tight spread — bid at ask for instant fill
-                            fill_price = best_ask
-                        elif spread <= 10:
-                            # Moderate spread — bid at midpoint + 1c
-                            fill_price = (best_bid + best_ask) // 2 + 1
-                        else:
-                            # Wide spread — bid 30% above mid (aggressive but not at ask)
-                            mid = (best_bid + best_ask) // 2
-                            fill_price = mid + max(1, spread // 3)
-                    else:
-                        # No bid info — bid at ask
-                        fill_price = best_ask
-
-                    fill_price = max(1, min(99, int(fill_price)))
-
-                    # NEVER pay above 50c — above that the R:R is against us
-                    if fill_price > MAX_ENTRY_CENTS:
-                        pred["reason"] = f"price {fill_price}c > max {MAX_ENTRY_CENTS}c — R:R unfavorable"
-                        print(colored(
-                            f"  [KALSHI SKIP] {pred['asset']} {side.upper()} @ {fill_price}c "
-                            f"— above {MAX_ENTRY_CENTS}c cap (R:R < 1:1)",
-                            "yellow"))
-                        predictions.append(pred)
-                        continue
-
-                    # Position size from risk budget: count = max_loss / entry_price
-                    # entry_price IS the max loss per contract (we hold to settlement)
-                    count = max(1, risk_budget_cents // fill_price)
-                    potential_profit = count * (100 - fill_price)
-                    potential_loss = count * fill_price
-                    rr_ratio = potential_profit / potential_loss if potential_loss > 0 else 0
-
-                    # Verify against actual Kalshi balance (exchange is source of truth)
-                    cost_cents = count * fill_price
-                    if cost_cents > balance_cents:
-                        count = max(1, balance_cents // fill_price)
-                        if count < 1:
-                            pred["reason"] = f"insufficient Kalshi balance (${balance_cents/100:.2f})"
-                            predictions.append(pred)
-                            continue
-                        cost_cents = count * fill_price
-                        potential_profit = count * (100 - fill_price)
-                        rr_ratio = potential_profit / cost_cents if cost_cents > 0 else 0
-
-                    result = self.kalshi_client.place_order(
-                        ticker=ticker,
-                        side=side,
-                        count=count,
-                        price_cents=fill_price,
-                        order_type="limit",
-                    )
-                    order = result.get("order", {})
-                    order_id = order.get("order_id", "?")
-                    fill_count = order.get("fill_count_fp", "0")
-                    order_status = order.get("status", "?")
-
-                    # Verify fill via Kalshi (exchange is source of truth)
-                    if float(fill_count) < count and order_status == "resting":
-                        # Partially filled or resting — check positions
-                        import time as _t
-                        _t.sleep(1)
-                        try:
-                            positions = self.kalshi_client.get_positions()
-                            for p in positions:
-                                if p.get("ticker") == ticker and p.get("position", 0) > 0:
-                                    fill_count = str(p["position"])
-                                    break
-                        except Exception:
-                            pass
-
-                    pred["reason"] = (
-                        f"placed {side.upper()} x{count} @ {fill_price}c "
-                        f"risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
-                        f"filled={fill_count} status={order_status} (#{order_id})"
-                    )
-                    print(colored(
-                        f"  [KALSHI BET] {pred['asset']} {signal.direction} "
-                        f"conf={signal.confidence} | {side.upper()} x{count} @ {fill_price}c "
-                        f"| risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
-                        f"| filled={fill_count} status={order_status}",
-                        "magenta",
-                    ))
-                    self._active_kalshi_bets[ticker] = time.time()
-                except Exception as e:
-                    pred["reason"] = f"order failed: {e}"
-                    print(colored(f"  [KALSHI ERR] {pred['asset']}: {e}", "red"))
-
+            pred = self._kalshi_execute_bet(
+                vs["symbol"], vs["series_ticker"], vs["signal"], vs["market_data"]
+            )
             predictions.append(pred)
 
         self.kalshi_predictions = predictions
