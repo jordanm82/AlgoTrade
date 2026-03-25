@@ -568,3 +568,69 @@ class TestKalshiPredictorMTF:
         signal = predictor.score(df)
         assert signal is not None
         assert signal.components["mtf"]["score"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Signal quality filter tests
+# ---------------------------------------------------------------------------
+
+class TestKalshiFilters:
+    """Tests for signal quality filters."""
+
+    def test_directional_conflict_rejects_signal(self):
+        """When lagging UP but leading DOWN (both >= 15), signal is rejected."""
+        df = _make_df(rsi=22.0)  # lagging UP = 30 pts
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": -0.35, "spread_pct": 0.01},  # 20 DOWN
+            "trade_flow": {"net_flow": -0.25, "buy_ratio": 0.38, "large_trade_bias": -0.4},  # 20+10 DOWN
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is None
+
+    def test_no_conflict_when_aligned(self):
+        """When lagging and leading agree, no conflict rejection."""
+        df = _make_df(rsi=22.0)  # lagging UP
+        predictor = KalshiPredictor()
+        market_data = {
+            "order_book": {"imbalance": 0.35, "spread_pct": 0.01},  # 20 UP
+            "trade_flow": {"net_flow": 0.25, "buy_ratio": 0.6, "large_trade_bias": 0.4},
+        }
+        signal = predictor.score(df, market_data=market_data)
+        assert signal is not None
+        assert signal.direction == "UP"
+
+    def test_volatility_too_high_rejects(self):
+        """ATR in 90th+ percentile of its history rejects signal."""
+        df = _make_df(n=250, rsi=22.0, atr=200.0)
+        df.iloc[-1, df.columns.get_loc("atr")] = 2000.0
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is None
+
+    def test_volatility_too_low_rejects(self):
+        """ATR in sub-10th percentile of its history rejects signal."""
+        df = _make_df(n=250, rsi=22.0, atr=200.0)
+        df.iloc[-1, df.columns.get_loc("atr")] = 5.0
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is None
+
+    def test_margin_auto_passes_when_loser_zero(self):
+        """When loser score is 0 or negative, margin filter auto-passes."""
+        df = _make_df(rsi=22.0)  # 30 UP, 0 DOWN
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
+        assert signal.direction == "UP"
+
+    def test_normal_volatility_passes(self):
+        """ATR in normal range (10th-90th percentile) passes filter."""
+        df = _make_df(n=250, rsi=22.0, atr=200.0)
+        # Set a range of ATR values so percentile is meaningful
+        atr_values = np.linspace(100, 300, 250)
+        df["atr"] = atr_values  # last value is 300, percentile ~100%
+        df.iloc[-1, df.columns.get_loc("atr")] = 200.0  # median = ~50th percentile
+        predictor = KalshiPredictor()
+        signal = predictor.score(df)
+        assert signal is not None
