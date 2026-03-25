@@ -112,6 +112,11 @@ class LiveDaemon:
         self._active_kalshi_bets = {}  # {ticker: placement_time}
         self._kalshi_pending_signals = {}   # {asset: {direction, base_conf, last_5m_conf, ...}}
         self._last_kalshi_eval = 0          # timestamp of last eval
+        # Dry-run bet tracking — records bets and checks settlement
+        self._dryrun_bets: list[dict] = []  # pending bets awaiting settlement
+        self._dryrun_results: list[dict] = []  # completed bets with W/L
+        self._dryrun_wins = 0
+        self._dryrun_losses = 0
         self._kalshi_cached_dataframes = {}  # {symbol: DataFrame} cached 15m data with indicators for CONFIRMED re-scoring
 
     # ------------------------------------------------------------------
@@ -580,6 +585,44 @@ class LiveDaemon:
             return float(product["price"])
         except Exception:
             return None
+
+    def _check_dryrun_settlements(self):
+        """Check if any dry-run bets have settled and record W/L."""
+        if not self._dryrun_bets:
+            return
+        now = datetime.now(timezone.utc)
+        settled = []
+        for bet in self._dryrun_bets:
+            if now >= bet["settle_time"]:
+                # Get actual price from Coinbase at settlement
+                cb_price = self._get_coinbase_price(bet["symbol"])
+                if cb_price is None:
+                    continue  # can't check yet, try next tick
+
+                above_strike = cb_price >= bet["strike"]
+                # YES wins if price >= strike, NO wins if price < strike
+                won = (bet["side"] == "yes" and above_strike) or \
+                      (bet["side"] == "no" and not above_strike)
+
+                result_str = "WIN" if won else "LOSS"
+                color = "green" if won else "red"
+                print(colored(
+                    f"  [KALSHI DRY SETTLED] {bet['asset']} {bet['direction']} "
+                    f"strike=${bet['strike']:,.2f} actual=${cb_price:,.2f} → {result_str}",
+                    color,
+                ))
+
+                bet["result"] = result_str
+                bet["settle_price"] = cb_price
+                self._dryrun_results.append(bet)
+                if won:
+                    self._dryrun_wins += 1
+                else:
+                    self._dryrun_losses += 1
+                settled.append(bet)
+
+        for bet in settled:
+            self._dryrun_bets.remove(bet)
 
     def _init_kalshi_client(self):
         """Lazy-initialize the Kalshi client.
@@ -1102,11 +1145,32 @@ class LiveDaemon:
         pred["reason"] = f"would bet {side.upper()} (conf={conf_display})"
 
         if self.dry_run:
+            # Record dry-run bet for settlement tracking
+            from strategy.strategies.kalshi_predictor_v3 import KalshiV3Signal
+            strike = 0
+            settle_time = None
+            if isinstance(signal, KalshiV3Signal):
+                strike = signal.strike_price
+                pending = self._kalshi_pending_signals.get(asset, {})
+                settle_time = pending.get("close_time")
+
+            if strike and settle_time:
+                self._dryrun_bets.append({
+                    "asset": asset,
+                    "symbol": symbol,
+                    "side": side,
+                    "direction": direction_label,
+                    "strike": strike,
+                    "confidence": conf_display,
+                    "bet_time": datetime.now(timezone.utc),
+                    "settle_time": settle_time,
+                })
+
             print(colored(
                 f"  [KALSHI DRY] {asset} {direction_label} "
                 f"conf={conf_display} | "
                 f"OB={ob_imb:+.2f} flow={net_flow:+.2f} | "
-                f"bet {side.upper()} (hold to settlement)",
+                f"bet {side.upper()} strike=${strike:,.2f} (hold to settlement)",
                 "magenta",
             ))
             return pred

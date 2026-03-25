@@ -242,8 +242,18 @@ class Dashboard:
             f"  COINBASE: ${self._coinbase_balance:,.2f} + positions ${position_value:,.2f}  |  KALSHI: ${self._kalshi_balance:,.2f}  |  TOTAL: ${total_value:,.2f}",
             f"  DAILY P&L: ${combined_pnl:+,.2f} ({combined_pct:+.2f}%)  |  Realized: ${realized_pnl:+,.2f}  |  Unrealized: ${unrealized_pnl:+,.2f}",
             f"  POSITIONS: {len(positions)}/{MAX_CONCURRENT_POSITIONS}  |  EXPOSURE: ${exposure:,.2f}  |  TRADES: {total} (W:{wins} L:{losses} WR:{wr:.0f}%)",
-            "",
         ]
+
+        # Dry-run Kalshi bet tracking
+        if self.daemon.dry_run and self.daemon.kalshi_only:
+            dw = self.daemon._dryrun_wins
+            dl = self.daemon._dryrun_losses
+            dt = dw + dl
+            dwr = dw / dt * 100 if dt > 0 else 0
+            pending = len(self.daemon._dryrun_bets)
+            lines.append(f"  KALSHI DRY-RUN: W:{dw} L:{dl} WR:{dwr:.0f}%  |  Pending settlement: {pending}")
+
+        lines.append("")
 
         # Indicator freshness label
         if self._last_signal_time:
@@ -527,6 +537,9 @@ class Dashboard:
                     self.daemon._last_kalshi_eval = now_ts
 
                 self.daemon._update_equity()
+                # Check dry-run bet settlements
+                if self.daemon.dry_run:
+                    self.daemon._check_dryrun_settlements()
                 self._draw_dashboard(is_signal_cycle=False, signals=None)
 
         else:
