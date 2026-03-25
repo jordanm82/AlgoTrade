@@ -61,8 +61,8 @@ async def list_tools():
                     },
                     "predictor": {
                         "type": "string",
-                        "enum": ["v1", "v2"],
-                        "description": "Kalshi predictor: v1 (mean-reversion) or v2 (continuation).",
+                        "enum": ["v1", "v2", "v3"],
+                        "description": "Kalshi predictor: v1 (mean-reversion), v2 (continuation), or v3 (strike-relative).",
                         "default": "v1",
                     },
                 },

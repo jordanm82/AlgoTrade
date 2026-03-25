@@ -513,8 +513,8 @@ def main():
     parser.add_argument("--live", action="store_true", help="Live trading")
     parser.add_argument("--cycles", type=int, default=15, help="Signal cycles to run")
     parser.add_argument("--kalshi-only", action="store_true", help="Run only Kalshi 15m predictions, skip Coinbase spot trading")
-    parser.add_argument("--predictor", choices=["v1", "v2"], default="v1",
-                        help="Kalshi predictor: v1 (mean-reversion) or v2 (continuation)")
+    parser.add_argument("--predictor", choices=["v1", "v2", "v3"], default="v1",
+                        help="Kalshi predictor: v1 (mean-reversion), v2 (continuation), or v3 (strike-relative)")
     args = parser.parse_args()
 
     dry_run = not args.live
