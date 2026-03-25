@@ -970,25 +970,26 @@ def main():
                 break
 
             # Tick runners — max MAX_CONCURRENT_POSITIONS can have capital deployed.
-            # Count runners with capital at risk (pending bid or inventory).
+            # "Active" = has inventory, has pending bid, OR is in a quoting/discovering
+            # state (about to deploy capital). Only truly idle/dark runners are "free".
             from kalshi_mm.mm_config import MAX_CONCURRENT_POSITIONS
-            active_count = sum(
-                1 for r in runners
-                if r.inv.has_inventory() or r.inv.pending_bid_id is not None
-            )
+
+            def _is_active(r):
+                """Runner has capital deployed or is about to."""
+                return (r.inv.has_inventory()
+                        or r.inv.pending_bid_id is not None
+                        or r.inv.state in (DISCOVERING, QUOTING_BID, QUOTING_ASK))
+
+            active_count = sum(1 for r in runners if _is_active(r))
 
             for runner in runners:
-                has_capital = runner.inv.has_inventory() or runner.inv.pending_bid_id is not None
-                if has_capital:
-                    runner.tick()  # always tick runners with capital at risk
+                if _is_active(runner):
+                    runner.tick()  # always tick active runners
                 elif active_count < MAX_CONCURRENT_POSITIONS:
-                    runner.tick()  # room for more — let it discover/quote
-                    # Check if this runner just deployed capital
-                    if runner.inv.has_inventory() or runner.inv.pending_bid_id is not None:
+                    runner.tick()  # room for one more — let it advance from IDLE
+                    if _is_active(runner):
                         active_count += 1
-                elif runner.inv.state == EXITING:
-                    runner.tick()  # always unwind
-                # else: skip — at capacity
+                # else: at capacity, skip this idle/dark runner
 
             # Get balance for dashboard
             balance_cents = 10000 if dry_run else _fetch_balance(client)
