@@ -115,12 +115,15 @@ class TestQuotingBidToAskOnFill:
         runner.inv.pending_bid_id = "dry-bid-123"
         runner.inv.bid_price_cents = 49
 
-        # Orderbook with YES ask <= bid price (fill condition)
-        # YES ask = 100 - best_no_bid = 100 - 52 = 48, which is <= 49
+        # Volume-based fill: our bid is YES@49, so we need NO volume consumed
+        # at (100-49)=51 or above. Set prev snapshot with volume at 51,
+        # then current snapshot with less volume → consumed.
+        runner._prev_no_bids = {51: 50, 52: 30}  # previous: 50 contracts at 51c NO
+
         fill_ob = {
             "orderbook_fp": {
                 "yes_dollars": [["0.4800", "20"]],
-                "no_dollars": [["0.5200", "10"]],
+                "no_dollars": [["0.5100", "20"], ["0.5200", "10"]],  # 51→20 (was 50, consumed 30), 52→10 (was 30, consumed 20)
             }
         }
         runner.client.get_orderbook.return_value = fill_ob

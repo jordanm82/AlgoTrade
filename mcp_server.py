@@ -59,6 +59,12 @@ async def list_tools():
                         "description": "Run only Kalshi 15m predictions, skip Coinbase spot trading.",
                         "default": False,
                     },
+                    "predictor": {
+                        "type": "string",
+                        "enum": ["v1", "v2", "v3"],
+                        "description": "Kalshi predictor: v1 (mean-reversion), v2 (continuation), or v3 (strike-relative).",
+                        "default": "v1",
+                    },
                 },
             },
         ),
@@ -422,13 +428,16 @@ def handle_status() -> dict:
     return {"dashboard_log": content, "daemon_running": running, "pid": pid}
 
 
-def handle_start(mode: str = "dry-run", cycles: int = 50, kalshi_only: bool = False) -> dict:
+def handle_start(mode: str = "dry-run", cycles: int = 50, kalshi_only: bool = False, predictor: str = "v1") -> dict:
     """Start the dashboard as a background subprocess."""
     global _daemon_process
     flag = "--live" if mode == "live" else "--dry-run"
     cmd = [sys.executable, "dashboard.py", flag, "--cycles", str(cycles)]
     if kalshi_only:
         cmd.append("--kalshi-only")
+    if predictor == "v2":
+        cmd.append("--predictor")
+        cmd.append("v2")
     _daemon_process = subprocess.Popen(
         cmd,
         stdout=open("/tmp/dashboard_stdout.log", "w"),
@@ -436,7 +445,7 @@ def handle_start(mode: str = "dry-run", cycles: int = 50, kalshi_only: bool = Fa
         cwd=os.path.dirname(os.path.abspath(__file__)),
     )
     Path("/tmp/dashboard_pid.txt").write_text(str(_daemon_process.pid))
-    return {"pid": _daemon_process.pid, "mode": mode, "cycles": cycles, "kalshi_only": kalshi_only}
+    return {"pid": _daemon_process.pid, "mode": mode, "cycles": cycles, "kalshi_only": kalshi_only, "predictor": predictor}
 
 
 def handle_stop() -> dict:
@@ -1380,6 +1389,7 @@ async def call_tool(name: str, arguments: dict):
                 mode=arguments.get("mode", "dry-run"),
                 cycles=arguments.get("cycles", 50),
                 kalshi_only=arguments.get("kalshi_only", False),
+                predictor=arguments.get("predictor", "v1"),
             )
         elif name == "algotrade_stop":
             result = handle_stop()

@@ -106,6 +106,30 @@ Buys when price < BB lower AND RSI < threshold. Exits when price > BB middle. Ea
 
 ### Strategy 3: Kalshi 15-Minute Predictions
 
+Three predictor versions available via `--predictor v1|v2|v3`:
+
+**V3 (recommended) — Strike-Relative Probability Model:**
+Answers the actual Kalshi question: "will price close above or below THIS strike?" Uses a pre-computed probability lookup table (distance from strike in ATR units × time remaining) calibrated from historical 1m data, adjusted by real-time technical signals. **68.8% WR on 90-day validation.**
+
+- Queries Kalshi API for the active contract's `floor_strike` and `close_time`
+- Computes distance from strike in ATR units + minutes remaining
+- Looks up base probability from `data/store/kalshi_prob_table.json`
+- Applies technical adjustments: OB confirms/opposes (±5%), trade flow (±5%), 1h trend (±5%), MACD momentum (+3%), RSI extreme (-8%), RSI divergence (-8%)
+- **Bets BOTH sides:** YES when probability > 55%, NO when probability < 45%
+- Edge margin: only bets when our probability gives ≥5c edge over contract price
+- NO bets have highest WR (74.4%) — strong at detecting when price won't cross back
+
+**Probability table rebuild:** `./venv/bin/python scripts/build_prob_table.py --days 90` (refresh weekly/monthly)
+
+| Asset | V3 WR (90d) | Bets |
+|-------|-------------|------|
+| ETH | 70.2% | 8589 |
+| BTC | 69.5% | 8588 |
+| SOL | 68.7% | 8589 |
+| XRP | 68.5% | 8589 |
+| BNB | 67.2% | 8589 |
+
+**V1 — Mean-Reversion (legacy, 63% WR):**
 Multi-signal confidence scorer (0-100) combining lagging + leading + multi-timeframe indicators. Places bets on BTC, ETH, SOL, XRP, BNB 15-minute up/down contracts.
 
 **Series tickers:** `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`, `KXBNB15M`

@@ -55,7 +55,8 @@ class TestKillSwitch:
     def test_toxic_vpin(self):
         from kalshi_mm.mm_vpin import KillSwitch
         ks = KillSwitch()
-        assert ks.should_go_dark(0.6) is True
+        # VPIN_CAUTION=0.8
+        assert ks.should_go_dark(0.85) is True
 
     def test_volatility_spike(self):
         from kalshi_mm.mm_vpin import KillSwitch
@@ -95,9 +96,10 @@ class TestKillSwitch:
     def test_spread_state_caution(self):
         from kalshi_mm.mm_vpin import KillSwitch
         ks = KillSwitch()
-        assert ks.get_spread_state(0.35) == "CAUTION"
+        # VPIN_SAFE=0.6, VPIN_CAUTION=0.8
+        assert ks.get_spread_state(0.7) == "CAUTION"
 
     def test_spread_state_toxic(self):
         from kalshi_mm.mm_vpin import KillSwitch
         ks = KillSwitch()
-        assert ks.get_spread_state(0.6) == "TOXIC"
+        assert ks.get_spread_state(0.9) == "TOXIC"

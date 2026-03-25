@@ -417,6 +417,138 @@ def main():
             bets = best['per_asset_bets'].get(a, 0)
             print(f"    {a}: {wr}% WR ({bets} bets)")
 
+    # ── V2 Continuation Predictor comparison ──
+    print("\n" + "=" * 60)
+    print("V2 CONTINUATION PREDICTOR (vs V1 baseline)")
+    print("=" * 60)
+
+    from strategy.strategies.kalshi_predictor_v2 import KalshiPredictorV2
+    predictor_v2 = KalshiPredictorV2()
+
+    # Run V2 on same data
+    results_v2 = []
+    for asset_name, df_15m in data_15m.items():
+        df_1h = data_1h.get(asset_name)
+        r = run_predictor_on_candles(asset_name, df_15m, df_1h, predictor_v2,
+                                     use_filters=True, use_mtf=True)
+        results_v2.extend(r)
+
+    # Per-asset breakdown with V1 thresholds
+    PER_ASSET_THRESH_V2 = {"BTC": 30, "ETH": 35, "SOL": 35, "XRP": 30, "BNB": 35}
+    print("\n  Per-asset (using V1 thresholds as starting point):")
+    for asset_name in ASSETS:
+        r_asset = [r for r in results_v2 if r["asset"] == asset_name]
+        thresh = PER_ASSET_THRESH_V2.get(asset_name, 30)
+        filtered = [r for r in r_asset if r["confidence"] >= thresh]
+        if filtered:
+            wins = sum(1 for r in filtered if r["correct"])
+            wr = wins / len(filtered) * 100
+            print(f"    {asset_name}: {wr:.1f}% WR ({len(filtered)} bets) @ threshold {thresh}")
+
+    # V2 threshold sweep
+    print(f"\n  V2 THRESHOLD SWEEP:")
+    print(f"  {'Thresh':>7} {'Bets':>6} {'Wins':>6} {'WR%':>7} {'PF':>6}")
+    print(f"  {'─' * 35}")
+    for t in [20, 25, 30, 35, 40, 45, 50, 55]:
+        m = simulate_pnl(results_v2, t)
+        if m['total_bets'] > 0:
+            print(f"  {t:>7} {m['total_bets']:>6} {m['wins']:>6} {m['win_rate']:>6.1f}% {m['profit_factor']:>5.2f}")
+
+    # V2 overall at threshold 30
+    m_v2 = simulate_pnl(results_v2, 30)
+    print_metrics("V2 Continuation @ threshold=30", m_v2)
+
+    # ── V3 Strike-Relative Predictor ──
+    print("\n" + "=" * 60)
+    print("V3 STRIKE-RELATIVE PREDICTOR")
+    print("=" * 60)
+
+    from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3
+
+    # Check if probability table exists
+    prob_table_path = "data/store/kalshi_prob_table.json"
+    if not Path(prob_table_path).exists():
+        print("  Probability table not found. Run: ./venv/bin/python scripts/build_prob_table.py")
+    else:
+        predictor_v3 = KalshiPredictorV3(prob_table_path=prob_table_path)
+
+        v3_results = []
+        for asset_name, df_15m in data_15m.items():
+            df_ind = add_indicators(df_15m.copy())
+            df_1h = data_1h.get(asset_name)
+            df_1h_ind = add_indicators(df_1h.copy()) if df_1h is not None else None
+
+            for i in range(50, len(df_ind) - 1):
+                # Simulate: strike = current candle open, settlement = next candle close
+                strike = float(df_ind.iloc[i]["open"])
+                next_close = float(df_ind.iloc[i + 1]["close"])
+                actual_above = next_close >= strike
+
+                # Find matching 1h window
+                mtf_1h = None
+                if df_1h_ind is not None and not df_1h_ind.empty:
+                    current_time = df_ind.index[i]
+                    mask = df_1h_ind.index <= current_time
+                    if mask.sum() >= 20:
+                        mtf_1h = df_1h_ind.loc[mask]
+
+                # Simulate minutes remaining (use 10 then 6 — first qualifying entry per window)
+                for mins_left in [10, 6]:
+                    signal = predictor_v3.predict(
+                        df_ind.iloc[:i + 1], strike_price=strike,
+                        minutes_remaining=mins_left,
+                        df_1h=mtf_1h,
+                    )
+                    if signal is None or signal.recommended_side == "SKIP":
+                        continue
+
+                    correct = (signal.recommended_side == "YES" and actual_above) or \
+                              (signal.recommended_side == "NO" and not actual_above)
+
+                    v3_results.append({
+                        "asset": asset_name,
+                        "side": signal.recommended_side,
+                        "probability": signal.probability,
+                        "distance_atr": signal.distance_atr,
+                        "correct": correct,
+                        "mins_left": mins_left,
+                    })
+                    break  # only first qualifying entry per window
+
+        if v3_results:
+            wins = sum(1 for r in v3_results if r["correct"])
+            total = len(v3_results)
+            wr = wins / total * 100
+            yes_results = [r for r in v3_results if r["side"] == "YES"]
+            no_results = [r for r in v3_results if r["side"] == "NO"]
+            yes_wr = sum(1 for r in yes_results if r["correct"]) / len(yes_results) * 100 if yes_results else 0
+            no_wr = sum(1 for r in no_results if r["correct"]) / len(no_results) * 100 if no_results else 0
+
+            print(f"\n  Overall: {wr:.1f}% WR ({total} bets)")
+            print(f"  YES bets: {yes_wr:.1f}% WR ({len(yes_results)} bets)")
+            print(f"  NO bets:  {no_wr:.1f}% WR ({len(no_results)} bets)")
+
+            # Calibration check
+            print(f"\n  Calibration (predicted prob vs actual win rate):")
+            for prob_min in [0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
+                prob_max = prob_min + 0.05
+                bucket = [r for r in v3_results if prob_min <= r["probability"] < prob_max]
+                bucket_no = [r for r in v3_results if prob_min <= (1 - r["probability"]) < prob_max and r["side"] == "NO"]
+                both = bucket + bucket_no
+                if both:
+                    actual_wr = sum(1 for r in both if r["correct"]) / len(both) * 100
+                    print(f"    Predicted {prob_min:.0%}-{prob_max:.0%}: actual {actual_wr:.1f}% ({len(both)} bets)")
+
+            # Per-asset breakdown
+            print(f"\n  Per-asset:")
+            for asset in ASSETS:
+                a_results = [r for r in v3_results if r["asset"] == asset]
+                if a_results:
+                    a_wr = sum(1 for r in a_results if r["correct"]) / len(a_results) * 100
+                    print(f"    {asset}: {a_wr:.1f}% WR ({len(a_results)} bets)")
+        else:
+            print("  No V3 bets generated.")
+
     print("\n" + "=" * 60)
     print("Backtest complete.")
 
