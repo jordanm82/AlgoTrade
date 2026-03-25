@@ -255,10 +255,11 @@ class Dashboard:
             lines.append(f"  PRICES: live | INDICATORS: pending first cycle")
         lines.append("")
 
-        # Pairs table with LIVE prices
-        lines.append(f"  {'PAIR':<12} {'PRICE':>10} {'RSI':>6} {'BB_LOW':>10} {'BB_MID':>10} {'BB_UP':>10} {'REGIME':<13} {'SIGNAL':<16}")
-        lines.append(f"  {'-'*91}")
-        for sym in ALL_PAIRS:
+        # Pairs table with LIVE prices (skip in kalshi-only mode)
+        if not self.daemon.kalshi_only:
+            lines.append(f"  {'PAIR':<12} {'PRICE':>10} {'RSI':>6} {'BB_LOW':>10} {'BB_MID':>10} {'BB_UP':>10} {'REGIME':<13} {'SIGNAL':<16}")
+            lines.append(f"  {'-'*91}")
+        for sym in (ALL_PAIRS if not self.daemon.kalshi_only else []):
             df = self.daemon._dataframes.get(sym)
             if df is None or len(df) == 0:
                 lines.append(f"  {sym:<12} {'--':>10}")
@@ -454,6 +455,12 @@ class Dashboard:
         # Fetch initial live prices
         self._fetch_live_prices()
 
+        import signal
+        def _handle_sigint(*_):
+            print("\n\n  [SHUTDOWN] Ctrl+C received — stopping...")
+            self.daemon._running = False
+        signal.signal(signal.SIGINT, _handle_sigint)
+
         while self.daemon._running and self._cycle_count < self.max_cycles:
             # Signal cycle (fetches fresh 15m candles + indicators)
             self._cycle_count += 1
@@ -476,7 +483,11 @@ class Dashboard:
             for tick in range(15):
                 if not self.daemon._running:
                     break
-                time.sleep(60)
+                # Sleep in 1-second chunks so Ctrl+C is responsive
+                for _ in range(60):
+                    if not self.daemon._running:
+                        break
+                    time.sleep(1)
                 self._tick_count += 1
                 # Fetch fresh prices from exchange
                 self._fetch_live_prices()
