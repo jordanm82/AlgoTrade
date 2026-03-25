@@ -1,0 +1,4 @@
+#!/bin/bash
+# K15 — Launch the Kalshi 15-minute prediction dashboard
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/venv/bin/python" -u "$DIR/k15.py" "$@"
