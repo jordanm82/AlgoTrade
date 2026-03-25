@@ -600,17 +600,24 @@ class LiveDaemon:
                 predictions.append(pred)
                 continue
 
-            # Determine bet side and approximate price
+            # Determine bet side
+            # We hold to settlement — entry price IS our risk per contract
+            # Payout: $1 if right, $0 if wrong
+            # Goal: buy below 50c for positive expected value
+            # MAX_ENTRY: never pay more than this (caps risk/reward)
+            MAX_ENTRY_CENTS = 50  # above 50c the R:R is against us
+            # RISK_PER_BET: max dollars to risk on a single bet
+            RISK_PER_BET_PCT = 0.05  # 5% of Kalshi balance
+
             side = "yes" if signal.direction == "UP" else "no"
-            approx_cents = max(5, min(95, int(50 + (signal.confidence - 50) * 0.5)))
-            pred["reason"] = f"would bet {side.upper()} @ ~{approx_cents}c"
+            pred["reason"] = f"would bet {side.upper()} (conf={signal.confidence})"
 
             if self.dry_run:
                 print(colored(
                     f"  [KALSHI DRY] {pred['asset']} {signal.direction} "
                     f"conf={signal.confidence} | "
                     f"OB={ob_imb:+.2f} flow={net_flow:+.2f} | "
-                    f"bet {side.upper()} @ ~{approx_cents}c",
+                    f"bet {side.upper()} (hold to settlement)",
                     "magenta",
                 ))
             else:
@@ -621,11 +628,10 @@ class LiveDaemon:
                     predictions.append(pred)
                     continue
                 try:
-                    # Get balance and compute bet size (5% of balance, min $5)
+                    # Kalshi is source of truth for balance
                     balance_resp = self.kalshi_client.get_balance()
                     balance_cents = balance_resp.get("balance", 0)
-                    bet_cents = max(500, int(balance_cents * 0.05))
-                    count = max(1, bet_cents // approx_cents)
+                    risk_budget_cents = max(500, int(balance_cents * RISK_PER_BET_PCT))
 
                     # Find the next 15-min market for this series
                     events = self.kalshi_client._get("/trade-api/v2/events", {
@@ -696,16 +702,35 @@ class LiveDaemon:
                         fill_price = best_ask
 
                     fill_price = max(1, min(99, int(fill_price)))
-                    # Verify Kalshi balance before placing (Kalshi is source of truth)
-                    bal_resp = self.kalshi_client.get_balance()
-                    avail_cents = bal_resp.get("balance", 0)
+
+                    # NEVER pay above 50c — above that the R:R is against us
+                    if fill_price > MAX_ENTRY_CENTS:
+                        pred["reason"] = f"price {fill_price}c > max {MAX_ENTRY_CENTS}c — R:R unfavorable"
+                        print(colored(
+                            f"  [KALSHI SKIP] {pred['asset']} {side.upper()} @ {fill_price}c "
+                            f"— above {MAX_ENTRY_CENTS}c cap (R:R < 1:1)",
+                            "yellow"))
+                        predictions.append(pred)
+                        continue
+
+                    # Position size from risk budget: count = max_loss / entry_price
+                    # entry_price IS the max loss per contract (we hold to settlement)
+                    count = max(1, risk_budget_cents // fill_price)
+                    potential_profit = count * (100 - fill_price)
+                    potential_loss = count * fill_price
+                    rr_ratio = potential_profit / potential_loss if potential_loss > 0 else 0
+
+                    # Verify against actual Kalshi balance (exchange is source of truth)
                     cost_cents = count * fill_price
-                    if cost_cents > avail_cents:
-                        count = max(1, avail_cents // fill_price)
+                    if cost_cents > balance_cents:
+                        count = max(1, balance_cents // fill_price)
                         if count < 1:
-                            pred["reason"] = f"insufficient Kalshi balance (${avail_cents/100:.2f})"
+                            pred["reason"] = f"insufficient Kalshi balance (${balance_cents/100:.2f})"
                             predictions.append(pred)
                             continue
+                        cost_cents = count * fill_price
+                        potential_profit = count * (100 - fill_price)
+                        rr_ratio = potential_profit / cost_cents if cost_cents > 0 else 0
 
                     result = self.kalshi_client.place_order(
                         ticker=ticker,
@@ -733,11 +758,16 @@ class LiveDaemon:
                         except Exception:
                             pass
 
-                    pred["reason"] = f"placed {side.upper()} x{count} filled={fill_count} status={order_status} @ {fill_price}c (#{order_id})"
+                    pred["reason"] = (
+                        f"placed {side.upper()} x{count} @ {fill_price}c "
+                        f"risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
+                        f"filled={fill_count} status={order_status} (#{order_id})"
+                    )
                     print(colored(
                         f"  [KALSHI BET] {pred['asset']} {signal.direction} "
                         f"conf={signal.confidence} | {side.upper()} x{count} @ {fill_price}c "
-                        f"filled={fill_count} status={order_status}",
+                        f"| risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
+                        f"| filled={fill_count} status={order_status}",
                         "magenta",
                     ))
                 except Exception as e:
