@@ -11,9 +11,9 @@ SPREAD_MIN_CENTS = 2
 SPREAD_DEFAULT_CENTS = 3
 SPREAD_MAX_CENTS = 4
 
-# VPIN thresholds
-VPIN_SAFE = 0.3
-VPIN_CAUTION = 0.5
+# VPIN thresholds (calibrated for crypto — spot flow is inherently directional)
+VPIN_SAFE = 0.6
+VPIN_CAUTION = 0.8
 VPIN_SPOT_WEIGHT = 0.7
 VPIN_KALSHI_WEIGHT = 0.3
 VPIN_WINDOW_SECONDS = 120

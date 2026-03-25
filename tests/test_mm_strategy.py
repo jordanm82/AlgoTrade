@@ -38,19 +38,23 @@ class TestComputeMidCents:
 class TestComputeSpreadCents:
     def test_safe_vpin(self):
         from kalshi_mm.mm_strategy import compute_spread_cents
-        assert compute_spread_cents(0.1) == 2
+        # VPIN_SAFE=0.6, below it -> 2c spread
+        assert compute_spread_cents(0.3) == 2
 
     def test_caution_low(self):
         from kalshi_mm.mm_strategy import compute_spread_cents
-        assert compute_spread_cents(0.3) == 3
+        # At VPIN_SAFE boundary -> 3c
+        assert compute_spread_cents(0.6) == 3
 
     def test_caution_high(self):
         from kalshi_mm.mm_strategy import compute_spread_cents
-        assert compute_spread_cents(0.49) == 4
+        # Near VPIN_CAUTION=0.8 -> 4c
+        assert compute_spread_cents(0.79) == 4
 
     def test_toxic_returns_none(self):
         from kalshi_mm.mm_strategy import compute_spread_cents
-        assert compute_spread_cents(0.6) is None
+        # At/above VPIN_CAUTION=0.8 -> go dark
+        assert compute_spread_cents(0.85) is None
 
 
 class TestComputeBidCents:

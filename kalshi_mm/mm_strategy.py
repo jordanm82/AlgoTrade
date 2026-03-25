@@ -1,6 +1,6 @@
 # kalshi_mm/mm_strategy.py
 """Market maker strategy: orderbook parsing, mid price, spread sizing, quote generation."""
-from kalshi_mm.mm_config import SPREAD_MIN_CENTS, SPREAD_MAX_CENTS
+from kalshi_mm.mm_config import SPREAD_MIN_CENTS, SPREAD_MAX_CENTS, VPIN_SAFE, VPIN_CAUTION
 
 
 def compute_mid_cents(orderbook: dict) -> int | None:
@@ -25,10 +25,12 @@ def compute_mid_cents(orderbook: dict) -> int | None:
 
 def compute_spread_cents(vpin: float) -> int | None:
     """Dynamic spread based on VPIN. Returns None if should go dark."""
-    if vpin < 0.3:
+    if vpin < VPIN_SAFE:
         return SPREAD_MIN_CENTS
-    elif vpin < 0.5:
-        return 3 + round((vpin - 0.3) / 0.2)
+    elif vpin < VPIN_CAUTION:
+        # Linear scale from 3c to 4c across the caution range
+        ratio = (vpin - VPIN_SAFE) / (VPIN_CAUTION - VPIN_SAFE)
+        return 3 + round(ratio)
     return None
 
 
