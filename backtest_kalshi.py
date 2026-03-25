@@ -149,11 +149,19 @@ def simulate_pnl(
     starting_balance: float = 100.0,
     risk_pct: float = 0.05,
     fixed_entry: int | None = None,
+    max_concurrent: int = 3,
 ) -> dict:
-    """Simulate realistic P&L with compounding.
+    """Simulate realistic P&L with compounding and concurrency limits.
+
+    Models real trading constraints:
+    - Max 3 concurrent Kalshi bets (each settles in 15 minutes)
+    - Only 1 bet per asset per 15m window (no duplicate bets)
+    - 5% of balance risked per bet
+    - Entry price capped at 50c
 
     Args:
         fixed_entry: If set, use this fixed entry price (cents) instead of confidence-based.
+        max_concurrent: Max concurrent active bets (default 3).
     """
     balance = starting_balance
     peak_balance = starting_balance
@@ -166,7 +174,37 @@ def simulate_pnl(
 
     filtered = [r for r in results if r["confidence"] >= threshold]
 
+    # Group signals by timestamp, rank by confidence within each group
+    from collections import defaultdict
+    by_time = defaultdict(list)
     for r in filtered:
+        by_time[r["timestamp"]].append(r)
+
+    # Sort timestamps, and within each timestamp sort by confidence descending
+    sorted_signals = []
+    for ts in sorted(by_time.keys()):
+        group = sorted(by_time[ts], key=lambda r: r["confidence"], reverse=True)
+        sorted_signals.extend(group)
+
+    # Track active bets: list of (settle_time, asset)
+    active_bets = []
+
+    for r in sorted_signals:
+        ts = r["timestamp"]
+
+        # Prune settled bets (15 min settlement)
+        active_bets = [(t, a) for t, a in active_bets
+                       if (ts - t).total_seconds() < 900]
+
+        # Skip if at max concurrent bets
+        if len(active_bets) >= max_concurrent:
+            continue
+
+        # Skip if already have an active bet on this asset
+        active_assets = {a for _, a in active_bets}
+        if r["asset"] in active_assets:
+            continue
+
         if fixed_entry is not None:
             entry_cents = fixed_entry
         else:
@@ -179,7 +217,7 @@ def simulate_pnl(
         if risk_budget_cents < entry_cents:
             continue
 
-        num_contracts = risk_budget_cents // entry_cents
+        num_contracts = min(risk_budget_cents // entry_cents, 20)  # cap at 20 contracts
         if num_contracts < 1:
             continue
 
@@ -188,6 +226,9 @@ def simulate_pnl(
         if asset not in per_asset:
             per_asset[asset] = {"bets": 0, "wins": 0}
         per_asset[asset]["bets"] += 1
+
+        # Track this bet as active
+        active_bets.append((ts, asset))
 
         if r["correct"]:
             profit_cents = num_contracts * (100 - entry_cents)
