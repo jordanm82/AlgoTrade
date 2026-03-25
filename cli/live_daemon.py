@@ -625,13 +625,27 @@ class LiveDaemon:
         }
 
         if minute_in_window >= KALSHI_CUTOFF_MINUTES:
-            # Too close to settlement — show EXPIRED state
-            self.kalshi_predictions = [{
-                "symbol": sym, "asset": sym.split("/")[0],
-                "direction": "--", "confidence": 0,
-                "reason": "expired — too close to settlement",
-                "ob": 0, "flow": 0, "state": "EXPIRED",
-            } for sym in self.KALSHI_PAIRS]
+            # Too close to settlement — show EXPIRED, but preserve BET_PLACED for bets taken this window
+            expired_preds = []
+            for sym in self.KALSHI_PAIRS:
+                asset = sym.split("/")[0]
+                pending = self._kalshi_pending_signals.get(asset, {})
+                if pending.get("bet_placed") and pending.get("window_start") == current_window_start:
+                    expired_preds.append({
+                        "symbol": sym, "asset": asset,
+                        "direction": pending.get("direction", "--"),
+                        "confidence": pending.get("last_5m_conf", 0),
+                        "reason": "bet placed — awaiting settlement",
+                        "ob": 0, "flow": 0, "state": "SETTLING",
+                    })
+                else:
+                    expired_preds.append({
+                        "symbol": sym, "asset": asset,
+                        "direction": "--", "confidence": 0,
+                        "reason": "expired — too close to settlement",
+                        "ob": 0, "flow": 0, "state": "EXPIRED",
+                    })
+            self.kalshi_predictions = expired_preds
             return
 
         predictions = []
