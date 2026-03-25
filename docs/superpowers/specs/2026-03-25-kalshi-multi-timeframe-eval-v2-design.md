@@ -69,9 +69,7 @@ The lifecycle from v1 stays, but the scoring model changes:
 | **LAST_LOOK** | 12 | 1m momentum check (existing `check_1m_momentum()`). Elevated threshold (per-asset + 10). Uses last computed boosted confidence. |
 | **EXPIRED** | 13+ | No new bets. |
 
-**Key change from v1:** SETUP runs the full 15m predictor (not the 5m predictor). CONFIRMED/DOUBLE_CONFIRMED compute the 5m booster (not a full re-score). The booster is lightweight — it reads the cached 5m candle data and computes 4 boost checks + 2 penalty checks. No `add_indicators()` call needed on 5m data, just raw OHLCV + simple computations.
-
-**Exception:** The booster DOES need 5m MACD histogram and 5m RSI for the crossover/divergence checks. These require `add_indicators()` on 5m data. However, this is computed once per 5m eval (not per-candle like v1 attempted) and is only used for the booster, not for full scoring.
+**Key change from v1:** SETUP runs the full 15m predictor (not the 5m predictor). CONFIRMED/DOUBLE_CONFIRMED compute the 5m booster (not a full re-score). The booster requires `add_indicators()` on 5m data for the MACD histogram and RSI checks, but this is computed once per 5m eval and is only used for the booster's 6 factor checks — not for full confidence scoring.
 
 ### 4. Booster Implementation
 
@@ -93,32 +91,43 @@ def compute_5m_booster(self, df_5m: pd.DataFrame, direction: str,
     """
 ```
 
-Booster logic:
-1. Get last closed 5m candle
-2. Check candle direction (+3 if aligned)
-3. Check volume vs SMA (+3 if > 1.5x)
-4. Check ATR distance from window open (+3 if > 0.5x ATR in predicted direction)
-5. Check MACD histogram crossover (+3 if aligned, -5 if against)
-6. Check RSI divergence (-5 if diverging against)
-7. Return sum (clamped to -10..+12)
+**Requires:** `df_5m` must have `add_indicators()` applied (needs `rsi`, `macd_hist`, `atr`, `vol_sma_20` columns).
+
+Booster logic (uses last 2 closed 5m candles):
+1. Get last 2 closed 5m candles (`last` = iloc[-1], `prev` = iloc[-2])
+2. **Candle direction** (+3): `last` candle close > open for UP, close < open for DOWN
+3. **Volume surge** (+3): `last` candle volume > 1.5x `vol_sma_20`
+4. **ATR distance** (+3): `abs(last.close - window_open_price) > 0.5 * last.atr` AND movement is in predicted direction
+5. **MACD crossover aligned** (+3): `prev.macd_hist` and `last.macd_hist` have different signs, AND `last.macd_hist` is in predicted direction (positive for UP, negative for DOWN)
+6. **MACD crossover against** (-5): same crossover detection but `last.macd_hist` is AGAINST predicted direction
+7. **RSI divergence against** (-5): for UP prediction: `last.close > prev.close` BUT `last.rsi < prev.rsi` (price up, momentum fading). For DOWN prediction: `last.close < prev.close` BUT `last.rsi > prev.rsi` (price down, momentum fading). Simple 2-candle divergence — no swing point detection needed.
+8. Return sum, clamped to range [-10, +12]
+
+Note: MACD checks 5 and 6 are mutually exclusive (a crossover is either aligned or against, not both).
 
 ### 5. Daemon Changes
 
 **`_kalshi_eval()` changes:**
 
-- **SETUP:** Instead of scoring on 5m data, run the full 15m predictor on 15m candles (same as old `_kalshi_cycle()` did). Store base confidence + direction. Also fetch and cache 5m candles with indicators for the booster.
-- **CONFIRMED/DOUBLE_CONFIRMED:** Don't re-score. Fetch latest 5m candles, run `compute_5m_booster()`, add to base confidence. If `base + booster >= threshold` → actionable.
-- **LAST_LOOK:** Unchanged from v1 — 1m momentum check with elevated threshold.
+- **SETUP:** Fetch 15m candles (limit=200) + `add_indicators()`. Run the full 15m predictor with `score(df_15m, market_data, df_1h)`. Store base confidence + direction. Also fetch 5m candles (limit=200) + `add_indicators()` and cache in `_kalshi_5m_dataframes` for the booster. Capture `window_open_price` from the 15m scoring candle's close price (last 15m candle close = this window's open). Re-fetch leading indicators (order book + trade flow) for the 15m scorer.
+- **CONFIRMED/DOUBLE_CONFIRMED:** Don't re-score on 15m. Fetch latest 5m candles + `add_indicators()`, update cache. Run `compute_5m_booster(df_5m, direction, window_open_price)`. Compute `boosted_conf = base_conf + booster`. If boosted >= threshold → actionable. No need to re-fetch leading indicators (the booster uses only 5m OHLCV + indicators).
+- **LAST_LOOK:** Unchanged from v1 — 1m momentum check with elevated threshold. Uses last `boosted_conf`.
 
-**New state field:**
+**15m data caching:** 15m candles are only fetched at SETUP (once per 15m window). The result is used for `score()` and then the base confidence is cached in the pending signal state. No 15m DataFrame cache needed — just the score.
+
+**New state fields:**
 ```python
 {
     "direction": "UP",
-    "base_conf": 26,           # from 15m predictor
-    "boosted_conf": 35,        # base + latest booster
-    "last_booster": 9,         # last computed booster value
-    "window_open_price": 71000, # price at window start for ATR distance
-    ...existing fields...
+    "base_conf": 26,            # from 15m predictor at SETUP
+    "boosted_conf": 35,         # base + latest booster
+    "last_booster": 9,          # last computed booster value
+    "last_5m_conf": 35,         # alias for boosted_conf (used by LAST_LOOK)
+    "window_open_price": 71000, # 15m candle close price = window open price
+    "setup_time": timestamp,
+    "confirmed": False,
+    "bet_placed": False,
+    "window_start": timestamp,
 }
 ```
 
@@ -126,13 +135,22 @@ Booster logic:
 
 The backtest needs to simulate the booster, not full 5m re-scoring.
 
-For each 15-minute window:
-1. Score at window boundary using 15m data up to that point (the old way — this works at 62.8% WR)
-2. At minute 5: compute 5m booster from first 5m candle. If `base + booster >= threshold` → bet at minute 5.
-3. At minute 10: compute 5m booster from second 5m candle. If `base + booster >= threshold` → bet at minute 10.
-4. Compare to 15m baseline (single-shot scoring).
+**Function signature change:** `simulate_lifecycle(asset, df_15m, df_5m, df_1h, predictor, threshold)` — takes BOTH 15m and 5m DataFrames.
 
-The backtest for the booster is straightforward because we have both 15m and 5m historical data. No order book simulation needed.
+**For each 15-minute window:**
+1. **SETUP:** Score on 15m data using `predictor.score(df_15m[:boundary], df_1h=...)`. Record base confidence + direction. Capture `window_open_price` from 15m candle close.
+2. **At minute 5:** Find the first 5m candle that closed within this window. Run `predictor.compute_5m_booster(df_5m[:candle], direction, window_open_price)`. If `base + booster >= threshold` → record bet at minute 5.
+3. **At minute 10:** If no bet yet, find the second 5m candle. Compute booster again. If `base + booster >= threshold` → record bet at minute 10.
+4. **Actual direction:** Compare 15m window open price to close price.
+5. Compare total results to 15m baseline (single-shot scoring at candle close).
+
+The backtest should report:
+- How many signals were promoted (started below threshold, booster pushed above)
+- How many signals were demoted (started above threshold, penalty pushed below)
+- Entry minute distribution (min 5 vs min 10)
+- Side-by-side WR: 15m baseline vs 15m+booster
+
+**Note:** The number of base signals (SETUP) will match the 15m baseline exactly, since both use the same 15m predictor. The difference is that the booster allows near-threshold signals to enter and can also prevent some above-threshold signals from entering (if penalties fire).
 
 ## Files to Modify
 
