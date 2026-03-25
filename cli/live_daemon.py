@@ -63,9 +63,10 @@ KALSHI_THRESHOLD_BOOST = 10    # added to per-asset threshold for last-look
 class LiveDaemon:
     """Production daemon that runs BB Grid + RSI MR on validated pairs."""
 
-    def __init__(self, dry_run: bool = False, kalshi_only: bool = False):
+    def __init__(self, dry_run: bool = False, kalshi_only: bool = False, predictor_version: str = "v1"):
         self.dry_run = dry_run
         self.kalshi_only = kalshi_only
+        self.kalshi_predictor_version = predictor_version
         self.fetcher = DataFetcher()
         self.store = DataStore(DATA_DIR)
         self.tracker = PositionTracker(max_concurrent=MAX_CONCURRENT_POSITIONS)
@@ -96,8 +97,12 @@ class LiveDaemon:
         self._pnl_today = 0.0
 
         # Kalshi predictor + client
-        from strategy.strategies.kalshi_predictor import KalshiPredictor
-        self.kalshi_predictor = KalshiPredictor()
+        if predictor_version == "v2":
+            from strategy.strategies.kalshi_predictor_v2 import KalshiPredictorV2
+            self.kalshi_predictor = KalshiPredictorV2()
+        else:
+            from strategy.strategies.kalshi_predictor import KalshiPredictor
+            self.kalshi_predictor = KalshiPredictor()
         self.kalshi_client = None  # lazy init
         self.kalshi_threshold = 30  # minimum confidence to bet (lowered from 40 — conf 25-35 with flow confirmation is the sweet spot)
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
@@ -1626,6 +1631,7 @@ class LiveDaemon:
         print(colored(f"  Pairs: {', '.join(ALL_PAIRS)}", "cyan"))
         print(colored(f"  Timeframe: 15m | Equity: ${self._equity:,.2f}", "cyan"))
         print(colored(f"  Stop-loss: {STOP_LOSS_PCT:.0%} | Position size: {POSITION_SIZE_PCT:.0%}", "cyan"))
+        print(colored(f"  Predictor: {'V2 Continuation' if self.kalshi_predictor_version == 'v2' else 'V1 Mean-Reversion'}", "cyan"))
         print(colored(f"{'='*70}", "cyan"))
 
         print("\n[STARTUP] Fetching initial 15m data for all pairs...")
@@ -1760,9 +1766,11 @@ def main():
         "--kalshi-only", action="store_true",
         help="Run only Kalshi 15m predictions, skip Coinbase spot trading",
     )
+    parser.add_argument("--predictor", choices=["v1", "v2"], default="v1",
+                        help="Kalshi predictor: v1 (mean-reversion) or v2 (continuation)")
     args = parser.parse_args()
 
-    daemon = LiveDaemon(dry_run=args.dry_run, kalshi_only=args.kalshi_only)
+    daemon = LiveDaemon(dry_run=args.dry_run, kalshi_only=args.kalshi_only, predictor_version=args.predictor)
     daemon.run()
 
 
