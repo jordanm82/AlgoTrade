@@ -44,7 +44,8 @@ class K15State:
         self.session_wins = 0
         self.session_losses = 0
         self.session_pnl = 0.0
-        self.kalshi_balance = 0.0
+        self.kalshi_cash = 0.0        # available cash (cents → dollars)
+        self.kalshi_portfolio = 0.0   # capital in open positions
         self.last_balance_check = 0.0
 
     def log(self, message: str):
@@ -70,9 +71,9 @@ def build_layout(state: K15State, input_buffer: str = "") -> Layout:
     from rich.text import Text as RichText
     prompt = RichText()
     prompt.append("\n k15> ", style="bold cyan")
-    prompt.append(input_buffer)
-    prompt.append("█", style="bold cyan")  # cursor
-    layout["bottom"].update(Panel(prompt, box=box.SIMPLE, style="dim"))
+    prompt.append(input_buffer, style="bold white")
+    prompt.append("█", style="bold cyan blink")  # cursor
+    layout["bottom"].update(Panel(prompt, box=box.HEAVY, border_style="cyan"))
 
     # Top splits into left and right
     layout["top"].split_row(
@@ -111,10 +112,16 @@ def build_status_panel(state: K15State) -> Text:
     """Build the left panel content."""
     t = Text()
 
-    # Balance
-    bal = state.kalshi_balance
-    t.append(f"  KALSHI BALANCE: ", style="white")
-    t.append(f"${bal:.2f}\n", style="bold green" if bal > 0 else "bold red")
+    # Balance — cash + portfolio
+    cash = state.kalshi_cash
+    portfolio = state.kalshi_portfolio
+    total_val = cash + portfolio
+    t.append(f"  CASH: ", style="white")
+    t.append(f"${cash:.2f}", style="bold green" if cash > 0 else "bold red")
+    t.append(f"  |  PORTFOLIO: ", style="white")
+    t.append(f"${portfolio:.2f}", style="bold cyan" if portfolio > 0 else "dim")
+    t.append(f"  |  TOTAL: ", style="white")
+    t.append(f"${total_val:.2f}\n", style="bold green" if total_val > 0 else "bold red")
 
     # Session stats
     total = state.session_wins + state.session_losses
@@ -279,7 +286,8 @@ def daemon_worker(state: K15State):
                     daemon._init_kalshi_client()
                     if daemon.kalshi_client:
                         bal = daemon.kalshi_client.get_balance()
-                        state.kalshi_balance = bal.get("balance", 0) / 100  # cents to dollars
+                        state.kalshi_cash = bal.get("balance", 0) / 100
+                        state.kalshi_portfolio = bal.get("portfolio_value", 0) / 100
                 except Exception:
                     pass
                 state.last_balance_check = now_ts
@@ -364,7 +372,7 @@ def handle_command(cmd: str, state: K15State, console: Console) -> bool:
         console.print(f"\n[cyan]Mode:[/cyan] {state.mode}")
         console.print(f"[cyan]Predictor:[/cyan] {state.predictor_version}")
         console.print(f"[cyan]Running:[/cyan] {state.running}")
-        console.print(f"[cyan]Balance:[/cyan] ${state.kalshi_balance:.2f}")
+        console.print(f"[cyan]Cash:[/cyan] ${state.kalshi_cash:.2f}  [cyan]Portfolio:[/cyan] ${state.kalshi_portfolio:.2f}")
         console.print(f"[cyan]W/L/WR:[/cyan] {state.session_wins}/{state.session_losses}/{state.session_wins / max(1, state.session_wins + state.session_losses) * 100:.0f}%")
         console.print()
         return False
@@ -374,14 +382,16 @@ def handle_command(cmd: str, state: K15State, console: Console) -> bool:
         try:
             if state.daemon and state.daemon.kalshi_client:
                 bal = state.daemon.kalshi_client.get_balance()
-                state.kalshi_balance = bal.get("balance", 0) / 100
+                state.kalshi_cash = bal.get("balance", 0) / 100
+                state.kalshi_portfolio = bal.get("portfolio_value", 0) / 100
             else:
                 from exchange.kalshi import KalshiClient
                 from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
                 client = KalshiClient(api_key_id=KALSHI_API_KEY_ID, private_key_path=str(KALSHI_KEY_FILE), demo=False)
                 bal = client.get_balance()
-                state.kalshi_balance = bal.get("balance", 0) / 100
-            console.print(f"[bold green]Kalshi Balance: ${state.kalshi_balance:.2f}[/bold green]")
+                state.kalshi_cash = bal.get("balance", 0) / 100
+                state.kalshi_portfolio = bal.get("portfolio_value", 0) / 100
+            console.print(f"[bold green]Cash: ${state.kalshi_cash:.2f}  Portfolio: ${state.kalshi_portfolio:.2f}[/bold green]")
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
         return False
@@ -444,8 +454,9 @@ def main():
         from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
         client = KalshiClient(api_key_id=KALSHI_API_KEY_ID, private_key_path=str(KALSHI_KEY_FILE), demo=False)
         bal = client.get_balance()
-        state.kalshi_balance = bal.get("balance", 0) / 100
-        console.print(f"[green]Kalshi Balance: ${state.kalshi_balance:.2f}[/green]")
+        state.kalshi_cash = bal.get("balance", 0) / 100
+        state.kalshi_portfolio = bal.get("portfolio_value", 0) / 100
+        console.print(f"[green]Cash: ${state.kalshi_cash:.2f}  Portfolio: ${state.kalshi_portfolio:.2f}[/green]")
     except Exception:
         console.print("[yellow]Could not connect to Kalshi[/yellow]")
 
