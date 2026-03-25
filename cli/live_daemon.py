@@ -644,24 +644,58 @@ class LiveDaemon:
                     # Pick the soonest-expiring open market
                     market = all_markets[0]
                     ticker = market.get("ticker", "")
-                    # Query the current ask and bid at that price for instant fill
-                    if side == "yes":
-                        fill_price = market.get("yes_ask") or 50
+
+                    # Optimal entry: query orderbook for bid-ask spread
+                    # Tight spread → bid at ask (instant fill)
+                    # Wide spread → bid at midpoint+1c (better price, likely fills)
+                    best_bid = None
+                    best_ask = None
+                    try:
+                        book = self.kalshi_client.get_orderbook(ticker)
+                        ob = book.get("orderbook", {})
+                        our_side = "yes" if side == "yes" else "no"
+                        asks = ob.get(our_side, [])
+                        # Orderbook format: [[price, qty], ...]
+                        # For YES side: asks are offers to sell YES contracts
+                        if asks and len(asks) > 0:
+                            best_ask = asks[0][0] if isinstance(asks[0], list) else asks[0]
+                        # Get the bid side too for spread calculation
+                        other_side = "no" if side == "yes" else "yes"
+                        bids = ob.get(other_side, [])
+                        if bids and len(bids) > 0:
+                            other_best = bids[0][0] if isinstance(bids[0], list) else bids[0]
+                            best_bid = 100 - other_best  # complement
+                    except Exception:
+                        pass
+
+                    # Fall back to market data if orderbook failed
+                    if best_ask is None:
+                        if side == "yes":
+                            best_ask = market.get("yes_ask") or 50
+                        else:
+                            best_ask = market.get("no_ask") or 50
+
+                    best_ask = int(best_ask) if best_ask else 50
+
+                    # Calculate optimal bid
+                    if best_bid is not None:
+                        best_bid = int(best_bid)
+                        spread = best_ask - best_bid
+                        if spread <= 3:
+                            # Tight spread — bid at ask for instant fill
+                            fill_price = best_ask
+                        elif spread <= 10:
+                            # Moderate spread — bid at midpoint + 1c
+                            fill_price = (best_bid + best_ask) // 2 + 1
+                        else:
+                            # Wide spread — bid 30% above mid (aggressive but not at ask)
+                            mid = (best_bid + best_ask) // 2
+                            fill_price = mid + max(1, spread // 3)
                     else:
-                        fill_price = market.get("no_ask") or 50
-                    # If market data is stale, fetch orderbook
-                    if fill_price is None or fill_price == 0:
-                        try:
-                            book = self.kalshi_client.get_orderbook(ticker)
-                            ob = book.get("orderbook", {})
-                            asks = ob.get("yes" if side == "yes" else "no", [])
-                            if asks:
-                                fill_price = asks[0][0]  # best ask price
-                        except Exception:
-                            fill_price = 50
-                    fill_price = int(fill_price)
-                    if fill_price < 1 or fill_price > 99:
-                        fill_price = 50
+                        # No bid info — bid at ask
+                        fill_price = best_ask
+
+                    fill_price = max(1, min(99, int(fill_price)))
                     # Verify Kalshi balance before placing (Kalshi is source of truth)
                     bal_resp = self.kalshi_client.get_balance()
                     avail_cents = bal_resp.get("balance", 0)
