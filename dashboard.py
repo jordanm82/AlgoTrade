@@ -37,8 +37,8 @@ LOG_FILE = Path("data/store/dashboard.log")
 
 
 class Dashboard:
-    def __init__(self, dry_run: bool = True, max_cycles: int = 15):
-        self.daemon = LiveDaemon(dry_run=dry_run)
+    def __init__(self, dry_run: bool = True, max_cycles: int = 15, kalshi_only: bool = False):
+        self.daemon = LiveDaemon(dry_run=dry_run, kalshi_only=kalshi_only)
         self.dry_run = dry_run
         self.max_cycles = max_cycles
         self._cycle_count = 0
@@ -499,10 +499,11 @@ def main():
     parser.add_argument("--dry-run", action="store_true", default=True, help="Paper trading (default)")
     parser.add_argument("--live", action="store_true", help="Live trading")
     parser.add_argument("--cycles", type=int, default=15, help="Signal cycles to run")
+    parser.add_argument("--kalshi-only", action="store_true", help="Run only Kalshi 15m predictions, skip Coinbase spot trading")
     args = parser.parse_args()
 
     dry_run = not args.live
-    Dashboard(dry_run=dry_run, max_cycles=args.cycles).run()
+    Dashboard(dry_run=dry_run, max_cycles=args.cycles, kalshi_only=args.kalshi_only).run()
 
 
 if __name__ == "__main__":

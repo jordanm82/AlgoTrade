@@ -58,8 +58,9 @@ SNAPSHOT_INTERVAL = 900  # save snapshot every 15 minutes
 class LiveDaemon:
     """Production daemon that runs BB Grid + RSI MR on validated pairs."""
 
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = False, kalshi_only: bool = False):
         self.dry_run = dry_run
+        self.kalshi_only = kalshi_only
         self.fetcher = DataFetcher()
         self.store = DataStore(DATA_DIR)
         self.tracker = PositionTracker(max_concurrent=MAX_CONCURRENT_POSITIONS)
@@ -1399,9 +1400,10 @@ class LiveDaemon:
     def startup(self):
         """Fetch initial data on startup."""
         mode = "DRY-RUN" if self.dry_run else "LIVE"
+        kalshi_tag = " (KALSHI-ONLY)" if self.kalshi_only else ""
         print(colored(f"{'='*70}", "cyan"))
-        print(colored(f"  Production Trading Daemon — {mode} MODE", "cyan"))
-        print(colored(f"  Strategies: BB Grid + RSI MR (per-pair config)", "cyan"))
+        print(colored(f"  Production Trading Daemon — {mode} MODE{kalshi_tag}", "cyan"))
+        print(colored(f"  Strategies: {'Kalshi 15m Predictions only' if self.kalshi_only else 'BB Grid + RSI MR (per-pair config)'}", "cyan"))
         print(colored(f"  Pairs: {', '.join(ALL_PAIRS)}", "cyan"))
         print(colored(f"  Timeframe: 15m | Equity: ${self._equity:,.2f}", "cyan"))
         print(colored(f"  Stop-loss: {STOP_LOSS_PCT:.0%} | Position size: {POSITION_SIZE_PCT:.0%}", "cyan"))
@@ -1429,21 +1431,27 @@ class LiveDaemon:
             print(colored("[HALT] Daily drawdown limit reached — skipping signal generation", "red"))
             return []
 
-        signals = self._collect_all_signals()
+        signals = []
 
-        if signals:
-            print(f"[CYCLE] {len(signals)} signals detected (sorted by confidence):")
-            for sig in signals:
-                conf = sig.get("_confidence", 0)
-                action = sig.get("action", "?")
-                sym = sig.get("symbol", "?")
-                # Skip new entries if at max positions (closes always execute)
-                if action in ("BUY", "SHORT") and not self.tracker.can_open():
-                    print(colored(f"  [SKIP] {action} {sym} (conf={conf:.0f}) — max {MAX_CONCURRENT_POSITIONS} positions reached", "yellow"))
-                    continue
-                self._execute_signal(sig)
+        # Spot trading (Coinbase) — skip when kalshi_only mode
+        if not self.kalshi_only:
+            signals = self._collect_all_signals()
+
+            if signals:
+                print(f"[CYCLE] {len(signals)} signals detected (sorted by confidence):")
+                for sig in signals:
+                    conf = sig.get("_confidence", 0)
+                    action = sig.get("action", "?")
+                    sym = sig.get("symbol", "?")
+                    # Skip new entries if at max positions (closes always execute)
+                    if action in ("BUY", "SHORT") and not self.tracker.can_open():
+                        print(colored(f"  [SKIP] {action} {sym} (conf={conf:.0f}) — max {MAX_CONCURRENT_POSITIONS} positions reached", "yellow"))
+                        continue
+                    self._execute_signal(sig)
+            else:
+                print("[CYCLE] No signals")
         else:
-            print("[CYCLE] No signals")
+            print("[CYCLE] Kalshi-only mode — skipping spot signals")
 
         # Kalshi prediction cycle
         try:
@@ -1460,8 +1468,9 @@ class LiveDaemon:
     def tick(self):
         """Minute tick: update prices, enforce stops, check profit taking."""
         self._update_prices()
-        self._enforce_stops()
-        self._check_profit_taking()
+        if not self.kalshi_only:
+            self._enforce_stops()
+            self._check_profit_taking()
         self._update_equity()
 
     def run(self):
@@ -1516,9 +1525,13 @@ def main():
         "--dry-run", action="store_true",
         help="Print signals without executing trades",
     )
+    parser.add_argument(
+        "--kalshi-only", action="store_true",
+        help="Run only Kalshi 15m predictions, skip Coinbase spot trading",
+    )
     args = parser.parse_args()
 
-    daemon = LiveDaemon(dry_run=args.dry_run)
+    daemon = LiveDaemon(dry_run=args.dry_run, kalshi_only=args.kalshi_only)
     daemon.run()
 
 

@@ -53,6 +53,11 @@ async def list_tools():
                         "description": "Number of 15-min signal cycles to run.",
                         "default": 50,
                     },
+                    "kalshi_only": {
+                        "type": "boolean",
+                        "description": "Run only Kalshi 15m predictions, skip Coinbase spot trading.",
+                        "default": False,
+                    },
                 },
             },
         ),
@@ -390,18 +395,21 @@ def handle_status() -> dict:
     return {"dashboard_log": content, "daemon_running": running, "pid": pid}
 
 
-def handle_start(mode: str = "dry-run", cycles: int = 50) -> dict:
+def handle_start(mode: str = "dry-run", cycles: int = 50, kalshi_only: bool = False) -> dict:
     """Start the dashboard as a background subprocess."""
     global _daemon_process
     flag = "--live" if mode == "live" else "--dry-run"
+    cmd = [sys.executable, "dashboard.py", flag, "--cycles", str(cycles)]
+    if kalshi_only:
+        cmd.append("--kalshi-only")
     _daemon_process = subprocess.Popen(
-        [sys.executable, "dashboard.py", flag, "--cycles", str(cycles)],
+        cmd,
         stdout=open("/tmp/dashboard_stdout.log", "w"),
         stderr=subprocess.STDOUT,
         cwd=os.path.dirname(os.path.abspath(__file__)),
     )
     Path("/tmp/dashboard_pid.txt").write_text(str(_daemon_process.pid))
-    return {"pid": _daemon_process.pid, "mode": mode, "cycles": cycles}
+    return {"pid": _daemon_process.pid, "mode": mode, "cycles": cycles, "kalshi_only": kalshi_only}
 
 
 def handle_stop() -> dict:
@@ -1296,6 +1304,7 @@ async def call_tool(name: str, arguments: dict):
             result = handle_start(
                 mode=arguments.get("mode", "dry-run"),
                 cycles=arguments.get("cycles", 50),
+                kalshi_only=arguments.get("kalshi_only", False),
             )
         elif name == "algotrade_stop":
             result = handle_stop()
