@@ -60,3 +60,10 @@ class TestIndicators:
         assert "roc_5" in df.columns
         valid = df["roc_5"].dropna()
         assert len(valid) > 0
+
+    def test_adds_adx(self, sample_ohlcv):
+        df = add_indicators(sample_ohlcv)
+        assert "adx" in df.columns
+        valid = df["adx"].dropna()
+        assert len(valid) > 0
+        assert (valid >= 0).all()

@@ -34,6 +34,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Volume SMA
     out["vol_sma_20"] = ta.sma(out["volume"], length=20)
 
+    # ADX (Average Directional Index)
+    adx_df = ta.adx(out["high"], out["low"], out["close"], length=14)
+    out["adx"] = adx_df.filter(like="ADX").iloc[:, 0]
+
     # Stochastic RSI
     stochrsi = ta.stochrsi(out["close"], length=14, rsi_length=14, k=3, d=3)
     out["stochrsi_k"] = stochrsi.iloc[:, 0]
