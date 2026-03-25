@@ -904,8 +904,20 @@ class LiveDaemon:
             if not pos:
                 return
 
-            base_size = pos["size_usd"] / price if price > 0 else 0
-            result = self.executor.market_sell(coinbase_sym, base_size)
+            # Query actual Coinbase balance to sell ALL tokens (not calculated from tracker)
+            currency = coinbase_sym.replace("-USD", "")
+            try:
+                balances = self.executor.get_balances()
+                base_size = balances.get(currency, 0)
+            except Exception:
+                base_size = pos["size_usd"] / price if price > 0 else 0
+            if base_size <= 0:
+                base_size = pos["size_usd"] / price if price > 0 else 0
+            try:
+                result = self.executor.market_sell(coinbase_sym, base_size)
+            except Exception as e:
+                print(colored(f"  [FAIL] CLOSE LONG {coinbase_sym}: {e}", "red"))
+                return
             closed = self.tracker.close(pos_key, price)
             pnl = closed.get("pnl_usd", 0)
             self._pnl_today += pnl

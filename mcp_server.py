@@ -338,6 +338,34 @@ async def list_tools():
                 "required": ["pair", "key", "value"],
             },
         ),
+        # 22. Force kill
+        Tool(
+            name="algotrade_force_kill",
+            description="Force kill the daemon (SIGKILL + pkill) when normal stop doesn't work.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        # 23. Logs
+        Tool(
+            name="algotrade_logs",
+            description="View recent daemon stdout/stderr log lines.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "lines": {"type": "integer", "description": "Number of lines to return.", "default": 50},
+                },
+            },
+        ),
+        # 24. Errors
+        Tool(
+            name="algotrade_errors",
+            description="Scan daemon logs for errors, warnings, failures, and blocked trades.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "lines": {"type": "integer", "description": "Max lines per category.", "default": 30},
+                },
+            },
+        ),
     ]
 
 
@@ -407,6 +435,95 @@ def handle_stop() -> dict:
         pid_file.unlink(missing_ok=True)
 
     return {"stopped": killed}
+
+
+def handle_force_kill() -> dict:
+    """Force kill the daemon process (SIGKILL) when stop doesn't work."""
+    global _daemon_process
+    pid_file = Path("/tmp/dashboard_pid.txt")
+    killed = False
+
+    if _daemon_process is not None:
+        try:
+            _daemon_process.kill()
+            killed = True
+        except Exception:
+            pass
+        _daemon_process = None
+
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 9)  # SIGKILL
+            killed = True
+        except (OSError, ValueError):
+            pass
+        pid_file.unlink(missing_ok=True)
+
+    # Also kill any stray dashboard.py processes
+    try:
+        result = subprocess.run(["pkill", "-9", "-f", "dashboard.py"], capture_output=True)
+        if result.returncode == 0:
+            killed = True
+    except Exception:
+        pass
+
+    return {"force_killed": killed}
+
+
+def handle_logs(lines: int = 50) -> dict:
+    """Check daemon stdout/stderr logs for recent output."""
+    log_file = Path("/tmp/dashboard_stdout.log")
+    if not log_file.exists():
+        return {"error": "No daemon log file found", "path": str(log_file)}
+    content = log_file.read_text()
+    log_lines = content.strip().split("\n")
+    return {
+        "total_lines": len(log_lines),
+        "last_lines": log_lines[-lines:],
+        "path": str(log_file),
+    }
+
+
+def handle_errors(lines: int = 30) -> dict:
+    """Scan daemon logs for errors, warnings, and failures."""
+    results = {"errors": [], "warnings": [], "failures": [], "blocks": []}
+
+    # Check daemon stdout log
+    log_file = Path("/tmp/dashboard_stdout.log")
+    if log_file.exists():
+        for line in log_file.read_text().strip().split("\n"):
+            ll = line.lower()
+            if "traceback" in ll or "error" in ll or "exception" in ll:
+                results["errors"].append(line.strip())
+            elif "warn" in ll:
+                results["warnings"].append(line.strip())
+            elif "fail" in ll:
+                results["failures"].append(line.strip())
+            elif "block" in ll:
+                results["blocks"].append(line.strip())
+
+    # Check trades for any issues
+    trades_file = Path("data/store/trades.csv")
+    if trades_file.exists():
+        import pandas as pd
+        try:
+            df = pd.read_csv(trades_file)
+            if len(df) > 0:
+                results["total_trades"] = len(df)
+                results["last_trade"] = df.iloc[-1].to_dict()
+        except Exception:
+            pass
+
+    # Trim to last N
+    for key in ("errors", "warnings", "failures", "blocks"):
+        results[key] = results[key][-lines:]
+
+    results["summary"] = (
+        f"{len(results['errors'])} errors, {len(results['warnings'])} warnings, "
+        f"{len(results['failures'])} failures, {len(results['blocks'])} blocks"
+    )
+    return results
 
 
 def handle_balances() -> dict:
@@ -1253,6 +1370,12 @@ async def call_tool(name: str, arguments: dict):
                 key=arguments["key"],
                 value=arguments["value"],
             )
+        elif name == "algotrade_force_kill":
+            result = handle_force_kill()
+        elif name == "algotrade_logs":
+            result = handle_logs(lines=arguments.get("lines", 50))
+        elif name == "algotrade_errors":
+            result = handle_errors(lines=arguments.get("lines", 30))
         else:
             result = {"error": f"Unknown tool: {name}"}
     except Exception as e:
