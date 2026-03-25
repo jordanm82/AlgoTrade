@@ -46,3 +46,17 @@ class TestIndicators:
         original_cols = list(sample_ohlcv.columns)
         add_indicators(sample_ohlcv)
         assert list(sample_ohlcv.columns) == original_cols
+
+    def test_adds_stochrsi(self, sample_ohlcv):
+        df = add_indicators(sample_ohlcv)
+        assert "stochrsi_k" in df.columns
+        assert "stochrsi_d" in df.columns
+        valid = df["stochrsi_k"].dropna()
+        assert len(valid) > 0
+        assert valid.between(0, 100).all()
+
+    def test_adds_roc_5(self, sample_ohlcv):
+        df = add_indicators(sample_ohlcv)
+        assert "roc_5" in df.columns
+        valid = df["roc_5"].dropna()
+        assert len(valid) > 0

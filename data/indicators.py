@@ -34,4 +34,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Volume SMA
     out["vol_sma_20"] = ta.sma(out["volume"], length=20)
 
+    # Stochastic RSI
+    stochrsi = ta.stochrsi(out["close"], length=14, rsi_length=14, k=3, d=3)
+    out["stochrsi_k"] = stochrsi.iloc[:, 0]
+    out["stochrsi_d"] = stochrsi.iloc[:, 1]
+
+    # Rate of Change (5-period)
+    out["roc_5"] = ta.roc(out["close"], length=5)
+
     return out
