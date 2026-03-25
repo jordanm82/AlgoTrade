@@ -100,3 +100,30 @@ class CoinbaseExecutor:
         """Cancel an order by ID."""
         resp = self.client.cancel_orders(order_ids=[order_id])
         return resp.to_dict() if hasattr(resp, "to_dict") else resp
+
+    def get_order_status(self, order_id: str) -> dict:
+        """Get the fill status of a specific order."""
+        try:
+            resp = self.client.get_order(order_id)
+            return resp.to_dict() if hasattr(resp, "to_dict") else resp
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_token_balance(self, currency: str) -> float:
+        """Get the actual balance of a specific token on Coinbase."""
+        balances = self.get_balances()
+        return balances.get(currency, 0.0)
+
+    def get_fills(self, order_id: str = None, product_id: str = None, limit: int = 10) -> list:
+        """Get recent fills (executed trades)."""
+        try:
+            kwargs = {"limit": limit}
+            if order_id:
+                kwargs["order_id"] = order_id
+            if product_id:
+                kwargs["product_id"] = product_id
+            resp = self.client.get_fills(**kwargs)
+            fills = resp.get("fills", [])
+            return fills
+        except Exception as e:
+            return [{"error": str(e)}]

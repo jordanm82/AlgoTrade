@@ -662,6 +662,17 @@ class LiveDaemon:
                     fill_price = int(fill_price)
                     if fill_price < 1 or fill_price > 99:
                         fill_price = 50
+                    # Verify Kalshi balance before placing (Kalshi is source of truth)
+                    bal_resp = self.kalshi_client.get_balance()
+                    avail_cents = bal_resp.get("balance", 0)
+                    cost_cents = count * fill_price
+                    if cost_cents > avail_cents:
+                        count = max(1, avail_cents // fill_price)
+                        if count < 1:
+                            pred["reason"] = f"insufficient Kalshi balance (${avail_cents/100:.2f})"
+                            predictions.append(pred)
+                            continue
+
                     result = self.kalshi_client.place_order(
                         ticker=ticker,
                         side=side,
@@ -669,12 +680,30 @@ class LiveDaemon:
                         price_cents=fill_price,
                         order_type="limit",
                     )
-                    order_id = result.get("order", {}).get("order_id", "?")
-                    fill_count = result.get("order", {}).get("fill_count_fp", "0")
-                    pred["reason"] = f"placed {side.upper()} x{count} filled={fill_count} (#{order_id})"
+                    order = result.get("order", {})
+                    order_id = order.get("order_id", "?")
+                    fill_count = order.get("fill_count_fp", "0")
+                    order_status = order.get("status", "?")
+
+                    # Verify fill via Kalshi (exchange is source of truth)
+                    if float(fill_count) < count and order_status == "resting":
+                        # Partially filled or resting — check positions
+                        import time as _t
+                        _t.sleep(1)
+                        try:
+                            positions = self.kalshi_client.get_positions()
+                            for p in positions:
+                                if p.get("ticker") == ticker and p.get("position", 0) > 0:
+                                    fill_count = str(p["position"])
+                                    break
+                        except Exception:
+                            pass
+
+                    pred["reason"] = f"placed {side.upper()} x{count} filled={fill_count} status={order_status} @ {fill_price}c (#{order_id})"
                     print(colored(
                         f"  [KALSHI BET] {pred['asset']} {signal.direction} "
-                        f"conf={signal.confidence} | {side.upper()} x{count} @ {approx_cents}c",
+                        f"conf={signal.confidence} | {side.upper()} x{count} @ {fill_price}c "
+                        f"filled={fill_count} status={order_status}",
                         "magenta",
                     ))
                 except Exception as e:
@@ -767,20 +796,35 @@ class LiveDaemon:
             # Execute: spot buy via Coinbase
             result = self.executor.market_buy(coinbase_sym, size_usd)
             if result.get("success") or result.get("order_id") or result.get("success_response"):
-                self.tracker.open(pos_key, "BUY", size_usd, price, stop, take_profit)
-                self._trades_today += 1
-                self.store.append_trade({
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "symbol": coinbase_sym, "side": "BUY", "strategy": strategy,
-                    "size_usd": size_usd, "price": price, "stop": stop,
-                    "leverage": leverage, "source": "live_daemon",
-                })
-                print(colored(
-                    f"  [BUY] {coinbase_sym} @ ${price:.4f} | "
-                    f"RSI={sig.get('rsi', 0):.1f} | {strategy} | "
-                    f"size=${size_usd:.0f}",
-                    "green",
-                ))
+                order_id = (result.get("success_response") or {}).get("order_id", "")
+
+                # Verify the order actually filled by checking Coinbase balance
+                time.sleep(1)  # brief wait for settlement
+                currency = coinbase_sym.replace("-USD", "")
+                actual_balance = self.executor.get_token_balance(currency)
+                if actual_balance > 0:
+                    # Use actual balance to compute USD value
+                    actual_usd = actual_balance * price  # approximate
+                    self.tracker.open(pos_key, "BUY", actual_usd, price, stop, take_profit)
+                    self._trades_today += 1
+                    self.store.append_trade({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "symbol": coinbase_sym, "side": "BUY", "strategy": strategy,
+                        "size_usd": actual_usd, "price": price, "stop": stop,
+                        "leverage": leverage, "source": "live_daemon",
+                        "order_id": order_id,
+                    })
+                    print(colored(
+                        f"  [BUY] {coinbase_sym} @ ${price:.4f} | "
+                        f"RSI={sig.get('rsi', 0):.1f} | {strategy} | "
+                        f"size=${actual_usd:.0f} (requested ${size_usd:.0f})",
+                        "green",
+                    ))
+                else:
+                    print(colored(
+                        f"  [WARN] BUY {coinbase_sym} order {order_id} — no tokens received",
+                        "yellow",
+                    ))
             else:
                 print(colored(f"  [FAIL] BUY {coinbase_sym}: {result}", "red"))
 
@@ -1017,13 +1061,18 @@ class LiveDaemon:
                     reason = action["reason"]
                     usd_to_sell = pos.reduce_size(pct)
 
-                    # In live mode, execute partial sell
+                    # In live mode, execute partial sell — exchange is source of truth
                     coinbase_sym = pos_key.split(":")[0]
                     if not self.dry_run and self.executor:
-                        base_to_sell = usd_to_sell / pos.current_price if pos.current_price > 0 else 0
+                        currency = coinbase_sym.replace("-USD", "")
                         if pos.side == "BUY":
-                            self.executor.market_sell(coinbase_sym, base_to_sell)
-                        # For shorts, partial close is more complex -- skip for now
+                            try:
+                                actual_balance = self.executor.get_token_balance(currency)
+                                base_to_sell = actual_balance * (pct / 100)
+                                if base_to_sell > 0:
+                                    self.executor.market_sell(coinbase_sym, base_to_sell)
+                            except Exception as e:
+                                print(colored(f"  [FAIL] TP sell {coinbase_sym}: {e}", "red"))
 
                     self._pnl_today += (pos.current_price - pos.entry_price) / pos.entry_price * usd_to_sell
                     print(colored(f"  [TP] {pos_key} {reason} — sold {pct}% (${usd_to_sell:.2f})", "green"))
@@ -1041,12 +1090,17 @@ class LiveDaemon:
                     print(colored(f"  [TRAIL] {pos_key} {reason}", "yellow"))
                     # Close remaining position
                     closed = self.tracker.close(pos_key, pos.current_price)
-                    # Execute sell
+                    # Execute sell — exchange is source of truth for actual balance
                     coinbase_sym = pos_key.split(":")[0]
                     if not self.dry_run and self.executor:
-                        base_size = pos.size_usd / pos.current_price if pos.current_price > 0 else 0
+                        currency = coinbase_sym.replace("-USD", "")
                         if pos.side == "BUY":
-                            self.executor.market_sell(coinbase_sym, base_size)
+                            try:
+                                base_size = self.executor.get_token_balance(currency)
+                                if base_size > 0:
+                                    self.executor.market_sell(coinbase_sym, base_size)
+                            except Exception as e:
+                                print(colored(f"  [FAIL] TRAIL sell {coinbase_sym}: {e}", "red"))
                     self._pnl_today += closed.get("pnl_usd", 0)
                     self.store.append_trade({
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1079,10 +1133,25 @@ class LiveDaemon:
             is_short = pos["side"] == "SELL"
             if is_short:
                 perp_sym = coinbase_sym.replace("-USD", "-PERP-INTX")
-                self.executor.close_perp(perp_sym)
+                try:
+                    self.executor.close_perp(perp_sym)
+                except Exception as e:
+                    print(colored(f"  [FAIL] STOP close perp {perp_sym}: {e}", "red"))
+                    continue
             else:
-                base_size = pos["size_usd"] / price if price > 0 else 0
-                self.executor.market_sell(coinbase_sym, base_size)
+                # Exchange is source of truth — query actual balance
+                currency = coinbase_sym.replace("-USD", "")
+                try:
+                    base_size = self.executor.get_token_balance(currency)
+                except Exception:
+                    base_size = pos["size_usd"] / price if price > 0 else 0
+                if base_size <= 0:
+                    continue
+                try:
+                    self.executor.market_sell(coinbase_sym, base_size)
+                except Exception as e:
+                    print(colored(f"  [FAIL] STOP sell {coinbase_sym}: {e}", "red"))
+                    continue
 
             closed = self.tracker.close(pos_key, price)
             pnl = closed.get("pnl_usd", 0)
@@ -1116,6 +1185,35 @@ class LiveDaemon:
             balances = self.executor.get_balances()
             self._equity = sum(balances.values()) + self.tracker.total_exposure()
         self.risk.update_portfolio_value(self._equity)
+
+    def _reconcile_positions(self):
+        """Compare tracker vs exchange. Log mismatches. Run every signal cycle."""
+        if self.dry_run or not self.executor:
+            return
+        try:
+            balances = self.executor.get_balances()
+            tracked_currencies = set()
+            for pos in self.tracker.open_positions():
+                currency = pos["symbol"].split("-")[0]
+                tracked_currencies.add(currency)
+
+            # Check for tokens on Coinbase not in tracker
+            for currency, amount in balances.items():
+                if currency in ("USD", "USDC", "USDT"):
+                    continue
+                if amount > 0.001 and currency not in tracked_currencies:
+                    print(colored(
+                        f"  [RECONCILE] Untracked {currency}: {amount:.6f} on Coinbase — not in tracker",
+                        "yellow"))
+
+            # Check for tracked positions with no tokens on Coinbase
+            for currency in tracked_currencies:
+                if currency not in balances or balances.get(currency, 0) < 0.001:
+                    print(colored(
+                        f"  [RECONCILE] Tracked {currency} has no tokens on Coinbase — phantom position",
+                        "yellow"))
+        except Exception as e:
+            print(colored(f"  [RECONCILE] Failed: {e}", "yellow"))
 
     # ------------------------------------------------------------------
     # Snapshot
@@ -1224,6 +1322,7 @@ class LiveDaemon:
             print(colored(f"  [KALSHI ERR] cycle failed: {e}", "yellow"))
 
         self._update_equity()
+        self._reconcile_positions()
         self._save_snapshot(signals)
         self._print_status(signals)
         return signals
