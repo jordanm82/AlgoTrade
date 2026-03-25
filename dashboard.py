@@ -363,23 +363,41 @@ class Dashboard:
         if kalshi_preds:
             lines.append("")
             lines.append("  KALSHI PREDICTIONS:")
+            lines.append(f"    {'ASSET':<5} {'SIDE':<5} {'PROB':>5}  {'PRICE':>12} {'TARGET':>12} {'DIST':>8}  {'STATE':<18}")
+            lines.append(f"    {'─'*70}")
             for pred in kalshi_preds:
                 asset = pred.get("asset", "?")
                 direction = pred.get("direction", "--")
                 conf = pred.get("confidence", 0)
-                ob = pred.get("ob", 0)
-                flow = pred.get("flow", 0)
-                reason = pred.get("reason", "")
                 state = pred.get("state", "")
-                state_tag = f" [{state}]" if state else ""
-                if direction == "--" or conf == 0:
-                    lines.append(f"    {asset:<5} {'--':<5} conf={conf:<3}{state_tag}")
-                else:
-                    lines.append(
-                        f"    {asset:<5} {direction:<5} conf={conf:<3} |  "
-                        f"OB={ob:+.2f} flow={flow:+.2f}  |  "
-                        f"{reason}{state_tag}"
-                    )
+
+                # Get current price + target from pending signals
+                current_str = ""
+                target_str = ""
+                dist_str = ""
+                if hasattr(self.daemon, '_kalshi_pending_signals'):
+                    pending = self.daemon._kalshi_pending_signals.get(asset, {})
+                    target = pending.get("strike_price", 0)
+                    if target:
+                        target_str = f"${target:,.2f}"
+                        # Get current price from cached data
+                        symbol = f"{asset}/USDT"
+                        df = self.daemon._dataframes.get(symbol) or self.daemon._kalshi_cached_dataframes.get(symbol)
+                        if df is not None and len(df) > 0:
+                            current = float(df.iloc[-1]["close"])
+                            current_str = f"${current:,.2f}"
+                            diff = current - target
+                            sign = "+" if diff >= 0 else ""
+                            dist_str = f"{sign}{diff:.2f}"
+
+                side_display = direction if direction != "--" else "--"
+                prob_display = f"{conf}%" if conf > 0 else "--"
+
+                lines.append(
+                    f"    {asset:<5} {side_display:<5} {prob_display:>5}  "
+                    f"{current_str:>12} {target_str:>12} {dist_str:>8}  "
+                    f"{state:<18}"
+                )
 
         # Footer
         remaining = self.max_cycles - self._cycle_count
