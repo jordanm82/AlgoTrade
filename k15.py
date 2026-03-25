@@ -17,6 +17,7 @@ Commands (type at the k15> prompt):
 import sys
 import os
 import time
+import select
 import threading
 from datetime import datetime, timezone
 
@@ -425,20 +426,31 @@ def main():
     except Exception:
         console.print("[yellow]Could not connect to Kalshi[/yellow]")
 
-    # Main loop: alternate between displaying dashboard and reading input
-    while True:
-        # Render dashboard once
-        try:
-            layout = build_layout(state)
-            console.print(layout)
-        except Exception:
-            pass
+    # Main loop: auto-refresh every 2 seconds, non-blocking input
+    refresh_interval = 2.0
+    last_refresh = 0
 
-        # Read command
+    while True:
+        # Auto-refresh dashboard
+        now = time.time()
+        if now - last_refresh >= refresh_interval:
+            try:
+                console.clear()
+                layout = build_layout(state)
+                console.print(layout)
+                # Print prompt without newline
+                console.print("[bold cyan]k15>[/bold cyan] ", end="")
+            except Exception:
+                pass
+            last_refresh = now
+
+        # Non-blocking input check (wait up to 0.5s)
         try:
-            cmd = console.input("[bold cyan]k15>[/bold cyan] ")
-            if handle_command(cmd, state, console):
-                break
+            if select.select([sys.stdin], [], [], 0.5)[0]:
+                cmd = sys.stdin.readline().strip()
+                if cmd:
+                    if handle_command(cmd, state, console):
+                        break
         except (KeyboardInterrupt, EOFError):
             if state.running:
                 state.running = False
