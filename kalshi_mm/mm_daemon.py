@@ -50,11 +50,13 @@ class MMAssetRunner:
         series_ticker: str,
         kalshi_client,
         dry_run: bool = True,
+        safe_mode: bool = False,
     ):
         self.symbol = symbol
         self.series_ticker = series_ticker
         self.client = kalshi_client
         self.dry_run = dry_run
+        self.safe_mode = safe_mode
 
         self.inv = MMInventory(asset=symbol)
         self.kill_switch = KillSwitch()
@@ -457,6 +459,9 @@ class MMAssetRunner:
         if contracts is None:
             self.status_msg = "QUOTING_BID: insufficient budget for bid"
             return
+
+        if self.safe_mode:
+            contracts = 1
 
         if self.dry_run:
             # Simulate: bid rests immediately
@@ -955,6 +960,7 @@ def main():
             series_ticker=series,
             kalshi_client=client,
             dry_run=dry_run,
+            safe_mode=args.safe_mode,
         )
         runners.append(runner)
 
