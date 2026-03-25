@@ -96,3 +96,42 @@ class TestParseOrderbookVolume:
         from kalshi_mm.mm_strategy import parse_ob_total_volume
         levels = [["0.48", "10"], ["0.47", "20"], ["0.46", "5"]]
         assert parse_ob_total_volume(levels) == 35
+
+
+class TestParseObAsDict:
+    def test_converts_to_cents_dict(self):
+        from kalshi_mm.mm_strategy import parse_ob_as_dict
+        levels = [["0.4800", "10.00"], ["0.5000", "20.00"]]
+        assert parse_ob_as_dict(levels) == {48: 10, 50: 20}
+
+
+class TestVolumeConsumed:
+    def test_volume_consumed_at_or_above(self):
+        from kalshi_mm.mm_strategy import volume_consumed_at_or_above
+        prev = {48: 100, 50: 50, 52: 30}
+        curr = {48: 100, 50: 30, 52: 10}  # 20 consumed at 50, 20 at 52
+        assert volume_consumed_at_or_above(prev, curr, 50) == 40
+
+    def test_no_consumption(self):
+        from kalshi_mm.mm_strategy import volume_consumed_at_or_above
+        prev = {48: 100, 50: 50}
+        curr = {48: 100, 50: 60}  # volume increased, not consumed
+        assert volume_consumed_at_or_above(prev, curr, 48) == 0
+
+    def test_level_disappeared(self):
+        from kalshi_mm.mm_strategy import volume_consumed_at_or_above
+        prev = {50: 30, 52: 20}
+        curr = {50: 30}  # 52 level gone = 20 consumed
+        assert volume_consumed_at_or_above(prev, curr, 50) == 20
+
+    def test_below_threshold_ignored(self):
+        from kalshi_mm.mm_strategy import volume_consumed_at_or_above
+        prev = {40: 100, 50: 50}
+        curr = {40: 10, 50: 50}  # 90 consumed at 40, but below threshold 45
+        assert volume_consumed_at_or_above(prev, curr, 45) == 0
+
+    def test_volume_consumed_at_or_below(self):
+        from kalshi_mm.mm_strategy import volume_consumed_at_or_below
+        prev = {48: 100, 50: 50, 52: 30}
+        curr = {48: 80, 50: 30}  # 20 at 48, 20 at 50, 52 not checked (above 50)
+        assert volume_consumed_at_or_below(prev, curr, 50) == 40

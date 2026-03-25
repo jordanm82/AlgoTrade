@@ -28,6 +28,7 @@ from kalshi_mm.mm_vpin import (
 )
 from kalshi_mm.mm_strategy import (
     compute_mid_cents, compute_spread_cents, compute_bid_cents,
+    parse_ob_as_dict, volume_consumed_at_or_above, volume_consumed_at_or_below,
     compute_ask_cents, parse_ob_total_volume,
 )
 
@@ -62,6 +63,10 @@ class MMAssetRunner:
         # OB volume tracking for Kalshi heuristic
         self._prev_yes_vol: float = 0.0
         self._prev_no_vol: float = 0.0
+
+        # OB snapshots for volume-based fill simulation (dry-run)
+        self._prev_yes_bids: dict[int, int] = {}  # {price_cents: volume}
+        self._prev_no_bids: dict[int, int] = {}   # {price_cents: volume}
 
         # Discovery timing
         self._last_discovery_ts: float = 0.0
@@ -163,6 +168,10 @@ class MMAssetRunner:
         # Snapshot OB volumes for heuristic baseline
         self._prev_yes_vol = parse_ob_total_volume(yes_bids)
         self._prev_no_vol = parse_ob_total_volume(no_bids)
+
+        # Initialize OB snapshots for volume-based fill simulation
+        self._prev_yes_bids = parse_ob_as_dict(yes_bids)
+        self._prev_no_bids = parse_ob_as_dict(no_bids)
 
         self.inv.state = QUOTING_BID
         self.status_msg = f"DISCOVERING -> QUOTING_BID ({ticker})"
@@ -570,29 +579,45 @@ class MMAssetRunner:
             return False
 
         if self.dry_run:
-            # Simulate fill when orderbook YES ask <= our bid
+            # Volume-based fill simulation:
+            # Our bid is BUY YES at X. For this to fill, someone must SELL YES at X.
+            # Selling YES = buying NO at (100-X). So if NO bid volume decreased
+            # at (100-X) or above, contracts were traded → our bid would fill.
             ob_inner = ob.get("orderbook_fp", ob)
-            no_bids = ob_inner.get("no_dollars", [])
-            if no_bids:
-                best_no_bid = round(float(no_bids[-1][0]) * 100)  # highest no bid = last (ascending sort)
-                yes_ask = 100 - best_no_bid
-                if yes_ask <= self.inv.bid_price_cents:
-                    contracts = compute_contracts(
-                        self._get_balance_cents() or 10000,
-                        self.inv.bid_price_cents,
-                    )
-                    if contracts is None:
-                        contracts = 10
-                    self.inv.record_buy_fill(
-                        contracts, self.inv.bid_price_cents, self.inv.pending_bid_id,
-                    )
-                    self._log_trade("buy", self.inv.bid_price_cents, "bid-filled-dry")
-                    self.inv.state = QUOTING_ASK
-                    self.status_msg = (
-                        f"QUOTING_BID: [DRY] bid filled@{self.inv.entry_price_cents}c"
-                        f" x{self.inv.yes_held} -> QUOTING_ASK"
-                    )
-                    return True
+            no_bids_raw = ob_inner.get("no_dollars", [])
+            curr_no_bids = parse_ob_as_dict(no_bids_raw)
+
+            # The NO price corresponding to our YES bid
+            no_price_for_our_bid = 100 - self.inv.bid_price_cents
+
+            # Check if volume was consumed at or above that NO price
+            consumed = volume_consumed_at_or_above(
+                self._prev_no_bids, curr_no_bids, no_price_for_our_bid
+            )
+
+            # Update snapshot for next poll
+            self._prev_no_bids = curr_no_bids
+
+            if consumed > 0:
+                contracts = compute_contracts(
+                    self._get_balance_cents() or 10000,
+                    self.inv.bid_price_cents,
+                )
+                if contracts is None:
+                    contracts = 1
+                # Fill at most what was consumed
+                contracts = min(contracts, consumed)
+                self.inv.record_buy_fill(
+                    contracts, self.inv.bid_price_cents, self.inv.pending_bid_id,
+                )
+                self._log_trade("buy", self.inv.bid_price_cents,
+                                f"bid-filled-dry vol={consumed}")
+                self.inv.state = QUOTING_ASK
+                self.status_msg = (
+                    f"QUOTING_BID: [DRY] bid filled@{self.inv.entry_price_cents}c"
+                    f" x{self.inv.yes_held} (vol={consumed}) -> QUOTING_ASK"
+                )
+                return True
             return False
         else:
             # Live: check order status
@@ -625,23 +650,32 @@ class MMAssetRunner:
             return False
 
         if self.dry_run:
-            # Simulate fill when orderbook YES bid >= our ask
+            # Volume-based fill simulation:
+            # Our ask is SELL YES at X. For this to fill, someone must BUY YES at X.
+            # If YES bid volume decreased at X or above, contracts were bought → our ask fills.
             ob_inner = ob.get("orderbook_fp", ob)
-            yes_bids = ob_inner.get("yes_dollars", [])
-            if yes_bids:
-                best_yes_bid = round(float(yes_bids[-1][0]) * 100)  # highest yes bid = last (ascending sort)
-                if best_yes_bid >= self.inv.ask_price_cents:
-                    rt = self.inv.record_sell_fill(self.inv.ask_price_cents)
-                    self._log_trade(
-                        "sell", self.inv.ask_price_cents,
-                        f"ask-filled-dry pnl={rt['pnl_cents']}c",
-                    )
-                    self.inv.state = QUOTING_BID
-                    self.status_msg = (
-                        f"QUOTING_ASK: [DRY] ask filled@{self.inv.ask_price_cents}c "
-                        f"pnl={rt['pnl_cents']}c -> QUOTING_BID"
-                    )
-                    return True
+            yes_bids_raw = ob_inner.get("yes_dollars", [])
+            curr_yes_bids = parse_ob_as_dict(yes_bids_raw)
+
+            consumed = volume_consumed_at_or_above(
+                self._prev_yes_bids, curr_yes_bids, self.inv.ask_price_cents
+            )
+
+            # Update snapshot for next poll
+            self._prev_yes_bids = curr_yes_bids
+
+            if consumed > 0:
+                rt = self.inv.record_sell_fill(self.inv.ask_price_cents)
+                self._log_trade(
+                    "sell", self.inv.ask_price_cents,
+                    f"ask-filled-dry vol={consumed} pnl={rt['pnl_cents']}c",
+                )
+                self.inv.state = QUOTING_BID
+                self.status_msg = (
+                    f"QUOTING_ASK: [DRY] ask filled@{self.inv.ask_price_cents}c "
+                    f"vol={consumed} pnl={rt['pnl_cents']}c -> QUOTING_BID"
+                )
+                return True
             return False
         else:
             try:

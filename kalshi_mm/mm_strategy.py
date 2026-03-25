@@ -61,3 +61,43 @@ def parse_ob_total_volume(levels: list) -> int:
     for level in levels:
         total += int(float(level[1]))
     return total
+
+
+def parse_ob_as_dict(levels: list) -> dict[int, int]:
+    """Parse orderbook levels into {price_cents: volume} dict."""
+    result = {}
+    for level in levels:
+        price = round(float(level[0]) * 100)
+        vol = int(float(level[1]))
+        result[price] = vol
+    return result
+
+
+def volume_consumed_at_or_above(prev: dict[int, int], curr: dict[int, int],
+                                 price_cents: int) -> int:
+    """Compute how much volume was consumed at or above a price level.
+
+    Compares two orderbook snapshots. Volume decrease at a price level means
+    contracts were traded there. Returns total contracts consumed at >= price_cents.
+    """
+    consumed = 0
+    for p in set(list(prev.keys()) + list(curr.keys())):
+        if p >= price_cents:
+            old_vol = prev.get(p, 0)
+            new_vol = curr.get(p, 0)
+            if new_vol < old_vol:
+                consumed += old_vol - new_vol
+    return consumed
+
+
+def volume_consumed_at_or_below(prev: dict[int, int], curr: dict[int, int],
+                                 price_cents: int) -> int:
+    """Compute how much volume was consumed at or below a price level."""
+    consumed = 0
+    for p in set(list(prev.keys()) + list(curr.keys())):
+        if p <= price_cents:
+            old_vol = prev.get(p, 0)
+            new_vol = curr.get(p, 0)
+            if new_vol < old_vol:
+                consumed += old_vol - new_vol
+    return consumed
