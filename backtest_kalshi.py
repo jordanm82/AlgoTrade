@@ -49,7 +49,9 @@ def fetch_candles(fetcher: DataFetcher, symbol: str, timeframe: str, days: int) 
     since = now_ms - period_ms
     batch_size = 1000
 
-    if timeframe == "15m":
+    if timeframe == "5m":
+        candle_ms = 5 * 60 * 1000
+    elif timeframe == "15m":
         candle_ms = 15 * 60 * 1000
     elif timeframe == "1h":
         candle_ms = 60 * 60 * 1000
@@ -286,6 +288,7 @@ def print_metrics(name: str, m: dict):
         print(f"  Per-Asset WR:   ", end="")
         parts = [f"{a}: {wr}% ({m['per_asset_bets'].get(a, 0)})" for a, wr in sorted(m['per_asset_wr'].items())]
         print(", ".join(parts))
+
 
 
 def main():

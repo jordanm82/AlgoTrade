@@ -440,6 +440,94 @@ class KalshiPredictor:
             )
         return None
 
+    def compute_5m_booster(self, df_5m: pd.DataFrame, direction: str,
+                            window_open_price: float) -> int:
+        """Compute 5m confirmation booster for a 15m base signal.
+
+        Returns a score from -10 to +12 that adds to the base 15m confidence.
+        Positive = 5m price action confirms the predicted direction.
+        Negative = 5m price action contradicts the predicted direction.
+
+        Args:
+            df_5m: 5m OHLCV with indicators (needs rsi, macd_hist, atr, vol_sma_20)
+            direction: "UP" or "DOWN" from the 15m base signal
+            window_open_price: Price at the start of the 15m window
+        """
+        if df_5m is None or len(df_5m) < 2:
+            return 0
+
+        last = df_5m.iloc[-1]
+        prev = df_5m.iloc[-2]
+        booster = 0
+        is_up = direction == "UP"
+
+        close = float(last["close"])
+        open_price = float(last["open"])
+        prev_close = float(prev["close"])
+
+        # 1. Candle direction (+3)
+        candle_is_green = close > open_price
+        if (is_up and candle_is_green) or (not is_up and not candle_is_green):
+            booster += 3
+
+        # 2. Volume surge (+3)
+        vol = float(last.get("volume", 0))
+        vol_sma = float(last.get("vol_sma_20", 0)) if pd.notna(last.get("vol_sma_20")) else 0
+        if vol_sma > 0 and vol > vol_sma * 1.5:
+            booster += 3
+
+        # 3. ATR distance (+3)
+        atr = float(last.get("atr", 0)) if pd.notna(last.get("atr")) else 0
+        if atr > 0 and window_open_price > 0:
+            distance = close - window_open_price
+            if is_up and distance > 0.5 * atr:
+                booster += 3
+            elif not is_up and distance < -0.5 * atr:
+                booster += 3
+
+        # 4. MACD histogram crossover
+        macd_now = float(last.get("macd_hist", 0)) if pd.notna(last.get("macd_hist")) else 0
+        macd_prev = float(prev.get("macd_hist", 0)) if pd.notna(prev.get("macd_hist")) else 0
+        crossed = (macd_now > 0 and macd_prev <= 0) or (macd_now < 0 and macd_prev >= 0)
+        if crossed:
+            macd_aligned = (is_up and macd_now > 0) or (not is_up and macd_now < 0)
+            if macd_aligned:
+                booster += 3   # aligned crossover
+            else:
+                booster -= 5   # crossover against
+
+        # 5. RSI divergence (-5)
+        rsi_now = float(last.get("rsi", 50)) if pd.notna(last.get("rsi")) else 50
+        rsi_prev = float(prev.get("rsi", 50)) if pd.notna(prev.get("rsi")) else 50
+        if is_up:
+            # Price up but RSI down = bearish divergence
+            if close > prev_close and rsi_now < rsi_prev:
+                booster -= 5
+        else:
+            # Price down but RSI up = bullish divergence (against DOWN prediction)
+            if close < prev_close and rsi_now > rsi_prev:
+                booster -= 5
+
+        return max(-10, min(12, booster))
+
+    def check_1m_momentum(self, df_1m: pd.DataFrame, direction: str, lookback: int = 3) -> bool:
+        """Check if recent 1m candles confirm the direction.
+
+        Returns True if at least 2 of the last `lookback` candles moved in
+        the expected direction (close > open for UP, close < open for DOWN).
+        Simple majority rule avoids single noisy 1m candle killing the signal.
+        """
+        if df_1m is None or len(df_1m) < lookback:
+            return False
+
+        recent = df_1m.iloc[-lookback:]
+        if direction == "UP":
+            confirming = (recent["close"] > recent["open"]).sum()
+        else:
+            confirming = (recent["close"] < recent["open"]).sum()
+
+        return bool(confirming >= 2)
+
     def _apply_filters(self, up_score: int, down_score: int,
                        lagging_up: int, lagging_down: int,
                        leading_up: int, leading_down: int,

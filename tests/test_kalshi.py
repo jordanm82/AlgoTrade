@@ -636,3 +636,198 @@ class TestKalshiFilters:
         predictor = KalshiPredictor()
         signal = predictor.score(df)
         assert signal is not None
+
+
+# ---------------------------------------------------------------------------
+# 1-minute momentum check tests
+# ---------------------------------------------------------------------------
+
+class TestKalshi1mMomentum:
+    """Tests for 1-minute momentum check."""
+
+    def test_up_momentum_confirmed(self):
+        """2 of 3 green candles confirms UP."""
+        df = pd.DataFrame({
+            "open":  [100.0, 101.0, 102.0, 101.5, 103.0],
+            "close": [101.0, 102.0, 101.0, 103.0, 104.0],
+        }, index=pd.date_range("2026-01-01", periods=5, freq="1min"))
+        predictor = KalshiPredictor()
+        assert predictor.check_1m_momentum(df, "UP", lookback=3) is True
+
+    def test_down_momentum_confirmed(self):
+        """2 of 3 red candles confirms DOWN."""
+        df = pd.DataFrame({
+            "open":  [104.0, 103.0, 102.0, 103.0, 101.0],
+            "close": [103.0, 102.0, 103.0, 101.0, 100.0],
+        }, index=pd.date_range("2026-01-01", periods=5, freq="1min"))
+        predictor = KalshiPredictor()
+        assert predictor.check_1m_momentum(df, "DOWN", lookback=3) is True
+
+    def test_momentum_not_confirmed(self):
+        """All candles against direction fails."""
+        df = pd.DataFrame({
+            "open":  [100.0, 101.0, 102.0, 103.0, 104.0],
+            "close": [101.0, 100.5, 101.5, 102.0, 103.5],
+        }, index=pd.date_range("2026-01-01", periods=5, freq="1min"))
+        predictor = KalshiPredictor()
+        # Last 3: 102->101.5 DOWN, 103->102 DOWN, 104->103.5 DOWN
+        assert predictor.check_1m_momentum(df, "UP", lookback=3) is False
+
+    def test_insufficient_data_returns_false(self):
+        """Less than lookback candles returns False."""
+        df = pd.DataFrame({
+            "open": [100.0],
+            "close": [101.0],
+        }, index=pd.date_range("2026-01-01", periods=1, freq="1min"))
+        predictor = KalshiPredictor()
+        assert predictor.check_1m_momentum(df, "UP", lookback=3) is False
+
+
+# ---------------------------------------------------------------------------
+# 5-minute confirmation booster tests
+# ---------------------------------------------------------------------------
+
+class TestKalshi5mBooster:
+    """Tests for 5m confirmation booster."""
+
+    def _make_5m_df(self, n=10, close=100.0, open_price=99.0, volume=1000.0,
+                     vol_sma_20=1000.0, atr=2.0, rsi=50.0, macd_hist=0.5,
+                     prev_rsi=50.0, prev_macd_hist=0.5, prev_close=99.5, prev_open=99.0):
+        """Build a small 5m DataFrame for booster testing."""
+        import numpy as np
+        closes = np.full(n, close)
+        opens = np.full(n, open_price)
+        volumes = np.full(n, volume)
+
+        # Set last 2 candles explicitly
+        closes[-2] = prev_close
+        opens[-2] = prev_open
+        closes[-1] = close
+        opens[-1] = open_price
+
+        df = pd.DataFrame({
+            "close": closes,
+            "open": opens,
+            "volume": volumes,
+            "vol_sma_20": np.full(n, vol_sma_20),
+            "atr": np.full(n, atr),
+            "rsi": np.full(n, rsi),
+            "macd_hist": np.full(n, macd_hist),
+        }, index=pd.date_range("2026-01-01", periods=n, freq="5min"))
+        # Set prev candle indicators
+        df.iloc[-2, df.columns.get_loc("rsi")] = prev_rsi
+        df.iloc[-2, df.columns.get_loc("macd_hist")] = prev_macd_hist
+        return df
+
+    def test_all_boost_factors_fire(self):
+        """All 4 boost factors give +12."""
+        # UP prediction: green candle, high volume, ATR distance, MACD crossover aligned
+        df = self._make_5m_df(
+            close=103.0, open_price=101.0,    # green candle (+3)
+            volume=2000.0, vol_sma_20=1000.0, # volume 2x avg (+3)
+            atr=2.0,                          # ATR distance: 103-100=3 > 0.5*2=1 (+3)
+            macd_hist=0.5, prev_macd_hist=-0.3, # MACD crossed positive (+3)
+        )
+        predictor = KalshiPredictor()
+        booster = predictor.compute_5m_booster(df, "UP", window_open_price=100.0)
+        assert booster == 12
+
+    def test_all_penalty_factors_fire(self):
+        """Both penalty factors give -10."""
+        # UP prediction but: MACD crossed negative (-5), RSI divergence (-5)
+        # Use a doji/flat candle (close == open) so candle direction doesn't add +3
+        df = self._make_5m_df(
+            close=100.0, open_price=100.0,    # doji — no candle direction boost
+            volume=500.0, vol_sma_20=1000.0,  # low volume
+            atr=2.0,
+            macd_hist=-0.3, prev_macd_hist=0.5,  # MACD crossed against UP (-5)
+            rsi=48.0, prev_rsi=50.0,              # price up but RSI down = divergence (-5)
+            prev_close=99.0, prev_open=99.5,      # prev close < current close (price up for divergence)
+        )
+        predictor = KalshiPredictor()
+        booster = predictor.compute_5m_booster(df, "UP", window_open_price=100.5)
+        assert booster == -10
+
+    def test_candle_direction_boost_up(self):
+        """Green candle gives +3 for UP prediction."""
+        df = self._make_5m_df(close=101.0, open_price=100.0)
+        predictor = KalshiPredictor()
+        booster = predictor.compute_5m_booster(df, "UP", window_open_price=100.0)
+        assert booster >= 3  # at least candle direction fires
+
+    def test_candle_direction_no_boost_wrong_direction(self):
+        """Red candle gives 0 for UP prediction."""
+        df = self._make_5m_df(close=99.0, open_price=100.0)
+        predictor = KalshiPredictor()
+        booster = predictor.compute_5m_booster(df, "UP", window_open_price=100.0)
+        # Candle direction doesn't fire, but no penalty either (just 0 for this factor)
+        assert booster <= 0 or booster < 3
+
+    def test_volume_surge_boost(self):
+        """Volume > 1.5x avg gives +3."""
+        df = self._make_5m_df(
+            close=101.0, open_price=100.0,      # green (+3)
+            volume=2000.0, vol_sma_20=1000.0,   # 2x avg (+3)
+        )
+        predictor = KalshiPredictor()
+        booster = predictor.compute_5m_booster(df, "UP", window_open_price=101.0)
+        # candle direction fires (+3), volume fires (+3), ATR distance may not
+        assert booster >= 6
+
+    def test_macd_crossover_against_penalty(self):
+        """MACD crossing against direction gives -5."""
+        df = self._make_5m_df(
+            close=100.5, open_price=100.0,
+            macd_hist=-0.5, prev_macd_hist=0.3,  # crossed negative while predicting UP
+        )
+        predictor = KalshiPredictor()
+        booster = predictor.compute_5m_booster(df, "UP", window_open_price=100.0)
+        # Should have -5 penalty from MACD crossover against
+        assert booster <= -2  # candle dir might give +3, net <= -2
+
+    def test_rsi_divergence_penalty(self):
+        """Price up but RSI down gives -5 for UP prediction."""
+        df = self._make_5m_df(
+            close=101.0, open_price=100.0,
+            rsi=48.0, prev_rsi=52.0,            # RSI dropped while price went up
+            prev_close=100.0, prev_open=99.5,   # prev close < current close (price up)
+        )
+        predictor = KalshiPredictor()
+        booster = predictor.compute_5m_booster(df, "UP", window_open_price=100.0)
+        # RSI divergence should fire (-5)
+        assert booster <= 1  # candle +3, divergence -5, maybe some others
+
+    def test_insufficient_data_returns_zero(self):
+        """Less than 2 candles returns 0."""
+        df = pd.DataFrame({
+            "close": [100.0], "open": [99.0], "volume": [1000.0],
+            "vol_sma_20": [1000.0], "atr": [2.0], "rsi": [50.0], "macd_hist": [0.5],
+        }, index=pd.date_range("2026-01-01", periods=1, freq="5min"))
+        predictor = KalshiPredictor()
+        assert predictor.compute_5m_booster(df, "UP", 100.0) == 0
+
+    def test_clamped_to_range(self):
+        """Result is always in [-10, +12]."""
+        predictor = KalshiPredictor()
+        # Even with extreme values, should clamp
+        df = self._make_5m_df(
+            close=110.0, open_price=100.0,
+            volume=5000.0, vol_sma_20=1000.0,
+            atr=1.0,
+            macd_hist=5.0, prev_macd_hist=-5.0,
+        )
+        booster = predictor.compute_5m_booster(df, "UP", window_open_price=90.0)
+        assert -10 <= booster <= 12
+
+    def test_down_prediction_booster(self):
+        """Booster works correctly for DOWN predictions."""
+        # Red candle, high volume, MACD crossed negative, price below window open
+        df = self._make_5m_df(
+            close=97.0, open_price=99.0,        # red candle (+3)
+            volume=2000.0, vol_sma_20=1000.0,   # volume (+3)
+            atr=2.0,                            # 100-97=3 > 0.5*2=1 (+3)
+            macd_hist=-0.5, prev_macd_hist=0.3, # MACD crossed negative (+3)
+        )
+        predictor = KalshiPredictor()
+        booster = predictor.compute_5m_booster(df, "DOWN", window_open_price=100.0)
+        assert booster == 12

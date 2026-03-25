@@ -117,8 +117,18 @@ Multi-signal confidence scorer (0-100) combining lagging + leading + multi-timef
 
 **Signal quality filters (hard gates, any rejection kills the signal):**
 - **Directional conflict** — rejects when lagging and leading indicators disagree (both ≥15 pts)
-- **Volatility regime** — rejects when ATR is in 90th+ or sub-10th percentile (200-period window)
+- **Volatility regime** — rejects when ATR spikes above 90th percentile (200-period window)
 - **Margin of victory** — rejects when winner < 1.5x loser score
+
+**Evaluation cadence (wall-clock aligned):**
+- Evaluates every 5 minutes (at :01, :06, :11 of each 15m window + :12 for last-look)
+- **SETUP (min 0-4):** Full 15m predictor score. Sets direction + base confidence. No betting.
+- **CONFIRMED (min 5-9):** Re-scores on cached 15m data with fresh order book + trade flow. If confidence >= threshold → bet.
+- **DOUBLE_CONFIRMED (min 10-11):** Same as CONFIRMED. Fresh leading indicators may promote or demote.
+- **LAST_LOOK (min 12):** 1m momentum check (2 of 3 candles confirm direction). Elevated threshold (per-asset + 10).
+- **EXPIRED (min 13+):** No new bets.
+
+The 15m lagging indicators are the proven edge (62-64% WR). The 5m evaluation cycle refreshes order book and trade flow every 5 minutes instead of every 15 — catching real-time shifts in market microstructure.
 
 **Per-asset confidence thresholds (from 3-month backtest optimization):**
 

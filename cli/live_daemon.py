@@ -54,6 +54,11 @@ TICK_INTERVAL = 60       # price update + stop enforcement
 SIGNAL_INTERVAL = 900    # 15 minutes — matches candle timeframe
 SNAPSHOT_INTERVAL = 900  # save snapshot every 15 minutes
 
+# Kalshi multi-timeframe evaluation
+KALSHI_CUTOFF_MINUTES = 13     # no new bets after this minute in the 15m window
+KALSHI_LASTLOOK_MINUTE = 12    # elevated threshold window
+KALSHI_THRESHOLD_BOOST = 10    # added to per-asset threshold for last-look
+
 
 class LiveDaemon:
     """Production daemon that runs BB Grid + RSI MR on validated pairs."""
@@ -97,6 +102,9 @@ class LiveDaemon:
         self.kalshi_threshold = 30  # minimum confidence to bet (lowered from 40 — conf 25-35 with flow confirmation is the sweet spot)
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
         self._active_kalshi_bets = {}  # {ticker: placement_time}
+        self._kalshi_pending_signals = {}   # {asset: {direction, base_conf, last_5m_conf, ...}}
+        self._last_kalshi_eval = 0          # timestamp of last eval
+        self._kalshi_cached_dataframes = {}  # {symbol: DataFrame} cached 15m data with indicators for CONFIRMED re-scoring
 
     # ------------------------------------------------------------------
     # Position sync from exchanges
@@ -558,293 +566,493 @@ class LiveDaemon:
         except Exception as e:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
-    def _kalshi_cycle(self):
-        """Run Kalshi predictions for BTC/ETH/SOL/XRP/BNB and optionally place bets."""
-        # Prune expired bets (Kalshi 15m contracts settle in 15 minutes)
-        now = time.time()
+    def _kalshi_eval(self):
+        """Kalshi evaluation cycle with 15m scoring + fresh leading indicators at each eval.
+
+        Lifecycle within each 15m window:
+        - SETUP (min 0-4): Score on 15m candles + leading indicators. Cache 15m data. No betting.
+        - CONFIRMED (min 5-9): Re-fetch OB + trade flow. Re-score on cached 15m data.
+        - DOUBLE_CONFIRMED (min 10-11): Same as CONFIRMED — refresh leading indicators, re-score.
+        - LAST_LOOK (min 12): 1m momentum check with elevated threshold.
+        - EXPIRED (min 13+): No new bets.
+        """
+        from data.market_data import get_order_book_imbalance, get_trade_flow
+
+        now_utc = datetime.now(timezone.utc)
+        minute_in_window = now_utc.minute % 15
+
+        # Compute current window start (round down to :00/:15/:30/:45)
+        window_minute = now_utc.minute - minute_in_window
+        current_window_start = now_utc.replace(minute=window_minute, second=0, microsecond=0)
+
+        # Prune expired bets
+        now_ts = time.time()
         self._active_kalshi_bets = {
             t: placed for t, placed in self._active_kalshi_bets.items()
-            if now - placed < 900  # 15 minutes
+            if now_ts - placed < 900
         }
-        if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
-            print(colored("  Kalshi: at max concurrent bets, skipping cycle", "yellow"))
+
+        if minute_in_window >= KALSHI_CUTOFF_MINUTES:
+            # Too close to settlement — show EXPIRED state
+            self.kalshi_predictions = [{
+                "symbol": sym, "asset": sym.split("/")[0],
+                "direction": "--", "confidence": 0,
+                "reason": "expired — too close to settlement",
+                "ob": 0, "flow": 0, "state": "EXPIRED",
+            } for sym in self.KALSHI_PAIRS]
             return
 
         predictions = []
-        valid_signals = []
+        actionable_signals = []
+
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
-            # Kalshi pairs may not be in our Coinbase trading set — fetch independently
-            df = self._dataframes.get(symbol)
-            if df is None or len(df) < 20:
-                try:
-                    df = self._fetch_pair(symbol)
-                    if df is not None:
-                        self._dataframes[symbol] = df
-                except Exception:
-                    pass
-            if df is None or len(df) < 20:
+            asset = symbol.split("/")[0]
+
+            # Check if pending signal belongs to current window
+            pending = self._kalshi_pending_signals.get(asset)
+            if pending and pending.get("window_start") != current_window_start:
+                # New window — clear old signal and cached data
+                self._kalshi_pending_signals.pop(asset, None)
+                self._kalshi_cached_dataframes.pop(symbol, None)
+                pending = None
+
+            # Skip if already bet this window
+            if pending and pending.get("bet_placed"):
                 predictions.append({
-                    "symbol": symbol, "asset": symbol.split("/")[0],
-                    "direction": "--", "confidence": 0,
-                    "reason": "no data", "ob": 0, "flow": 0,
+                    "symbol": symbol, "asset": asset,
+                    "direction": pending["direction"],
+                    "confidence": pending.get("last_5m_conf", pending["base_conf"]),
+                    "reason": "already bet this window",
+                    "ob": 0, "flow": 0, "state": "BET_PLACED",
                 })
                 continue
 
-            # Get leading indicator data for enhanced prediction
-            market_data = None
+            # Determine lifecycle state
+            if minute_in_window <= 4:
+                state = "SETUP"
+            elif minute_in_window <= 9:
+                state = "CONFIRMED"
+            elif minute_in_window <= 11:
+                state = "DOUBLE_CONFIRMED"
+            elif minute_in_window == KALSHI_LASTLOOK_MINUTE:
+                state = "LAST_LOOK"
+            else:
+                state = "EXPIRED"
+
+            # --- LAST_LOOK: use cached 5m scores + 1m momentum ---
+            if state == "LAST_LOOK":
+                if not pending or not pending.get("confirmed"):
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": pending["direction"] if pending else "--",
+                        "confidence": pending.get("last_5m_conf", 0) if pending else 0,
+                        "reason": "last-look: no prior confirmation",
+                        "ob": 0, "flow": 0, "state": state,
+                    })
+                    continue
+
+                last_conf = pending.get("last_5m_conf", 0)
+                asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, self.kalshi_threshold)
+                elevated = asset_threshold + KALSHI_THRESHOLD_BOOST
+
+                if last_conf < elevated:
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": pending["direction"],
+                        "confidence": last_conf,
+                        "reason": f"last-look: conf {last_conf} < elevated threshold {elevated}",
+                        "ob": 0, "flow": 0, "state": state,
+                    })
+                    continue
+
+                # Fetch 1m candles for momentum check
+                try:
+                    df_1m = self.fetcher.ohlcv(symbol, "1m", limit=5)
+                except Exception:
+                    df_1m = None
+
+                if df_1m is not None and self.kalshi_predictor.check_1m_momentum(df_1m, pending["direction"]):
+                    # Momentum confirmed — actionable
+                    from strategy.strategies.kalshi_predictor import KalshiSignal
+                    # Use last known price from cached 15m data
+                    cached_15m = self._kalshi_cached_dataframes.get(symbol)
+                    last_price = float(cached_15m.iloc[-1]["close"]) if cached_15m is not None and len(cached_15m) > 0 else 0
+                    fake_signal = KalshiSignal(
+                        asset=asset, direction=pending["direction"],
+                        confidence=last_conf, components={},
+                        price=last_price, rsi=0,
+                    )
+                    actionable_signals.append({
+                        "symbol": symbol, "series_ticker": series_ticker,
+                        "signal": fake_signal, "market_data": None,
+                        "state": state,
+                    })
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": pending["direction"],
+                        "confidence": last_conf,
+                        "reason": "last-look: 1m momentum confirmed, taking bet",
+                        "ob": 0, "flow": 0, "state": state,
+                    })
+                else:
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": pending["direction"],
+                        "confidence": last_conf,
+                        "reason": "last-look: 1m momentum NOT confirmed",
+                        "ob": 0, "flow": 0, "state": state,
+                    })
+                continue
+
+            # --- SETUP: 15m base scoring ---
+            if state == "SETUP":
+                # Fetch 15m candles for base scoring
+                df_15m = None
+                try:
+                    df_15m = self.fetcher.ohlcv(symbol, "15m", limit=200)
+                    if df_15m is not None and not df_15m.empty:
+                        df_15m = add_indicators(df_15m)
+                except Exception:
+                    df_15m = None
+
+                if df_15m is None or len(df_15m) < 50:
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": "--", "confidence": 0,
+                        "reason": "no 15m data", "ob": 0, "flow": 0, "state": state,
+                    })
+                    continue
+
+                # Fetch 1h data for MTF
+                df_1h = None
+                try:
+                    df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
+                    if df_1h is not None and not df_1h.empty:
+                        df_1h = add_indicators(df_1h)
+                except Exception:
+                    pass
+
+                # Fetch leading indicators
+                market_data = None
+                try:
+                    ob = get_order_book_imbalance(symbol)
+                    tf = get_trade_flow(symbol, limit=100)
+                    market_data = {"order_book": ob, "trade_flow": tf}
+                except Exception:
+                    pass
+
+                # Score on 15m data
+                signal = self.kalshi_predictor.score(df_15m, market_data=market_data, df_1h=df_1h)
+
+                ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
+                net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
+
+                # Cache 15m data with indicators for CONFIRMED re-scoring
+                self._kalshi_cached_dataframes[symbol] = df_15m
+
+                # Store direction + confidence, no betting
+                if signal is not None and asset not in self._kalshi_pending_signals:
+                    self._kalshi_pending_signals[asset] = {
+                        "direction": signal.direction,
+                        "base_conf": signal.confidence,
+                        "last_5m_conf": signal.confidence,
+                        "setup_time": now_utc,
+                        "confirmed": False,
+                        "bet_placed": False,
+                        "window_start": current_window_start,
+                    }
+                predictions.append({
+                    "symbol": symbol, "asset": asset,
+                    "direction": signal.direction if signal else "--",
+                    "confidence": signal.confidence if signal else 0,
+                    "reason": "setup — waiting for confirmation (leading indicators will refresh)",
+                    "ob": ob_imb, "flow": net_flow, "state": state,
+                })
+
+            # --- CONFIRMED / DOUBLE_CONFIRMED: re-score 15m with fresh leading indicators ---
+            elif state in ("CONFIRMED", "DOUBLE_CONFIRMED"):
+                if not pending:
+                    # No SETUP signal — nothing to re-score
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": "--", "confidence": 0,
+                        "reason": f"{state.lower()}: no SETUP signal",
+                        "ob": 0, "flow": 0, "state": state,
+                    })
+                    continue
+
+                # Re-fetch leading indicators (order book + trade flow shift every minute)
+                market_data = None
+                try:
+                    ob = get_order_book_imbalance(symbol)
+                    tf = get_trade_flow(symbol, limit=100)
+                    market_data = {"order_book": ob, "trade_flow": tf}
+                except Exception:
+                    pass
+
+                # Re-score on cached 15m data with fresh leading indicators
+                df_15m = self._kalshi_cached_dataframes.get(symbol)
+                if df_15m is None or len(df_15m) < 50:
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": pending["direction"] if pending else "--",
+                        "confidence": 0,
+                        "reason": f"{state.lower()}: no cached 15m data",
+                        "ob": 0, "flow": 0, "state": state,
+                    })
+                    continue
+
+                # Fetch 1h MTF data
+                df_1h = None
+                try:
+                    df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
+                    if df_1h is not None and not df_1h.empty:
+                        df_1h = add_indicators(df_1h)
+                except Exception:
+                    pass
+
+                signal = self.kalshi_predictor.score(df_15m, market_data=market_data, df_1h=df_1h)
+
+                ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
+                net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
+
+                if signal is None:
+                    # Signal disappeared with new leading data — skip, signal survives for next eval
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": pending["direction"] if pending else "--",
+                        "confidence": 0,
+                        "reason": f"{state.lower()}: score returned None with fresh OB/flow, signal survives",
+                        "ob": ob_imb, "flow": net_flow, "state": state,
+                    })
+                    continue
+
+                # Update pending with fresh confidence
+                pending["last_5m_conf"] = signal.confidence
+                pending["confirmed"] = True
+
+                asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, self.kalshi_threshold)
+                if signal.confidence >= asset_threshold:
+                    # Actionable!
+                    actionable_signals.append({
+                        "symbol": symbol, "series_ticker": series_ticker,
+                        "signal": signal, "market_data": market_data,
+                        "state": state,
+                    })
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": signal.direction,
+                        "confidence": signal.confidence,
+                        "reason": f"{state.lower()}: conf {signal.confidence} >= {asset_threshold} (fresh OB/flow)",
+                        "ob": ob_imb, "flow": net_flow, "state": state,
+                    })
+                else:
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": signal.direction,
+                        "confidence": signal.confidence,
+                        "reason": f"{state.lower()}: conf {signal.confidence} < {asset_threshold}",
+                        "ob": ob_imb, "flow": net_flow, "state": state,
+                    })
+
+        # Execute top actionable signals by confidence
+        actionable_signals.sort(key=lambda x: x["signal"].confidence, reverse=True)
+        for vs in actionable_signals:
+            if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
+                break
+            pred = self._kalshi_execute_bet(
+                vs["symbol"], vs["series_ticker"], vs["signal"], vs["market_data"]
+            )
+            # Mark bet as placed in pending signals
+            asset = vs["symbol"].split("/")[0]
+            if asset in self._kalshi_pending_signals:
+                self._kalshi_pending_signals[asset]["bet_placed"] = True
+
+        self.kalshi_predictions = predictions
+
+    def _kalshi_execute_bet(self, symbol: str, series_ticker: str, signal, market_data: dict | None) -> dict:
+        """Execute a single Kalshi bet. Returns a pred dict with outcome details.
+
+        Handles: balance check, market discovery, orderbook pricing,
+        order placement, fill verification, active bet tracking.
+        """
+        asset = symbol.split("/")[0]
+        ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
+        net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
+
+        pred = {
+            "symbol": symbol, "asset": asset,
+            "direction": signal.direction, "confidence": signal.confidence,
+            "ob": ob_imb, "flow": net_flow, "reason": "",
+        }
+
+        MAX_ENTRY_CENTS = 50
+        RISK_PER_BET_PCT = 0.05
+
+        side = "yes" if signal.direction == "UP" else "no"
+        pred["reason"] = f"would bet {side.upper()} (conf={signal.confidence})"
+
+        if self.dry_run:
+            print(colored(
+                f"  [KALSHI DRY] {asset} {signal.direction} "
+                f"conf={signal.confidence} | "
+                f"OB={ob_imb:+.2f} flow={net_flow:+.2f} | "
+                f"bet {side.upper()} (hold to settlement)",
+                "magenta",
+            ))
+            return pred
+
+        # Live: place the bet
+        self._init_kalshi_client()
+        if self.kalshi_client is None:
+            pred["reason"] = "client init failed"
+            return pred
+        try:
+            # Kalshi is source of truth for balance
+            balance_resp = self.kalshi_client.get_balance()
+            balance_cents = balance_resp.get("balance", 0)
+            risk_budget_cents = max(500, int(balance_cents * RISK_PER_BET_PCT))
+
+            # Find the next 15-min market for this series
+            events = self.kalshi_client._get("/trade-api/v2/events", {
+                "series_ticker": series_ticker, "status": "open",
+                "limit": 3, "with_nested_markets": "true",
+            })
+            all_markets = []
+            for evt in events.get("events", []):
+                all_markets.extend(evt.get("markets", []))
+            if not all_markets:
+                pred["reason"] = f"no {series_ticker} markets found"
+                print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
+                return pred
+
+            # Pick the soonest-expiring open market
+            market = all_markets[0]
+            ticker = market.get("ticker", "")
+
+            # Optimal entry: query orderbook for bid-ask spread
+            # Tight spread → bid at ask (instant fill)
+            # Wide spread → bid at midpoint+1c (better price, likely fills)
+            best_bid = None
+            best_ask = None
             try:
-                from data.market_data import get_order_book_imbalance, get_trade_flow
-                ob = get_order_book_imbalance(symbol)
-                tf = get_trade_flow(symbol, limit=100)
-                market_data = {"order_book": ob, "trade_flow": tf}
+                book = self.kalshi_client.get_orderbook(ticker)
+                ob = book.get("orderbook", {})
+                our_side = "yes" if side == "yes" else "no"
+                asks = ob.get(our_side, [])
+                # Orderbook format: [[price, qty], ...]
+                # For YES side: asks are offers to sell YES contracts
+                if asks and len(asks) > 0:
+                    best_ask = asks[0][0] if isinstance(asks[0], list) else asks[0]
+                # Get the bid side too for spread calculation
+                other_side = "no" if side == "yes" else "yes"
+                bids = ob.get(other_side, [])
+                if bids and len(bids) > 0:
+                    other_best = bids[0][0] if isinstance(bids[0], list) else bids[0]
+                    best_bid = 100 - other_best  # complement
             except Exception:
                 pass
 
-            # Fetch 1h data for multi-timeframe confirmation
-            df_1h = None
-            try:
-                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
-                if df_1h is not None and not df_1h.empty:
-                    from data.indicators import add_indicators
-                    df_1h = add_indicators(df_1h)
-            except Exception as e:
-                print(colored(f"  Warning: 1h data fetch failed for {symbol}: {e}", "yellow"))
+            # Fall back to market data if orderbook failed
+            if best_ask is None:
+                if side == "yes":
+                    best_ask = market.get("yes_ask") or 50
+                else:
+                    best_ask = market.get("no_ask") or 50
 
-            signal = self.kalshi_predictor.score(df, market_data=market_data, df_1h=df_1h)
-            if signal is None:
-                predictions.append({
-                    "symbol": symbol, "asset": symbol.split("/")[0],
-                    "direction": "--", "confidence": 0,
-                    "reason": "neutral", "ob": 0, "flow": 0,
-                })
-                continue
+            best_ask = int(best_ask) if best_ask else 50
 
-            ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
-            net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
-
-            pred = {
-                "symbol": symbol,
-                "asset": symbol.split("/")[0],
-                "direction": signal.direction,
-                "confidence": signal.confidence,
-                "ob": ob_imb,
-                "flow": net_flow,
-                "reason": "",
-            }
-
-            asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, self.kalshi_threshold)
-            if signal.confidence < asset_threshold:
-                pred["reason"] = f"below threshold ({asset_threshold})"
-                predictions.append(pred)
-                continue
-
-            # Signal cleared threshold — collect for confidence-ranked execution
-            valid_signals.append({
-                "symbol": symbol,
-                "series_ticker": series_ticker,
-                "signal": signal,
-                "market_data": market_data,
-                "pred": pred,
-            })
-
-        # Sort by confidence descending — highest conviction bets get priority
-        valid_signals.sort(key=lambda x: x["signal"].confidence, reverse=True)
-
-        # Execute top signals up to concurrency limit
-        for vs in valid_signals:
-            symbol = vs["symbol"]
-            series_ticker = vs["series_ticker"]
-            signal = vs["signal"]
-            market_data = vs["market_data"]
-            pred = vs["pred"]
-
-            ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
-            net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
-
-            if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
-                pred["reason"] = "at max concurrent bets (lower confidence skipped)"
-                predictions.append(pred)
-                continue
-
-            # Determine bet side
-            # We hold to settlement — entry price IS our risk per contract
-            # Payout: $1 if right, $0 if wrong
-            # Goal: buy below 50c for positive expected value
-            # MAX_ENTRY: never pay more than this (caps risk/reward)
-            MAX_ENTRY_CENTS = 50  # above 50c the R:R is against us
-            # RISK_PER_BET: max dollars to risk on a single bet
-            RISK_PER_BET_PCT = 0.05  # 5% of Kalshi balance
-
-            side = "yes" if signal.direction == "UP" else "no"
-            pred["reason"] = f"would bet {side.upper()} (conf={signal.confidence})"
-
-            if self.dry_run:
-                print(colored(
-                    f"  [KALSHI DRY] {pred['asset']} {signal.direction} "
-                    f"conf={signal.confidence} | "
-                    f"OB={ob_imb:+.2f} flow={net_flow:+.2f} | "
-                    f"bet {side.upper()} (hold to settlement)",
-                    "magenta",
-                ))
+            # Calculate optimal bid
+            if best_bid is not None:
+                best_bid = int(best_bid)
+                spread = best_ask - best_bid
+                if spread <= 3:
+                    # Tight spread — bid at ask for instant fill
+                    fill_price = best_ask
+                elif spread <= 10:
+                    # Moderate spread — bid at midpoint + 1c
+                    fill_price = (best_bid + best_ask) // 2 + 1
+                else:
+                    # Wide spread — bid 30% above mid (aggressive but not at ask)
+                    mid = (best_bid + best_ask) // 2
+                    fill_price = mid + max(1, spread // 3)
             else:
-                # Live: place the bet
-                self._init_kalshi_client()
-                if self.kalshi_client is None:
-                    pred["reason"] = "client init failed"
-                    predictions.append(pred)
-                    continue
+                # No bid info — bid at ask
+                fill_price = best_ask
+
+            fill_price = max(1, min(99, int(fill_price)))
+
+            # NEVER pay above 50c — above that the R:R is against us
+            if fill_price > MAX_ENTRY_CENTS:
+                pred["reason"] = f"price {fill_price}c > max {MAX_ENTRY_CENTS}c — R:R unfavorable"
+                print(colored(
+                    f"  [KALSHI SKIP] {asset} {side.upper()} @ {fill_price}c "
+                    f"— above {MAX_ENTRY_CENTS}c cap (R:R < 1:1)",
+                    "yellow"))
+                return pred
+
+            # Position size from risk budget: count = max_loss / entry_price
+            # entry_price IS the max loss per contract (we hold to settlement)
+            count = max(1, risk_budget_cents // fill_price)
+            potential_profit = count * (100 - fill_price)
+            potential_loss = count * fill_price
+            rr_ratio = potential_profit / potential_loss if potential_loss > 0 else 0
+
+            # Verify against actual Kalshi balance (exchange is source of truth)
+            cost_cents = count * fill_price
+            if cost_cents > balance_cents:
+                count = max(1, balance_cents // fill_price)
+                if count < 1:
+                    pred["reason"] = f"insufficient Kalshi balance (${balance_cents/100:.2f})"
+                    return pred
+                cost_cents = count * fill_price
+                potential_profit = count * (100 - fill_price)
+                rr_ratio = potential_profit / cost_cents if cost_cents > 0 else 0
+
+            result = self.kalshi_client.place_order(
+                ticker=ticker,
+                side=side,
+                count=count,
+                price_cents=fill_price,
+                order_type="limit",
+            )
+            order = result.get("order", {})
+            order_id = order.get("order_id", "?")
+            fill_count = order.get("fill_count_fp", "0")
+            order_status = order.get("status", "?")
+
+            # Verify fill via Kalshi (exchange is source of truth)
+            if float(fill_count) < count and order_status == "resting":
+                # Partially filled or resting — check positions
+                import time as _t
+                _t.sleep(1)
                 try:
-                    # Kalshi is source of truth for balance
-                    balance_resp = self.kalshi_client.get_balance()
-                    balance_cents = balance_resp.get("balance", 0)
-                    risk_budget_cents = max(500, int(balance_cents * RISK_PER_BET_PCT))
+                    positions = self.kalshi_client.get_positions()
+                    for p in positions:
+                        if p.get("ticker") == ticker and p.get("position", 0) > 0:
+                            fill_count = str(p["position"])
+                            break
+                except Exception:
+                    pass
 
-                    # Find the next 15-min market for this series
-                    events = self.kalshi_client._get("/trade-api/v2/events", {
-                        "series_ticker": series_ticker, "status": "open",
-                        "limit": 3, "with_nested_markets": "true",
-                    })
-                    all_markets = []
-                    for evt in events.get("events", []):
-                        all_markets.extend(evt.get("markets", []))
-                    if not all_markets:
-                        pred["reason"] = f"no {series_ticker} markets found"
-                        print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
-                        predictions.append(pred)
-                        continue
+            pred["reason"] = (
+                f"placed {side.upper()} x{count} @ {fill_price}c "
+                f"risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
+                f"filled={fill_count} status={order_status} (#{order_id})"
+            )
+            print(colored(
+                f"  [KALSHI BET] {asset} {signal.direction} "
+                f"conf={signal.confidence} | {side.upper()} x{count} @ {fill_price}c "
+                f"| risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
+                f"| filled={fill_count} status={order_status}",
+                "magenta",
+            ))
+            self._active_kalshi_bets[ticker] = time.time()
+        except Exception as e:
+            pred["reason"] = f"order failed: {e}"
+            print(colored(f"  [KALSHI ERR] {asset}: {e}", "red"))
 
-                    # Pick the soonest-expiring open market
-                    market = all_markets[0]
-                    ticker = market.get("ticker", "")
-
-                    # Optimal entry: query orderbook for bid-ask spread
-                    # Tight spread → bid at ask (instant fill)
-                    # Wide spread → bid at midpoint+1c (better price, likely fills)
-                    best_bid = None
-                    best_ask = None
-                    try:
-                        book = self.kalshi_client.get_orderbook(ticker)
-                        ob = book.get("orderbook", {})
-                        our_side = "yes" if side == "yes" else "no"
-                        asks = ob.get(our_side, [])
-                        # Orderbook format: [[price, qty], ...]
-                        # For YES side: asks are offers to sell YES contracts
-                        if asks and len(asks) > 0:
-                            best_ask = asks[0][0] if isinstance(asks[0], list) else asks[0]
-                        # Get the bid side too for spread calculation
-                        other_side = "no" if side == "yes" else "yes"
-                        bids = ob.get(other_side, [])
-                        if bids and len(bids) > 0:
-                            other_best = bids[0][0] if isinstance(bids[0], list) else bids[0]
-                            best_bid = 100 - other_best  # complement
-                    except Exception:
-                        pass
-
-                    # Fall back to market data if orderbook failed
-                    if best_ask is None:
-                        if side == "yes":
-                            best_ask = market.get("yes_ask") or 50
-                        else:
-                            best_ask = market.get("no_ask") or 50
-
-                    best_ask = int(best_ask) if best_ask else 50
-
-                    # Calculate optimal bid
-                    if best_bid is not None:
-                        best_bid = int(best_bid)
-                        spread = best_ask - best_bid
-                        if spread <= 3:
-                            # Tight spread — bid at ask for instant fill
-                            fill_price = best_ask
-                        elif spread <= 10:
-                            # Moderate spread — bid at midpoint + 1c
-                            fill_price = (best_bid + best_ask) // 2 + 1
-                        else:
-                            # Wide spread — bid 30% above mid (aggressive but not at ask)
-                            mid = (best_bid + best_ask) // 2
-                            fill_price = mid + max(1, spread // 3)
-                    else:
-                        # No bid info — bid at ask
-                        fill_price = best_ask
-
-                    fill_price = max(1, min(99, int(fill_price)))
-
-                    # NEVER pay above 50c — above that the R:R is against us
-                    if fill_price > MAX_ENTRY_CENTS:
-                        pred["reason"] = f"price {fill_price}c > max {MAX_ENTRY_CENTS}c — R:R unfavorable"
-                        print(colored(
-                            f"  [KALSHI SKIP] {pred['asset']} {side.upper()} @ {fill_price}c "
-                            f"— above {MAX_ENTRY_CENTS}c cap (R:R < 1:1)",
-                            "yellow"))
-                        predictions.append(pred)
-                        continue
-
-                    # Position size from risk budget: count = max_loss / entry_price
-                    # entry_price IS the max loss per contract (we hold to settlement)
-                    count = max(1, risk_budget_cents // fill_price)
-                    potential_profit = count * (100 - fill_price)
-                    potential_loss = count * fill_price
-                    rr_ratio = potential_profit / potential_loss if potential_loss > 0 else 0
-
-                    # Verify against actual Kalshi balance (exchange is source of truth)
-                    cost_cents = count * fill_price
-                    if cost_cents > balance_cents:
-                        count = max(1, balance_cents // fill_price)
-                        if count < 1:
-                            pred["reason"] = f"insufficient Kalshi balance (${balance_cents/100:.2f})"
-                            predictions.append(pred)
-                            continue
-                        cost_cents = count * fill_price
-                        potential_profit = count * (100 - fill_price)
-                        rr_ratio = potential_profit / cost_cents if cost_cents > 0 else 0
-
-                    result = self.kalshi_client.place_order(
-                        ticker=ticker,
-                        side=side,
-                        count=count,
-                        price_cents=fill_price,
-                        order_type="limit",
-                    )
-                    order = result.get("order", {})
-                    order_id = order.get("order_id", "?")
-                    fill_count = order.get("fill_count_fp", "0")
-                    order_status = order.get("status", "?")
-
-                    # Verify fill via Kalshi (exchange is source of truth)
-                    if float(fill_count) < count and order_status == "resting":
-                        # Partially filled or resting — check positions
-                        import time as _t
-                        _t.sleep(1)
-                        try:
-                            positions = self.kalshi_client.get_positions()
-                            for p in positions:
-                                if p.get("ticker") == ticker and p.get("position", 0) > 0:
-                                    fill_count = str(p["position"])
-                                    break
-                        except Exception:
-                            pass
-
-                    pred["reason"] = (
-                        f"placed {side.upper()} x{count} @ {fill_price}c "
-                        f"risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
-                        f"filled={fill_count} status={order_status} (#{order_id})"
-                    )
-                    print(colored(
-                        f"  [KALSHI BET] {pred['asset']} {signal.direction} "
-                        f"conf={signal.confidence} | {side.upper()} x{count} @ {fill_price}c "
-                        f"| risk=${cost_cents/100:.2f} profit=${potential_profit/100:.2f} R:R={rr_ratio:.1f}:1 "
-                        f"| filled={fill_count} status={order_status}",
-                        "magenta",
-                    ))
-                    self._active_kalshi_bets[ticker] = time.time()
-                except Exception as e:
-                    pred["reason"] = f"order failed: {e}"
-                    print(colored(f"  [KALSHI ERR] {pred['asset']}: {e}", "red"))
-
-            predictions.append(pred)
-
-        self.kalshi_predictions = predictions
-        return predictions
+        return pred
 
     # ------------------------------------------------------------------
     # Execution
@@ -1464,12 +1672,6 @@ class LiveDaemon:
         else:
             print("[CYCLE] Kalshi-only mode — skipping spot signals")
 
-        # Kalshi prediction cycle
-        try:
-            self._kalshi_cycle()
-        except Exception as e:
-            print(colored(f"  [KALSHI ERR] cycle failed: {e}", "yellow"))
-
         self._update_equity()
         self._reconcile_positions()
         self._save_snapshot(signals)
@@ -1500,6 +1702,13 @@ class LiveDaemon:
         # Run initial signal cycle immediately
         self.signal_cycle()
 
+        # Run initial Kalshi eval immediately
+        try:
+            self._kalshi_eval()
+            self._last_kalshi_eval = time.time()
+        except Exception as e:
+            print(colored(f"  [KALSHI EVAL ERR] startup eval: {e}", "red"))
+
         last_signal_time = time.time()
 
         while self._running:
@@ -1514,6 +1723,17 @@ class LiveDaemon:
                 if now - last_signal_time >= SIGNAL_INTERVAL:
                     self.signal_cycle()
                     last_signal_time = now
+
+                # Wall-clock aligned Kalshi eval at :01, :06, :11 + LAST_LOOK at :12/:27/:42/:57
+                current_minute = datetime.now(timezone.utc).minute
+                should_eval = (current_minute % 5 == 1 and now - self._last_kalshi_eval >= 240) \
+                           or (current_minute % 15 == 12 and now - self._last_kalshi_eval >= 50)
+                if should_eval:
+                    try:
+                        self._kalshi_eval()
+                    except Exception as e:
+                        print(colored(f"  [KALSHI EVAL ERR] {e}", "red"))
+                    self._last_kalshi_eval = now
 
             except KeyboardInterrupt:
                 break
