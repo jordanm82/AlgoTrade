@@ -5,7 +5,9 @@ from kalshi_mm.mm_config import SPREAD_MIN_CENTS, SPREAD_MAX_CENTS, VPIN_SAFE, V
 
 def compute_mid_cents(orderbook: dict) -> int | None:
     """Compute mid price in cents from Kalshi orderbook.
+
     Kalshi returns yes_dollars and no_dollars as [[price_str, count_str], ...].
+    Sorted lowest-first, so best (highest) bid is the LAST element.
     Only bids are shown. YES ask = 100 - best NO bid.
     """
     ob = orderbook.get("orderbook_fp", orderbook)
@@ -15,8 +17,9 @@ def compute_mid_cents(orderbook: dict) -> int | None:
     if not yes_bids or not no_bids:
         return None
 
-    best_yes_bid = round(float(yes_bids[0][0]) * 100)
-    best_no_bid = round(float(no_bids[0][0]) * 100)
+    # Best bid = highest price = last element (sorted ascending)
+    best_yes_bid = round(float(yes_bids[-1][0]) * 100)
+    best_no_bid = round(float(no_bids[-1][0]) * 100)
     implied_yes_ask = 100 - best_no_bid
 
     mid = (best_yes_bid + implied_yes_ask) // 2

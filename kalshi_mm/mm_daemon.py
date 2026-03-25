@@ -574,7 +574,7 @@ class MMAssetRunner:
             ob_inner = ob.get("orderbook_fp", ob)
             no_bids = ob_inner.get("no_dollars", [])
             if no_bids:
-                best_no_bid = round(float(no_bids[0][0]) * 100)
+                best_no_bid = round(float(no_bids[-1][0]) * 100)  # highest no bid = last (ascending sort)
                 yes_ask = 100 - best_no_bid
                 if yes_ask <= self.inv.bid_price_cents:
                     contracts = compute_contracts(
@@ -629,7 +629,7 @@ class MMAssetRunner:
             ob_inner = ob.get("orderbook_fp", ob)
             yes_bids = ob_inner.get("yes_dollars", [])
             if yes_bids:
-                best_yes_bid = round(float(yes_bids[0][0]) * 100)
+                best_yes_bid = round(float(yes_bids[-1][0]) * 100)  # highest yes bid = last (ascending sort)
                 if best_yes_bid >= self.inv.ask_price_cents:
                     rt = self.inv.record_sell_fill(self.inv.ask_price_cents)
                     self._log_trade(

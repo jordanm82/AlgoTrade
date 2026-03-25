@@ -34,6 +34,16 @@ class TestComputeMidCents:
         ob = {"orderbook_fp": {"yes_dollars": [["0.5700", "10"]], "no_dollars": [["0.4300", "10"]]}}
         assert compute_mid_cents(ob) == 57
 
+    def test_multi_level_book_uses_best_bid(self):
+        """Kalshi sorts ascending — best (highest) bid is last element."""
+        from kalshi_mm.mm_strategy import compute_mid_cents
+        ob = {"orderbook_fp": {
+            "yes_dollars": [["0.0100", "100"], ["0.5000", "50"], ["0.9200", "25"]],
+            "no_dollars": [["0.0100", "200"], ["0.0300", "100"], ["0.0600", "50"]],
+        }}
+        # best_yes_bid=92, best_no_bid=6, yes_ask=100-6=94, mid=(92+94)//2=93
+        assert compute_mid_cents(ob) == 93
+
 
 class TestComputeSpreadCents:
     def test_safe_vpin(self):
