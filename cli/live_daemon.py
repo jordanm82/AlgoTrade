@@ -24,6 +24,7 @@ from config.pair_config import (
 )
 from config.production import (
     MAX_CONCURRENT_POSITIONS,
+    MAX_CONCURRENT_KALSHI_BETS,
     POSITION_SIZE_PCT,
     STOP_LOSS_PCT,
 )
@@ -94,6 +95,7 @@ class LiveDaemon:
         self.kalshi_client = None  # lazy init
         self.kalshi_threshold = 30  # minimum confidence to bet (lowered from 40 — conf 25-35 with flow confirmation is the sweet spot)
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
+        self._active_kalshi_bets = {}  # {ticker: placement_time}
 
     # ------------------------------------------------------------------
     # Position sync from exchanges
@@ -524,6 +526,7 @@ class LiveDaemon:
         "ETH/USDT": "KXETH15M",
         "SOL/USDT": "KXSOL15M",
         "XRP/USDT": "KXXRP15M",
+        "DOGE/USDT": "KXDOGE15M",
     }
 
     def _init_kalshi_client(self):
@@ -543,7 +546,17 @@ class LiveDaemon:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
     def _kalshi_cycle(self):
-        """Run Kalshi predictions for BTC/ETH/SOL/XRP and optionally place bets."""
+        """Run Kalshi predictions for BTC/ETH/SOL/XRP/DOGE and optionally place bets."""
+        # Prune expired bets (Kalshi 15m contracts settle in 15 minutes)
+        now = time.time()
+        self._active_kalshi_bets = {
+            t: placed for t, placed in self._active_kalshi_bets.items()
+            if now - placed < 900  # 15 minutes
+        }
+        if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
+            print(colored("  Kalshi: at max concurrent bets, skipping cycle", "yellow"))
+            return
+
         predictions = []
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
             # Kalshi pairs may not be in our Coinbase trading set — fetch independently
@@ -573,7 +586,17 @@ class LiveDaemon:
             except Exception:
                 pass
 
-            signal = self.kalshi_predictor.score(df, market_data=market_data)
+            # Fetch 1h data for multi-timeframe confirmation
+            df_1h = None
+            try:
+                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
+                if df_1h is not None and not df_1h.empty:
+                    from data.indicators import add_indicators
+                    df_1h = add_indicators(df_1h)
+            except Exception as e:
+                print(colored(f"  Warning: 1h data fetch failed for {symbol}: {e}", "yellow"))
+
+            signal = self.kalshi_predictor.score(df, market_data=market_data, df_1h=df_1h)
             if signal is None:
                 predictions.append({
                     "symbol": symbol, "asset": symbol.split("/")[0],
@@ -770,6 +793,7 @@ class LiveDaemon:
                         f"| filled={fill_count} status={order_status}",
                         "magenta",
                     ))
+                    self._active_kalshi_bets[ticker] = time.time()
                 except Exception as e:
                     pred["reason"] = f"order failed: {e}"
                     print(colored(f"  [KALSHI ERR] {pred['asset']}: {e}", "red"))
