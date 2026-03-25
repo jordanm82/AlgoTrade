@@ -43,6 +43,9 @@ MAX_EXIT_LOSS_CENTS = 5
 # Re-quote
 REQUOTE_DRIFT_CENTS = 1
 
+# Contract price volatility — go dark if mid moves more than this between polls
+MID_MOVE_DARK_CENTS = 3
+
 # States
 IDLE = "IDLE"
 DISCOVERING = "DISCOVERING"

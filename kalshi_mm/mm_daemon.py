@@ -70,6 +70,9 @@ class MMAssetRunner:
         self._prev_yes_bids: dict[int, int] = {}  # {price_cents: volume}
         self._prev_no_bids: dict[int, int] = {}   # {price_cents: volume}
 
+        # Contract mid price tracking — detect rapid repricing
+        self._prev_mid: int = 0
+
         # Discovery timing
         self._last_discovery_ts: float = 0.0
 
@@ -175,6 +178,10 @@ class MMAssetRunner:
         self._prev_yes_bids = parse_ob_as_dict(yes_bids)
         self._prev_no_bids = parse_ob_as_dict(no_bids)
 
+        # Initialize mid for contract price volatility detection
+        initial_mid = compute_mid_cents(ob)
+        self._prev_mid = initial_mid or 0
+
         self.inv.state = QUOTING_BID
         self.status_msg = f"DISCOVERING -> QUOTING_BID ({ticker})"
 
@@ -222,6 +229,19 @@ class MMAssetRunner:
         if mid is None:
             self.status_msg = "QUOTING_BID: no mid price"
             return
+
+        # Contract price volatility check — go dark if mid moved too fast
+        from kalshi_mm.mm_config import MID_MOVE_DARK_CENTS
+        if self._prev_mid > 0 and abs(mid - self._prev_mid) >= MID_MOVE_DARK_CENTS:
+            self.status_msg = (
+                f"QUOTING_BID: mid jumped {self._prev_mid}->{mid}c "
+                f"({abs(mid - self._prev_mid)}c) -> DARK"
+            )
+            self._prev_mid = mid
+            self._cancel_pending_bid()
+            self.inv.state = DARK
+            return
+        self._prev_mid = mid
 
         bid = compute_bid_cents(mid, spread)
         if bid is None:
@@ -287,6 +307,27 @@ class MMAssetRunner:
             self._exit_from_kill_switch = True
             self.inv.state = EXITING
             return
+
+        # Contract price volatility check — exit if mid is crashing while we hold
+        ob_for_mid = self._get_orderbook(self.inv.market_ticker)
+        if ob_for_mid:
+            mid = compute_mid_cents(ob_for_mid)
+            if mid and self._prev_mid > 0 and abs(mid - self._prev_mid) >= MID_MOVE_DARK_CENTS:
+                self.status_msg = (
+                    f"QUOTING_ASK: mid jumped {self._prev_mid}->{mid}c -> EXITING"
+                )
+                self._prev_mid = mid
+                cancel_result = self._cancel_pending_ask()
+                if cancel_result and cancel_result.get("status") == "filled":
+                    self.inv.record_sell_fill(self.inv.ask_price_cents)
+                    self._log_trade("sell", self.inv.ask_price_cents, "ask-cancel-fill-mid-jump")
+                    self.inv.state = IDLE
+                    return
+                self._exit_from_kill_switch = True
+                self.inv.state = EXITING
+                return
+            if mid:
+                self._prev_mid = mid
 
         # Compute spread and ask
         spread = compute_spread_cents(self.vpin)
