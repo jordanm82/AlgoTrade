@@ -18,6 +18,7 @@ from config.production import MAX_CONCURRENT_KALSHI_BETS
 from config.settings import CDP_KEY_FILE, DATA_DIR
 from data.fetcher import DataFetcher
 from data.indicators import add_indicators
+from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3, KalshiV3Signal
 
 # Intervals in seconds
 TICK_INTERVAL = 60
@@ -72,7 +73,6 @@ class KalshiDaemon:
 
         # Kalshi predictor + client
         if predictor_version == "v3":
-            from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3
             self.kalshi_predictor = KalshiPredictorV3()
         elif predictor_version == "v2":
             from strategy.strategies.kalshi_predictor_v2 import KalshiPredictorV2
@@ -378,33 +378,31 @@ class KalshiDaemon:
                     })
                     continue
 
-                # Fetch 1m candles for momentum check
-                try:
-                    df_1m = self.fetcher.ohlcv(symbol, "1m", limit=5)
-                except Exception:
-                    df_1m = None
-
-                if df_1m is not None and self.kalshi_predictor.check_1m_momentum(df_1m, pending["direction"]):
-                    # Momentum confirmed — actionable
-                    from strategy.strategies.kalshi_predictor import KalshiSignal
-                    # Use last known price from cached 15m data
-                    cached_15m = self._kalshi_cached_dataframes.get(symbol)
-                    last_price = float(cached_15m.iloc[-1]["close"]) if cached_15m is not None and len(cached_15m) > 0 else 0
-                    fake_signal = KalshiSignal(
-                        asset=asset, direction=pending["direction"],
-                        confidence=last_conf, components={},
-                        price=last_price, rsi=0,
-                    )
-                    actionable_signals.append({
-                        "symbol": symbol, "series_ticker": series_ticker,
-                        "signal": fake_signal, "market_data": None,
-                        "state": state,
-                    })
+                # V3: re-run predict() at LAST_LOOK with updated time remaining
+                if self.kalshi_predictor_version == "v3":
+                    strike = pending.get("strike_price")
+                    close_time_dt = pending.get("close_time")
+                    if strike and close_time_dt:
+                        mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
+                        df_15m = self._kalshi_cached_dataframes.get(symbol)
+                        if df_15m is not None and len(df_15m) >= 50:
+                            cb_price = self._get_coinbase_price(symbol)
+                            signal = self.kalshi_predictor.predict(
+                                df_15m, strike_price=float(strike),
+                                minutes_remaining=mins_left,
+                                current_price=cb_price,
+                            )
+                            if signal and signal.recommended_side != "SKIP":
+                                actionable_signals.append({
+                                    "symbol": symbol, "series_ticker": series_ticker,
+                                    "signal": signal, "market_data": None,
+                                    "state": state,
+                                })
                     predictions.append({
                         "symbol": symbol, "asset": asset,
                         "direction": pending["direction"],
                         "confidence": last_conf,
-                        "reason": "last-look: 1m momentum confirmed, taking bet",
+                        "reason": "last-look: re-evaluated with updated time",
                         "ob": 0, "flow": 0, "state": state,
                     })
                 else:
@@ -412,7 +410,7 @@ class KalshiDaemon:
                         "symbol": symbol, "asset": asset,
                         "direction": pending["direction"],
                         "confidence": last_conf,
-                        "reason": "last-look: 1m momentum NOT confirmed",
+                        "reason": "last-look: no action",
                         "ob": 0, "flow": 0, "state": state,
                     })
                 continue
@@ -662,7 +660,7 @@ class KalshiDaemon:
 
                 # V3: check recommended_side; V1/V2: check confidence threshold
                 if self.kalshi_predictor_version == "v3":
-                    from strategy.strategies.kalshi_predictor_v3 import KalshiV3Signal
+
                     if isinstance(signal, KalshiV3Signal) and signal.recommended_side != "SKIP":
                         pending["confirmed"] = True
                         # Only bet at CONFIRMED (min 10+) or LAST_LOOK, not OBSERVING
@@ -753,7 +751,7 @@ class KalshiDaemon:
         net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
 
         # Detect V3 signal type and extract side/confidence accordingly
-        from strategy.strategies.kalshi_predictor_v3 import KalshiV3Signal, KalshiPredictorV3
+
         if isinstance(signal, KalshiV3Signal):
             direction_label = signal.recommended_side  # "YES" or "NO"
             side = "yes" if signal.recommended_side == "YES" else "no"
