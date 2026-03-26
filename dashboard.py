@@ -26,7 +26,8 @@ from config.pair_config import (
     ALL_PAIRS, COINBASE_MAP, PAIR_CONFIG, get_pair_config,
 )
 from config.production import (
-    MAX_CONCURRENT_POSITIONS, POSITION_SIZE_PCT, STOP_LOSS_PCT, MAX_LEVERAGE,
+    MAX_CONCURRENT_POSITIONS, MAX_CONCURRENT_KALSHI_BETS,
+    POSITION_SIZE_PCT, STOP_LOSS_PCT, MAX_LEVERAGE,
 )
 
 # Derive leverage pairs from per-pair config
