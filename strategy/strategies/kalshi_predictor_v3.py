@@ -96,21 +96,33 @@ class KalshiPredictorV3:
 
         if use_knn:
             # KNN predicts probability of next candle going UP
-            # This IS the base probability — no table lookup needed
+            # KNN already captures multi-timeframe context — skip hand-tuned adjustments
             knn_prob = self.predict_knn(df, df_1h, df_4h)
             if knn_prob is not None:
-                base_prob = knn_prob
-            else:
-                base_prob = 0.50  # fallback if KNN fails
-        else:
-            # Standard probability table lookup
-            base_prob = self._lookup_probability(distance_atr, minutes_remaining)
+                # Use raw KNN probability directly — no adjustments, no gates
+                recommended_side, max_price = self._decide_bet(knn_prob)
+                return KalshiV3Signal(
+                    asset="",
+                    probability=round(knn_prob, 4),
+                    recommended_side=recommended_side,
+                    max_price_cents=max_price,
+                    distance_atr=round(distance_atr, 3),
+                    base_prob=round(knn_prob, 4),
+                    adjustments={"mode": "knn_early_entry"},
+                    current_price=current_price,
+                    strike_price=strike_price,
+                    minutes_remaining=minutes_remaining,
+                )
+            # KNN failed — fall through to table lookup
 
-            # Sanity check: cap probability when on wrong side of strike
-            if current_price < strike_price and base_prob > 0.50:
-                base_prob = 0.50
-            elif current_price > strike_price and base_prob < 0.50:
-                base_prob = 0.50
+        # Standard probability table lookup (late entry or KNN fallback)
+        base_prob = self._lookup_probability(distance_atr, minutes_remaining)
+
+        # Sanity check: cap probability when on wrong side of strike
+        if current_price < strike_price and base_prob > 0.50:
+            base_prob = 0.50
+        elif current_price > strike_price and base_prob < 0.50:
+            base_prob = 0.50
 
         # 3. Apply technical adjustments
         adjustments = self._compute_adjustments(
