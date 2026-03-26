@@ -248,11 +248,11 @@ class Dashboard:
                 except Exception:
                     pass
 
-            dw = self.daemon._dryrun_wins
-            dl = self.daemon._dryrun_losses
+            dw = self.daemon._session_wins
+            dl = self.daemon._session_losses
             dt = dw + dl
             dwr = dw / dt * 100 if dt > 0 else 0
-            pending = len(self.daemon._dryrun_bets)
+            pending = len(self.daemon._pending_bets)
             from config.production import MAX_CONCURRENT_KALSHI_BETS
 
             lines = [
@@ -468,11 +468,11 @@ class Dashboard:
         mode = "DRY-RUN" if self.dry_run else "LIVE"
 
         if self.daemon.kalshi_only:
-            dw = self.daemon._dryrun_wins
-            dl = self.daemon._dryrun_losses
+            dw = self.daemon._session_wins
+            dl = self.daemon._session_losses
             dt = dw + dl
             dwr = dw / dt * 100 if dt > 0 else 0
-            pending = len(self.daemon._dryrun_bets)
+            pending = len(self.daemon._pending_bets)
             lines = [
                 "",
                 "=" * 78,
@@ -490,7 +490,7 @@ class Dashboard:
                 "",
                 "  RESULTS:",
             ]
-            for r in self.daemon._dryrun_results:
+            for r in self.daemon._completed_bets:
                 color = "WIN " if r["result"] == "WIN" else "LOSS"
                 lines.append(
                     f"    {color} {r['asset']:<5} {r['direction']:<4} "
@@ -592,9 +592,8 @@ class Dashboard:
                     self.daemon._last_kalshi_eval = now_ts
 
                 self.daemon._update_equity()
-                # Check dry-run bet settlements
-                if self.daemon.dry_run:
-                    self.daemon._check_dryrun_settlements()
+                # Check bet settlements (both live and dry-run)
+                self.daemon._check_dryrun_settlements()
                 self._draw_dashboard(is_signal_cycle=False, signals=None)
 
         else:
