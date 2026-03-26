@@ -108,61 +108,60 @@ Buys when price < BB lower AND RSI < threshold. Exits when price > BB middle. Ea
 
 Three predictor versions available via `--predictor v1|v2|v3`:
 
-**V3 (recommended) — Strike-Relative Probability Model:**
-Answers the actual Kalshi question: "will price close above or below THIS strike?" Uses a pre-computed probability lookup table (distance from strike in ATR units × time remaining) calibrated from historical 1m data, adjusted by real-time technical signals. **68.8% WR on 90-day validation.**
+**V3 (recommended) — Strike-Relative + KNN Hybrid Model:**
 
-- Queries Kalshi API for the active contract's `floor_strike` and `close_time`
-- Computes distance from strike in ATR units + minutes remaining
-- Looks up base probability from `data/store/kalshi_prob_table.json`
-- Applies technical adjustments: OB confirms/opposes (±5%), trade flow (±5%), 1h trend (±5%), MACD momentum (+3%), RSI extreme (-8%), RSI divergence (-8%)
-- **Bets BOTH sides:** YES when probability > 55%, NO when probability < 45%
-- Edge margin: only bets when our probability gives ≥5c edge over contract price
-- NO bets have highest WR (74.4%) — strong at detecting when price won't cross back
+Two prediction modes that activate automatically:
 
-**Probability table rebuild:** `./venv/bin/python scripts/build_prob_table.py --days 90` (refresh weekly/monthly)
+**Early Entry (KNN) — minute 0-5, near strike:**
+- 12-feature KNN model trained on multi-timeframe data (15m + 1h + 4h)
+- Features: RSI, StochRSI, MACD, normalized returns, volume ratio, BB position, EMA slope, ADX, ROC across 3 timeframes
+- Walk-forward validated: 61.3% WR on 6,178 bets, +22.6% ROI @50c contracts
+- Activates when: minutes_remaining >= 10 AND distance from strike < 0.5 ATR
+- Bypasses V3 adjustments — raw KNN probability is stronger than hand-tuned rules
+- This is where the money is — contracts near 50c with 60%+ prediction accuracy
 
-| Asset | V3 WR (90d) | Bets |
-|-------|-------------|------|
-| ETH | 70.2% | 8589 |
-| BTC | 69.5% | 8588 |
-| SOL | 68.7% | 8589 |
-| XRP | 68.5% | 8589 |
-| BNB | 67.2% | 8589 |
+**Late Entry (Probability Table) — minute 10+, far from strike:**
+- Pre-computed 2D probability table (distance_ATR × time_remaining)
+- Built from historical 1m data: `./venv/bin/python scripts/build_prob_table.py --days 90`
+- Technical adjustments: OB (±5%), trade flow (±5%), 1h trend (±5%), MACD (+3%), RSI extreme (-8%), RSI divergence (-8%), momentum gate (-15%)
+- Useful for high-probability late-window bets when price has moved far from strike
 
-**V1 — Mean-Reversion (legacy, 63% WR):**
-Multi-signal confidence scorer (0-100) combining lagging + leading + multi-timeframe indicators. Places bets on BTC, ETH, SOL, XRP, BNB 15-minute up/down contracts.
+**Bet decision:**
+- YES when probability >= 60%, NO when probability <= 40%
+- **Bets BOTH sides** — YES and NO
+- Edge margin: 5c minimum edge over implied contract price
+- Max contract price: 85c hard cap
+- Price source: Coinbase (closest to CF Benchmarks BRTI settlement)
+
+**Position sizing (tiered by confidence):**
+
+| Confidence | Max Risk (% of balance) |
+|-----------|------------------------|
+| 70%+ | 10% |
+| 65-69% | 7.5% |
+| 60-64% | 5% |
+| 55-59% | 2.5% |
+| Below 55% | No bet |
+
+**Evaluation lifecycle (wall-clock aligned at :01, :06, :11, :12):**
+- **SETUP (min 0-4):** Score direction. No betting.
+- **OBSERVING (min 5-9):** Re-score with fresh data. No betting.
+- **CONFIRMED (min 10-11):** Place bets if signal is strong.
+- **LAST_LOOK (min 12):** Final chance, elevated threshold.
+- **SETTLING (min 13+):** Bets awaiting settlement.
+
+**Settlement tracking:** Queries Kalshi API for authoritative settlement results (not approximated from price data). Tracks W/L/WR and P&L for both dry-run and live modes.
+
+**Model refresh:**
+- KNN model: `./venv/bin/python scripts/build_knn_model.py --days 90 --k 50`
+- Probability table: `./venv/bin/python scripts/build_prob_table.py --days 90`
+- Refresh weekly/monthly to stay current with market regime
 
 **Series tickers:** `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`, `KXBNB15M`
 
-**Confidence scoring (8 lagging + 5 leading + 1 MTF, max raw 200):**
-- RSI Signal (0-30), BB Position (0-20), MACD Momentum (0-15), Volume (0-10), ROC-5 (0-10), RSI Trend (0-10), StochRSI (0-15), ATR Move Ratio (-5 to +10)
-- Order Book Imbalance (0-20), Trade Flow (0-20), Large Trade Bias (0-10), Spread (0-5), Cross-Asset (0-10)
-- 1-Hour Trend Alignment (-15 to +15) — biggest edge, prevents betting against hourly trend
+**V1 — Mean-Reversion (legacy, 63% WR):** Original predictor. 14 scoring components + 3 filters. Still functional via `--predictor v1`.
 
-**Signal quality filters (hard gates, any rejection kills the signal):**
-- **Directional conflict** — rejects when lagging and leading indicators disagree (both ≥15 pts)
-- **Volatility regime** — rejects when ATR spikes above 90th percentile (200-period window)
-- **Margin of victory** — rejects when winner < 1.5x loser score
-
-**Evaluation cadence (wall-clock aligned):**
-- Evaluates every 5 minutes (at :01, :06, :11 of each 15m window + :12 for last-look)
-- **SETUP (min 0-4):** Full 15m predictor score. Sets direction + base confidence. No betting.
-- **CONFIRMED (min 5-9):** Re-scores on cached 15m data with fresh order book + trade flow. If confidence >= threshold → bet.
-- **DOUBLE_CONFIRMED (min 10-11):** Same as CONFIRMED. Fresh leading indicators may promote or demote.
-- **LAST_LOOK (min 12):** 1m momentum check (2 of 3 candles confirm direction). Elevated threshold (per-asset + 10).
-- **EXPIRED (min 13+):** No new bets.
-
-The 15m lagging indicators are the proven edge (62-64% WR). The 5m evaluation cycle refreshes order book and trade flow every 5 minutes instead of every 15 — catching real-time shifts in market microstructure.
-
-**Per-asset confidence thresholds (from 3-month backtest optimization):**
-
-| Asset | Class | Threshold | 3mo WR | 3mo PF | Series |
-|-------|-------|-----------|--------|--------|--------|
-| BTC | A | 30 | 64.7% | 4.94 | KXBTC15M |
-| ETH | A | 35 | 66.7% | 4.73 | KXETH15M |
-| SOL | A | 35 | 63.7% | 4.08 | KXSOL15M |
-| XRP | B | 30 | 62.2% | 4.33 | KXXRP15M |
-| BNB | A | 35 | 60.9% | 3.67 | KXBNB15M |
+**V2 — Continuation (shelved, 46% WR):** Trend-following approach. Proved that continuation signals don't predict 15m direction. Available via `--predictor v2` but not recommended.
 
 **Betting rules:**
 - Per-asset thresholds (above) — not a single global threshold
