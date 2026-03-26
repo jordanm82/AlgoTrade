@@ -41,16 +41,23 @@ class KalshiDaemon:
         "BNB/USDT": "KXBNB15M",
     }
 
-    # Per-asset confidence thresholds (tiered from 1m backtest at minute 3)
-    # Tier 1: BNB — strongest edge, lower threshold for more bets (67% WR @60%)
-    # Tier 2: SOL, XRP — solid edge, moderate threshold (66-67% WR @65%)
-    # Tier 3: ETH, BTC — weaker but still profitable at high conf (73-74% WR @70%)
+    # Per-asset KNN confidence thresholds (walk-forward validated, min 3 entry)
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 70,   # Tier 3 — only high confidence
-        "ETH/USDT": 70,   # Tier 3 — only high confidence
-        "SOL/USDT": 65,   # Tier 2 — moderate threshold
-        "XRP/USDT": 65,   # Tier 2 — moderate threshold
-        "BNB/USDT": 60,   # Tier 1 — strongest edge, more bets
+        "BTC/USDT": 70,   # Tier 3 — 64.7% WR with TBL gate
+        "ETH/USDT": 70,   # Tier 3 — 75.0% WR with TBL gate
+        "SOL/USDT": 65,   # Tier 2 — 61.2% WR
+        "XRP/USDT": 65,   # Tier 2 — 62.8% WR
+        "BNB/USDT": 60,   # Tier 1 — 70.2% WR
+    }
+
+    # Per-asset TBL agreement thresholds (probability table must also agree)
+    # Higher for ETH/BTC where TBL filtering adds the most WR
+    KALSHI_TBL_THRESHOLDS = {
+        "BTC/USDT": 62.5,  # 54.8% → 64.7% WR with this gate
+        "ETH/USDT": 62.5,  # 59.7% → 75.0% WR with this gate
+        "SOL/USDT": 55.0,  # 50.0% → 61.2% WR
+        "XRP/USDT": 55.0,  # 50.1% → 62.8% WR
+        "BNB/USDT": 55.0,  # 60.3% → 70.2% WR
     }
 
     # Coinbase symbol mapping for V3 live price (closer to CF Benchmarks BRTI)
@@ -613,26 +620,52 @@ class KalshiDaemon:
 
                     if isinstance(signal, KalshiV3Signal) and signal.recommended_side != "SKIP":
                         pending["confirmed"] = True
-                        # Apply per-asset confidence threshold
+                        # Apply per-asset KNN confidence threshold
                         asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, 60)
                         prob_pct = int(signal.probability * 100)
-                        meets_threshold = prob_pct >= asset_threshold or prob_pct <= (100 - asset_threshold)
+                        meets_knn = prob_pct >= asset_threshold or prob_pct <= (100 - asset_threshold)
 
-                        if state == "CONFIRMED" and meets_threshold:
+                        # TBL agreement gate — get table probability and check per-asset threshold
+                        tbl_threshold = self.KALSHI_TBL_THRESHOLDS.get(symbol, 55.0)
+                        tbl_agrees = False
+                        if meets_knn:
+                            cb_price = self._get_coinbase_price(symbol)
+                            tbl_sig = self.kalshi_predictor.predict(
+                                df_15m, strike_price=float(pending.get("strike_price", 0)),
+                                minutes_remaining=5,  # force table mode
+                                current_price=cb_price,
+                            )
+                            if tbl_sig:
+                                tbl_pct = int(tbl_sig.probability * 100)
+                                if signal.recommended_side == "YES":
+                                    tbl_agrees = tbl_pct >= tbl_threshold
+                                elif signal.recommended_side == "NO":
+                                    tbl_agrees = (100 - tbl_pct) >= tbl_threshold
+
+                        both_pass = meets_knn and tbl_agrees
+
+                        if state == "CONFIRMED" and both_pass:
                             actionable_signals.append({
                                 "symbol": symbol, "series_ticker": series_ticker,
                                 "signal": signal, "market_data": market_data,
                                 "state": state,
                             })
                         model = "KNN" if signal.adjustments.get("mode") == "knn_early_entry" else "TBL"
+                        reason_suffix = ""
+                        if not meets_knn:
+                            reason_suffix = f" (KNN below {asset_threshold}%)"
+                        elif not tbl_agrees:
+                            reason_suffix = f" (TBL disagrees, need {tbl_threshold}%)"
+                        elif state == "CONFIRMED":
+                            reason_suffix = f" -> BETTING (KNN>={asset_threshold}% + TBL>={tbl_threshold}%)"
+                        else:
+                            reason_suffix = " (waiting)"
+
                         predictions.append({
                             "symbol": symbol, "asset": asset,
                             "direction": signal.recommended_side,
                             "confidence": prob_pct,
-                            "reason": f"{state.lower()} [{model}]: prob={signal.probability:.2f} side={signal.recommended_side}"
-                                      + (f" -> BETTING (>={asset_threshold}%)" if state == "CONFIRMED" and meets_threshold
-                                         else f" (below {asset_threshold}% threshold)" if not meets_threshold
-                                         else " (waiting)"),
+                            "reason": f"{state.lower()} [{model}]: prob={signal.probability:.2f} side={signal.recommended_side}" + reason_suffix,
                             "ob": ob_imb, "flow": net_flow, "state": state,
                         })
                     else:
