@@ -1288,6 +1288,10 @@ class LiveDaemon:
                 })
                 self._session_bets_placed += 1
 
+            # Track active bet for concurrency limit (same as live path)
+            bet_key = f"dry_{asset}_{int(time.time())}"
+            self._active_kalshi_bets[bet_key] = time.time()
+
             print(colored(
                 f"  [KALSHI DRY] {asset} {direction_label} "
                 f"prob={conf_display}% | "
