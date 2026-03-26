@@ -341,12 +341,12 @@ class KalshiDaemon:
                 continue
 
             # Determine lifecycle state
-            if minute_in_window <= 4:
-                state = "SETUP"
-            elif minute_in_window <= 9:
-                state = "OBSERVING"
+            # Bet early — contracts are cheapest before minute 5
+            # SETUP at first eval, CONFIRMED from second eval onward
+            if minute_in_window <= 2:
+                state = "SETUP"          # first eval — score + cache, no bet
             elif minute_in_window <= 11:
-                state = "CONFIRMED"
+                state = "CONFIRMED"      # eligible to bet from minute 3+
             elif minute_in_window == KALSHI_LASTLOOK_MINUTE:
                 state = "LAST_LOOK"
             else:
@@ -536,8 +536,8 @@ class KalshiDaemon:
                         "ob": ob_imb, "flow": net_flow, "state": state,
                     })
 
-            # --- OBSERVING / CONFIRMED: re-score with fresh leading indicators ---
-            elif state in ("OBSERVING", "CONFIRMED"):
+            # --- CONFIRMED: score and bet if signal is strong ---
+            elif state == "CONFIRMED":
                 if not pending and self.kalshi_predictor_version != "v3":
                     # No SETUP signal — nothing to re-score (V1/V2 only)
                     predictions.append({
