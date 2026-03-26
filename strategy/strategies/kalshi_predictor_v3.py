@@ -15,7 +15,7 @@ DISTANCE_BINS = [-3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.5, 
 TIME_BINS = [14, 12, 10, 8, 6, 4, 2]
 
 EDGE_MARGIN = 0.05    # require 5% edge over implied contract price
-MAX_BET_PRICE = 50    # never pay more than 50c for either side
+MAX_BET_PRICE = 85    # max price scales with probability, hard cap at 85c
 
 
 @dataclass

@@ -143,7 +143,7 @@ class TestV3BetDecision:
         if signal.recommended_side == "YES":
             # max price should be probability * 100 - margin
             assert signal.max_price_cents <= int(signal.probability * 100)
-            assert signal.max_price_cents <= 50  # hard cap
+            assert signal.max_price_cents <= 85  # hard cap
 
 
 class TestV3SignalFields:

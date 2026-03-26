@@ -758,12 +758,16 @@ class LiveDaemon:
                 continue
 
             # Determine lifecycle state
+            # SETUP (0-4): initial scoring, no betting
+            # OBSERVING (5-9): re-score with fresh data, still no betting
+            # CONFIRMED (10-11): enough data to bet, re-score and place bets
+            # LAST_LOOK (12): final chance with elevated threshold
             if minute_in_window <= 4:
                 state = "SETUP"
             elif minute_in_window <= 9:
-                state = "CONFIRMED"
+                state = "OBSERVING"
             elif minute_in_window <= 11:
-                state = "DOUBLE_CONFIRMED"
+                state = "CONFIRMED"
             elif minute_in_window == KALSHI_LASTLOOK_MINUTE:
                 state = "LAST_LOOK"
             else:
@@ -955,8 +959,10 @@ class LiveDaemon:
                         "ob": ob_imb, "flow": net_flow, "state": state,
                     })
 
-            # --- CONFIRMED / DOUBLE_CONFIRMED: re-score 15m with fresh leading indicators ---
-            elif state in ("CONFIRMED", "DOUBLE_CONFIRMED"):
+            # --- OBSERVING / CONFIRMED: re-score with fresh leading indicators ---
+            # OBSERVING (min 5-9): score but don't bet — gathering data
+            # CONFIRMED (min 10-11): score and bet if signal is strong
+            elif state in ("OBSERVING", "CONFIRMED"):
                 if not pending and self.kalshi_predictor_version != "v3":
                     # No SETUP signal — nothing to re-score (V1/V2 only)
                     predictions.append({
@@ -1082,16 +1088,19 @@ class LiveDaemon:
                     from strategy.strategies.kalshi_predictor_v3 import KalshiV3Signal
                     if isinstance(signal, KalshiV3Signal) and signal.recommended_side != "SKIP":
                         pending["confirmed"] = True
-                        actionable_signals.append({
-                            "symbol": symbol, "series_ticker": series_ticker,
-                            "signal": signal, "market_data": market_data,
-                            "state": state,
-                        })
+                        # Only bet at CONFIRMED (min 10+) or LAST_LOOK, not OBSERVING
+                        if state in ("CONFIRMED", "LAST_LOOK"):
+                            actionable_signals.append({
+                                "symbol": symbol, "series_ticker": series_ticker,
+                                "signal": signal, "market_data": market_data,
+                                "state": state,
+                            })
                         predictions.append({
                             "symbol": symbol, "asset": asset,
                             "direction": signal.recommended_side,
                             "confidence": int(signal.probability * 100),
-                            "reason": f"{state.lower()}: V3 prob={signal.probability:.2f} side={signal.recommended_side} (fresh OB/flow)",
+                            "reason": f"{state.lower()}: V3 prob={signal.probability:.2f} side={signal.recommended_side}"
+                                      + (" → BETTING" if state in ("CONFIRMED", "LAST_LOOK") else " (observing)"),
                             "ob": ob_imb, "flow": net_flow, "state": state,
                         })
                     else:
@@ -1167,7 +1176,7 @@ class LiveDaemon:
             direction_label = signal.recommended_side  # "YES" or "NO"
             side = "yes" if signal.recommended_side == "YES" else "no"
             conf_display = int(signal.probability * 100)
-            MAX_ENTRY_CENTS = min(50, signal.max_price_cents) if signal.max_price_cents > 0 else 50
+            MAX_ENTRY_CENTS = min(85, signal.max_price_cents) if signal.max_price_cents > 0 else 85
         else:
             direction_label = signal.direction
             side = "yes" if signal.direction == "UP" else "no"
