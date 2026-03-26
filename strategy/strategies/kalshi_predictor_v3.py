@@ -85,10 +85,31 @@ class KalshiPredictorV3:
         )
         total_adjustment = sum(adjustments.values())
 
-        # 4. Compute adjusted probability
+        # 4. Momentum gate — if price is moving toward the strike (against our side),
+        # apply a heavy penalty. Don't bet YES on a falling price near the strike.
+        if len(df) >= 3:
+            c1 = float(df.iloc[-3]["close"])
+            c2 = float(df.iloc[-2]["close"])
+            c3 = current_price
+            above_strike = current_price >= strike_price
+
+            if above_strike:
+                # Betting YES — check if price is falling toward strike
+                if c3 < c2 < c1:
+                    # 3 consecutive drops while above strike — price heading down to cross
+                    adjustments["momentum_against"] = -0.15
+            else:
+                # Betting NO — check if price is rising toward strike
+                if c3 > c2 > c1:
+                    # 3 consecutive rises while below strike — price heading up to cross
+                    adjustments["momentum_against"] = -0.15
+
+            total_adjustment = sum(adjustments.values())
+
+        # 5. Compute adjusted probability
         adjusted_prob = max(0.05, min(0.95, base_prob + total_adjustment))
 
-        # 5. Determine bet recommendation
+        # 6. Determine bet recommendation
         recommended_side, max_price = self._decide_bet(adjusted_prob)
 
         return KalshiV3Signal(
