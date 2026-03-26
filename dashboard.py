@@ -704,19 +704,19 @@ def main():
     parser.add_argument("--dry-run", action="store_true", default=True, help="Paper trading (default)")
     parser.add_argument("--live", action="store_true", help="Live trading")
     parser.add_argument("--cycles", type=int, default=15, help="Signal cycles to run")
-    parser.add_argument("--kalshi-only", action="store_true", help="Run only Kalshi 15m predictions, skip Coinbase spot trading")
-    parser.add_argument("--predictor", choices=["v1", "v2", "v3"], default="v1",
-                        help="Kalshi predictor: v1 (mean-reversion), v2 (continuation), or v3 (strike-relative)")
+    parser.add_argument("--bot", choices=["k15", "spot"], default="k15",
+                        help="Which bot to run: k15 (Kalshi 15m predictions) or spot (Coinbase BB Grid)")
+    # Legacy flags still accepted for compatibility
+    parser.add_argument("--kalshi-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--predictor", choices=["v1", "v2", "v3"], default="v3", help=argparse.SUPPRESS)
     parser.add_argument("--simple", action="store_true", help="Force plain text output (for logs/pipes)")
     args = parser.parse_args()
 
-    # Use plain text output when piped, redirected, or --simple flag
-    if not args.simple and sys.stdout.isatty():
-        # Interactive terminal — suggest k15.py for rich experience
-        print("Tip: use './venv/bin/python k15.py' for the interactive rich dashboard")
+    # --kalshi-only is now the same as --bot k15
+    kalshi_only = args.bot == "k15" or args.kalshi_only
 
     dry_run = not args.live
-    Dashboard(dry_run=dry_run, max_cycles=args.cycles, kalshi_only=args.kalshi_only, predictor_version=args.predictor).run()
+    Dashboard(dry_run=dry_run, max_cycles=args.cycles, kalshi_only=kalshi_only, predictor_version=args.predictor).run()
 
 
 if __name__ == "__main__":
