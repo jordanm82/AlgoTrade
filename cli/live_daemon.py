@@ -588,39 +588,79 @@ class LiveDaemon:
             return None
 
     def _check_dryrun_settlements(self):
-        """Check if any dry-run bets have settled and record W/L."""
+        """Check if any pending bets have settled using Kalshi's actual results.
+
+        Queries Kalshi for settled markets to get the authoritative outcome.
+        No Coinbase price approximation — uses Kalshi's own settlement data.
+        """
         if not self._pending_bets:
             return
         now = datetime.now(timezone.utc)
         settled = []
-        for bet in self._pending_bets:
-            if now >= bet["settle_time"]:
-                # Get actual price from Coinbase at settlement
-                cb_price = self._get_coinbase_price(bet["symbol"])
-                if cb_price is None:
-                    continue  # can't check yet, try next tick
 
-                above_strike = cb_price >= bet["strike"]
-                # YES wins if price >= strike, NO wins if price < strike
-                won = (bet["side"] == "yes" and above_strike) or \
-                      (bet["side"] == "no" and not above_strike)
+        # Only check bets past their settlement time (+ 1 min buffer for Kalshi to settle)
+        due_bets = [b for b in self._pending_bets
+                    if now >= b["settle_time"] + pd.Timedelta(minutes=1)]
+        if not due_bets:
+            return
 
-                result_str = "WIN" if won else "LOSS"
-                color = "green" if won else "red"
-                print(colored(
-                    f"  [KALSHI DRY SETTLED] {bet['asset']} {bet['direction']} "
-                    f"strike=${bet['strike']:,.2f} actual=${cb_price:,.2f} → {result_str}",
-                    color,
-                ))
+        # Query Kalshi for settled markets
+        self._init_kalshi_client()
+        if not self.kalshi_client:
+            return
 
-                bet["result"] = result_str
-                bet["settle_price"] = cb_price
-                self._completed_bets.append(bet)
-                if won:
-                    self._session_wins += 1
-                else:
-                    self._session_losses += 1
-                settled.append(bet)
+        for bet in due_bets:
+            try:
+                # Find the settled market by series ticker
+                asset = bet["asset"]
+                series = self.KALSHI_PAIRS.get(bet["symbol"], "")
+                if not series:
+                    continue
+
+                settled_markets = self.kalshi_client.get_markets(
+                    series_ticker=series, status="settled"
+                )
+
+                # Find the market that matches our bet's settlement time
+                for m in settled_markets:
+                    ct = m.get("close_time", "")
+                    if not ct:
+                        continue
+                    market_close = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                    # Match within 1 minute of our expected settle time
+                    if abs((market_close - bet["settle_time"]).total_seconds()) < 60:
+                        result = m.get("result", "")  # "yes" or "no"
+                        expiration_value = m.get("expiration_value", 0)
+
+                        if not result:
+                            continue
+
+                        # Our bet wins if our side matches the result
+                        won = bet["side"] == result
+                        result_str = "WIN" if won else "LOSS"
+                        color = "green" if won else "red"
+
+                        print(colored(
+                            f"  [SETTLED] {asset} {bet['direction']} "
+                            f"strike=${bet['strike']:,.2f} "
+                            f"settled=${float(expiration_value):,.2f} "
+                            f"result={result.upper()} → {result_str}",
+                            color,
+                        ))
+
+                        bet["result"] = result_str
+                        bet["settle_price"] = float(expiration_value)
+                        bet["kalshi_result"] = result
+                        self._completed_bets.append(bet)
+                        if won:
+                            self._session_wins += 1
+                        else:
+                            self._session_losses += 1
+                        settled.append(bet)
+                        break
+
+            except Exception as e:
+                print(colored(f"  [SETTLE ERR] {bet['asset']}: {e}", "yellow"))
 
         for bet in settled:
             self._pending_bets.remove(bet)
