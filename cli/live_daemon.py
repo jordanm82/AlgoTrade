@@ -1160,7 +1160,8 @@ class LiveDaemon:
             return getattr(sig, 'confidence', 0) / 100
         actionable_signals.sort(key=_signal_score, reverse=True)
         for vs in actionable_signals:
-            if len(self._active_kalshi_bets) >= MAX_CONCURRENT_KALSHI_BETS:
+            max_bets = 4 if self.dry_run else MAX_CONCURRENT_KALSHI_BETS
+            if len(self._active_kalshi_bets) >= max_bets:
                 break
             pred = self._kalshi_execute_bet(
                 vs["symbol"], vs["series_ticker"], vs["signal"], vs["market_data"]
