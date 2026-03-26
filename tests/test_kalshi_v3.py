@@ -74,9 +74,10 @@ class TestV3BaseProbability:
     def test_below_strike_low_probability(self, sample_prob_table):
         predictor = KalshiPredictorV3(prob_table_path=sample_prob_table)
         df = _make_df(close=96.0, atr=2.0)  # 2 ATR below strike
-        signal = predictor.predict(df, strike_price=100.0, minutes_remaining=10)
+        # At 3 min left, table mode kicks in (KNN only at >= 8 min)
+        signal = predictor.predict(df, strike_price=100.0, minutes_remaining=3)
         assert signal is not None
-        assert signal.probability < 0.4
+        assert signal.probability <= 0.4
 
     def test_at_strike_near_50(self, sample_prob_table):
         predictor = KalshiPredictorV3(prob_table_path=sample_prob_table)

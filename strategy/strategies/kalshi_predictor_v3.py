@@ -88,10 +88,9 @@ class KalshiPredictorV3:
         distance_atr = (current_price - strike_price) / atr
 
         # 2. Choose prediction mode based on timing + distance
-        # Early entry (>= 10 min left, near strike): use KNN for direction prediction
-        # Late entry (< 10 min left, or far from strike): use probability table
-        use_knn = (minutes_remaining >= 10
-                   and abs(distance_atr) < 0.5
+        # KNN for early entry (>= 8 min left) — contracts are still cheap
+        # Probability table for late entry (< 8 min left) — distance-based
+        use_knn = (minutes_remaining >= 8
                    and self._knn is not None)
 
         if use_knn:
