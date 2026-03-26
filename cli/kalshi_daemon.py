@@ -96,6 +96,25 @@ class KalshiDaemon:
         self._session_losses = 0
         self._session_bets_placed = 0
 
+        # Dashboard compatibility stubs (spot trading attributes not used)
+        self.kalshi_only = True
+        self._equity = 0.0
+        self._pnl_today = 0.0
+        self.executor = None
+        self.tracker = None
+
+    def _update_equity(self):
+        """Stub — KalshiDaemon doesn't track equity."""
+        pass
+
+    def _enforce_stops(self):
+        """Stub — KalshiDaemon doesn't have stop-losses."""
+        pass
+
+    def signal_cycle(self):
+        """Stub — KalshiDaemon uses _kalshi_eval() instead."""
+        return []
+
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------

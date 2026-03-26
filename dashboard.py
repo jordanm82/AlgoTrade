@@ -32,13 +32,18 @@ from config.production import (
 # Derive leverage pairs from per-pair config
 LEVERAGE_PAIRS = [sym for sym, cfg in PAIR_CONFIG.items() if cfg["leverage"] > 1]
 from cli.live_daemon import LiveDaemon
+from cli.kalshi_daemon import KalshiDaemon
 
 LOG_FILE = Path("data/store/dashboard.log")
 
 
 class Dashboard:
     def __init__(self, dry_run: bool = True, max_cycles: int = 15, kalshi_only: bool = False, predictor_version: str = "v1"):
-        self.daemon = LiveDaemon(dry_run=dry_run, kalshi_only=kalshi_only, predictor_version=predictor_version)
+        if kalshi_only:
+            self.daemon = KalshiDaemon(dry_run=dry_run, predictor_version=predictor_version)
+            self.daemon.kalshi_only = True  # for dashboard rendering checks
+        else:
+            self.daemon = LiveDaemon(dry_run=dry_run, kalshi_only=kalshi_only, predictor_version=predictor_version)
         self.dry_run = dry_run
         self.max_cycles = max_cycles
         self._cycle_count = 0
@@ -290,7 +295,7 @@ class Dashboard:
             mins_ago = int(delta.total_seconds() // 60)
             mins_to_next = max(0, 15 - mins_ago)
             lines.append(f"  PRICES: live | INDICATORS: {mins_ago} min ago (next refresh in ~{mins_to_next} min)")
-        else:
+        elif not self.daemon.kalshi_only:
             lines.append(f"  PRICES: live | INDICATORS: pending first cycle")
         lines.append("")
 
