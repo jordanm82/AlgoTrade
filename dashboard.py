@@ -407,7 +407,7 @@ class Dashboard:
         if kalshi_preds:
             lines.append("")
             lines.append("  KALSHI PREDICTIONS:")
-            lines.append(f"    {'ASSET':<5} {'SIDE':<5} {'PROB':>5}  {'PRICE':>12} {'TARGET':>12} {'DIST':>8}  {'STATE':<18}")
+            lines.append(f"    {'ASSET':<5} {'SIDE':<5} {'PROB':>5}  {'PRICE':>12} {'TARGET':>12} {'DIST':>8}  {'MDL':<4}{'STATE':<18}")
             lines.append(f"    {'─'*70}")
             for pred in kalshi_preds:
                 asset = pred.get("asset", "?")
@@ -442,10 +442,14 @@ class Dashboard:
                 side_display = direction if direction != "--" else "--"
                 prob_display = f"{conf}%" if conf > 0 else "--"
 
+                # Show which model produced the prediction
+                reason = pred.get("reason", "")
+                model_tag = "KNN" if "knn" in reason.lower() else "TBL"
+
                 lines.append(
                     f"    {asset:<5} {side_display:<5} {prob_display:>5}  "
                     f"{current_str:>12} {target_str:>12} {dist_str:>8}  "
-                    f"{state:<18}"
+                    f"{model_tag:<4}{state:<18}"
                 )
 
         # Footer — show time to next Kalshi window
