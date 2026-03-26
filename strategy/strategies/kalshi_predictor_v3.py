@@ -338,34 +338,44 @@ class KalshiPredictorV3:
     @staticmethod
     def kelly_size(probability: float, contract_price_cents: int,
                    balance_cents: int, fraction: float = 0.5) -> int:
-        """Calculate Kelly-optimal position size in number of contracts.
+        """Calculate position size capped by account percentage tiers.
+
+        Uses Kelly direction (higher confidence = larger bet) but caps
+        the total risk as a percentage of account balance:
+        - prob >= 0.70: up to 10% of balance
+        - prob >= 0.65: up to 7.5% of balance
+        - prob >= 0.60: up to 5% of balance
+        - prob >= 0.55: up to 2.5% of balance
 
         Args:
             probability: our estimated probability of winning (0-1)
             contract_price_cents: what we'd pay per contract
             balance_cents: total available balance in cents
-            fraction: Kelly fraction (0.5 = half-Kelly for safety)
+            fraction: Kelly fraction (unused — kept for API compat)
 
         Returns:
             Number of contracts to buy
         """
         if contract_price_cents <= 0 or contract_price_cents >= 100:
             return 0
+        if balance_cents <= 0:
+            return 0
 
-        # Binary payoff: win (100 - price), lose (price)
-        b = (100 - contract_price_cents) / contract_price_cents  # net odds
-        q = 1.0 - probability
-
-        # Kelly formula: f* = (bp - q) / b
-        kelly_f = (b * probability - q) / b
-        if kelly_f <= 0:
-            return 0  # negative edge, don't bet
-
-        # Apply fractional Kelly
-        f = kelly_f * fraction
+        # Determine max risk as % of balance based on confidence tier
+        prob = max(probability, 1.0 - probability)  # use the stronger side
+        if prob >= 0.70:
+            max_risk_pct = 0.10   # 10% of balance
+        elif prob >= 0.65:
+            max_risk_pct = 0.075  # 7.5%
+        elif prob >= 0.60:
+            max_risk_pct = 0.05   # 5%
+        elif prob >= 0.55:
+            max_risk_pct = 0.025  # 2.5%
+        else:
+            return 0  # below threshold, don't bet
 
         # Convert to contract count
-        risk_amount = int(balance_cents * f)
-        count = risk_amount // contract_price_cents
+        max_risk_cents = int(balance_cents * max_risk_pct)
+        count = max_risk_cents // contract_price_cents
 
         return max(0, count)
