@@ -71,6 +71,14 @@ class KalshiPredictorV3:
         # 2. Look up base probability
         base_prob = self._lookup_probability(distance_atr, minutes_remaining)
 
+        # Sanity check: if price is below strike, probability of closing ABOVE
+        # cannot exceed 50%. If above strike, probability cannot be below 50%.
+        # This prevents the 0.0 bucket's bullish bias from betting YES when below.
+        if current_price < strike_price and base_prob > 0.50:
+            base_prob = 0.50
+        elif current_price > strike_price and base_prob < 0.50:
+            base_prob = 0.50
+
         # 3. Apply technical adjustments
         adjustments = self._compute_adjustments(
             df, current_price, strike_price, distance_atr, market_data, df_1h
