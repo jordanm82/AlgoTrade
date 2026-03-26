@@ -455,11 +455,12 @@ class KalshiDaemon:
                     else:
                         signal = None
 
+                    model = "KNN" if signal and signal.adjustments.get("mode") == "knn_early_entry" else "TBL"
                     predictions.append({
                         "symbol": symbol, "asset": asset,
                         "direction": (signal.recommended_side if signal and signal.recommended_side != "SKIP" else "--"),
                         "confidence": int(signal.probability * 100) if signal else 0,
-                        "reason": "setup -- waiting for confirmation (V3 strike-relative)",
+                        "reason": f"setup [{model}] — waiting for confirmation",
                         "ob": ob_imb, "flow": net_flow, "state": state,
                     })
                 else:
@@ -623,22 +624,24 @@ class KalshiDaemon:
                                 "signal": signal, "market_data": market_data,
                                 "state": state,
                             })
+                        model = "KNN" if signal.adjustments.get("mode") == "knn_early_entry" else "TBL"
                         predictions.append({
                             "symbol": symbol, "asset": asset,
                             "direction": signal.recommended_side,
                             "confidence": prob_pct,
-                            "reason": f"{state.lower()}: V3 prob={signal.probability:.2f} side={signal.recommended_side}"
+                            "reason": f"{state.lower()} [{model}]: prob={signal.probability:.2f} side={signal.recommended_side}"
                                       + (f" -> BETTING (>={asset_threshold}%)" if state == "CONFIRMED" and meets_threshold
                                          else f" (below {asset_threshold}% threshold)" if not meets_threshold
                                          else " (waiting)"),
                             "ob": ob_imb, "flow": net_flow, "state": state,
                         })
                     else:
+                        model = "KNN" if hasattr(signal, 'adjustments') and signal.adjustments.get("mode") == "knn_early_entry" else "TBL"
                         predictions.append({
                             "symbol": symbol, "asset": asset,
                             "direction": "--",
                             "confidence": int(signal.probability * 100) if hasattr(signal, 'probability') else 0,
-                            "reason": f"{state.lower()}: V3 SKIP (prob={signal.probability:.2f})",
+                            "reason": f"{state.lower()} [{model}]: SKIP (prob={signal.probability:.2f})",
                             "ob": ob_imb, "flow": net_flow, "state": state,
                         })
                 else:
