@@ -33,20 +33,39 @@ class KalshiV3Signal:
 
 
 class KalshiPredictorV3:
-    """Strike-relative probability predictor for Kalshi 15m contracts."""
+    """Strike-relative probability predictor for Kalshi 15m contracts.
 
-    def __init__(self, prob_table_path: str = "data/store/kalshi_prob_table.json"):
+    Two prediction modes:
+    - Late entry (minute 10+): probability table + technical adjustments
+    - Early entry (minute 0-5): KNN model trained on multi-timeframe features
+    """
+
+    def __init__(self, prob_table_path: str = "data/store/kalshi_prob_table.json",
+                 knn_model_path: str = "models/knn_kalshi.pkl"):
         self._prob_table = {}
         try:
             with open(prob_table_path) as f:
                 self._prob_table = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            pass  # empty table — will return 0.5 for everything
+            pass
+
+        # Load KNN model for early-entry prediction
+        self._knn = None
+        self._knn_scaler = None
+        try:
+            import pickle
+            with open(knn_model_path, "rb") as f:
+                model_data = pickle.load(f)
+                self._knn = model_data["knn"]
+                self._knn_scaler = model_data["scaler"]
+        except (FileNotFoundError, Exception):
+            pass  # no KNN model — early entry disabled
 
     def predict(self, df: pd.DataFrame, strike_price: float,
                 minutes_remaining: float, market_data: dict | None = None,
                 df_1h: pd.DataFrame | None = None,
-                current_price: float | None = None) -> KalshiV3Signal | None:
+                current_price: float | None = None,
+                df_4h: pd.DataFrame | None = None) -> KalshiV3Signal | None:
         """Compute strike-relative probability and bet recommendation.
 
         Args:
@@ -68,16 +87,30 @@ class KalshiPredictorV3:
         # 1. Compute distance from strike in ATR units
         distance_atr = (current_price - strike_price) / atr
 
-        # 2. Look up base probability
-        base_prob = self._lookup_probability(distance_atr, minutes_remaining)
+        # 2. Choose prediction mode based on timing + distance
+        # Early entry (>= 10 min left, near strike): use KNN for direction prediction
+        # Late entry (< 10 min left, or far from strike): use probability table
+        use_knn = (minutes_remaining >= 10
+                   and abs(distance_atr) < 0.5
+                   and self._knn is not None)
 
-        # Sanity check: if price is below strike, probability of closing ABOVE
-        # cannot exceed 50%. If above strike, probability cannot be below 50%.
-        # This prevents the 0.0 bucket's bullish bias from betting YES when below.
-        if current_price < strike_price and base_prob > 0.50:
-            base_prob = 0.50
-        elif current_price > strike_price and base_prob < 0.50:
-            base_prob = 0.50
+        if use_knn:
+            # KNN predicts probability of next candle going UP
+            # This IS the base probability — no table lookup needed
+            knn_prob = self.predict_knn(df, df_1h, df_4h)
+            if knn_prob is not None:
+                base_prob = knn_prob
+            else:
+                base_prob = 0.50  # fallback if KNN fails
+        else:
+            # Standard probability table lookup
+            base_prob = self._lookup_probability(distance_atr, minutes_remaining)
+
+            # Sanity check: cap probability when on wrong side of strike
+            if current_price < strike_price and base_prob > 0.50:
+                base_prob = 0.50
+            elif current_price > strike_price and base_prob < 0.50:
+                base_prob = 0.50
 
         # 3. Apply technical adjustments
         adjustments = self._compute_adjustments(
@@ -124,6 +157,66 @@ class KalshiPredictorV3:
             strike_price=strike_price,
             minutes_remaining=minutes_remaining,
         )
+
+    def predict_knn(self, df: pd.DataFrame, df_1h: pd.DataFrame | None = None,
+                    df_4h: pd.DataFrame | None = None) -> float | None:
+        """Use KNN model to predict probability of next candle going UP.
+
+        Returns probability (0.0-1.0) or None if KNN model not available.
+        Used for early entry (minute 0-5) when distance from strike is minimal.
+        """
+        if self._knn is None or self._knn_scaler is None:
+            return None
+        if df is None or len(df) < 20:
+            return None
+
+        last = df.iloc[-1]
+
+        # Extract same 12 features used in training
+        try:
+            pct = df["close"].pct_change()
+            norm_ret_series = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
+            vol_sma = float(last.get("vol_sma_20", 0))
+            bb_range = float(last.get("bb_upper", 0)) - float(last.get("bb_lower", 0))
+
+            vals = [
+                float(last.get("rsi", 50)),
+                float(last.get("stochrsi_k", 50)),
+                float(last.get("macd_hist", 0)),
+                float(norm_ret_series.iloc[-1]) if pd.notna(norm_ret_series.iloc[-1]) else 0,
+                float(last.get("volume", 0)) / vol_sma if vol_sma > 0 else 1.0,
+                (float(last["close"]) - float(last.get("bb_lower", 0))) / bb_range if bb_range > 0 else 0.5,
+                float(df["ema_12"].pct_change(3).iloc[-1] * 100) if len(df) >= 4 and pd.notna(df["ema_12"].pct_change(3).iloc[-1]) else 0,
+                float(last.get("adx", 20)),
+                float(last.get("roc_5", 0)),
+            ]
+
+            # 1h context
+            if df_1h is not None and len(df_1h) >= 20:
+                r1h = df_1h.iloc[-1]
+                vals.append(float(r1h.get("rsi", 50)))
+                vals.append(float(r1h.get("macd_hist", 0)))
+            else:
+                vals.extend([50.0, 0.0])
+
+            # 4h context
+            if df_4h is not None and len(df_4h) >= 10:
+                r4h = df_4h.iloc[-1]
+                vals.append(float(r4h.get("rsi", 50)))
+            else:
+                vals.append(50.0)
+
+            # Check for NaN/inf
+            if any(pd.isna(v) or np.isinf(v) for v in vals):
+                return None
+
+            X = np.array(vals).reshape(1, -1)
+            X_scaled = self._knn_scaler.transform(X)
+            probs = self._knn.predict_proba(X_scaled)
+            return float(probs[0][1])  # probability of UP
+
+        except Exception:
+            return None
 
     def _lookup_probability(self, distance_atr: float, minutes_remaining: float) -> float:
         """Look up base probability from the pre-computed table."""
