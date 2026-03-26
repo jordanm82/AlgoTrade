@@ -266,14 +266,12 @@ class KalshiDaemon:
     # ------------------------------------------------------------------
 
     def _kalshi_eval(self):
-        """Kalshi evaluation cycle with 15m scoring + fresh leading indicators at each eval.
+        """Kalshi evaluation — minute 3 entry model.
 
         Lifecycle within each 15m window:
-        - SETUP (min 0-4): Score on 15m candles + leading indicators. Cache 15m data. No betting.
-        - OBSERVING (min 5-9): Re-fetch OB + trade flow. Re-score on cached 15m data.
-        - CONFIRMED (min 10-11): Same as OBSERVING — refresh leading indicators, re-score. Place bets.
-        - LAST_LOOK (min 12): 1m momentum check with elevated threshold.
-        - EXPIRED (min 13+): No new bets.
+        - SETUP (min 0-2): Score + cache data. No betting.
+        - CONFIRMED (min 3-5): THE betting window. KNN predicts, bet or skip.
+        - DONE (min 6+): Window closed. Show status only.
         """
         from data.market_data import get_order_book_imbalance, get_trade_flow
 
@@ -341,78 +339,29 @@ class KalshiDaemon:
                 continue
 
             # Determine lifecycle state
-            # Bet early — contracts are cheapest before minute 5
-            # SETUP at first eval, CONFIRMED from second eval onward
+            # Minute 3 is the ONLY entry point — contracts near 50c, backtested at 61% WR
             if minute_in_window <= 2:
-                state = "SETUP"          # first eval — score + cache, no bet
-            elif minute_in_window <= 11:
-                state = "CONFIRMED"      # eligible to bet from minute 3+
-            elif minute_in_window == KALSHI_LASTLOOK_MINUTE:
-                state = "LAST_LOOK"
+                state = "SETUP"          # cache data, no bet
+            elif minute_in_window <= 5:
+                state = "CONFIRMED"      # minute 3-5: the betting window
             else:
-                state = "EXPIRED"
+                state = "DONE"           # past minute 5: no more bets this window
 
-            # --- LAST_LOOK: use cached 5m scores + 1m momentum ---
-            if state == "LAST_LOOK":
-                if not pending or not pending.get("confirmed"):
-                    predictions.append({
-                        "symbol": symbol, "asset": asset,
-                        "direction": pending["direction"] if pending else "--",
-                        "confidence": pending.get("last_5m_conf", 0) if pending else 0,
-                        "reason": "last-look: no prior confirmation",
-                        "ob": 0, "flow": 0, "state": state,
-                    })
-                    continue
-
-                last_conf = pending.get("last_5m_conf", 0)
-                asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, self.kalshi_threshold)
-                elevated = asset_threshold + KALSHI_THRESHOLD_BOOST
-
-                if last_conf < elevated:
-                    predictions.append({
-                        "symbol": symbol, "asset": asset,
-                        "direction": pending["direction"],
-                        "confidence": last_conf,
-                        "reason": f"last-look: conf {last_conf} < elevated threshold {elevated}",
-                        "ob": 0, "flow": 0, "state": state,
-                    })
-                    continue
-
-                # V3: re-run predict() at LAST_LOOK with updated time remaining
-                if self.kalshi_predictor_version == "v3":
-                    strike = pending.get("strike_price")
-                    close_time_dt = pending.get("close_time")
-                    if strike and close_time_dt:
-                        mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
-                        df_15m = self._kalshi_cached_dataframes.get(symbol)
-                        if df_15m is not None and len(df_15m) >= 50:
-                            cb_price = self._get_coinbase_price(symbol)
-                            signal = self.kalshi_predictor.predict(
-                                df_15m, strike_price=float(strike),
-                                minutes_remaining=mins_left,
-                                current_price=cb_price,
-                            )
-                            if signal and signal.recommended_side != "SKIP":
-                                actionable_signals.append({
-                                    "symbol": symbol, "series_ticker": series_ticker,
-                                    "signal": signal, "market_data": None,
-                                    "state": state,
-                                })
-                    predictions.append({
-                        "symbol": symbol, "asset": asset,
-                        "direction": pending["direction"],
-                        "confidence": last_conf,
-                        "reason": "last-look: re-evaluated with updated time",
-                        "ob": 0, "flow": 0, "state": state,
-                    })
+            # --- DONE: past the betting window ---
+            if state == "DONE":
+                if pending and pending.get("bet_placed"):
+                    reason = "bet placed — awaiting settlement"
+                    state_display = "SETTLING"
                 else:
-                    predictions.append({
-                        "symbol": symbol, "asset": asset,
-                        "direction": pending["direction"],
-                        "confidence": last_conf,
-                        "reason": "last-look: no action",
-                        "ob": 0, "flow": 0, "state": state,
-                    })
+                    reason = "window closed — no bet"
+                    state_display = "DONE"
+                predictions.append({
+                    "symbol": symbol, "asset": asset,
+                    "direction": pending.get("direction", "--") if pending else "--",
+                    "confidence": pending.get("last_5m_conf", 0) if pending else 0,
+                    "reason": reason,
+                    "ob": 0, "flow": 0, "state": state_display,
+                })
                 continue
 
             # --- SETUP: 15m base scoring ---
@@ -668,7 +617,7 @@ class KalshiDaemon:
                         prob_pct = int(signal.probability * 100)
                         meets_threshold = prob_pct >= asset_threshold or prob_pct <= (100 - asset_threshold)
 
-                        if state in ("CONFIRMED", "LAST_LOOK") and meets_threshold:
+                        if state == "CONFIRMED" and meets_threshold:
                             actionable_signals.append({
                                 "symbol": symbol, "series_ticker": series_ticker,
                                 "signal": signal, "market_data": market_data,
@@ -679,7 +628,7 @@ class KalshiDaemon:
                             "direction": signal.recommended_side,
                             "confidence": prob_pct,
                             "reason": f"{state.lower()}: V3 prob={signal.probability:.2f} side={signal.recommended_side}"
-                                      + (f" -> BETTING (>={asset_threshold}%)" if state in ("CONFIRMED", "LAST_LOOK") and meets_threshold
+                                      + (f" -> BETTING (>={asset_threshold}%)" if state == "CONFIRMED" and meets_threshold
                                          else f" (below {asset_threshold}% threshold)" if not meets_threshold
                                          else " (waiting)"),
                             "ob": ob_imb, "flow": net_flow, "state": state,
@@ -1089,9 +1038,10 @@ class KalshiDaemon:
         # Wall-clock aligned Kalshi eval at :01, :06, :11 + LAST_LOOK at :12/:27/:42/:57
         now = time.time()
         current_minute = datetime.now(timezone.utc).minute
-        should_eval = (current_minute % 5 == 1 and now - self._last_kalshi_eval >= 240) \
-                   or (current_minute % 15 == 12 and now - self._last_kalshi_eval >= 50) \
-                   or (current_minute % 15 == 1 and now - self._last_kalshi_eval >= 50)
+        # Eval at minute 1 (SETUP) and minute 3 (CONFIRMED — the betting moment)
+        min_in_window = current_minute % 15
+        should_eval = (min_in_window == 1 and now - self._last_kalshi_eval >= 50) \
+                   or (min_in_window == 3 and now - self._last_kalshi_eval >= 50)
         if should_eval:
             try:
                 self._kalshi_eval()
