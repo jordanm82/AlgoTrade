@@ -1287,7 +1287,7 @@ class LiveDaemon:
                 side=side,
                 count=count,
                 price_cents=fill_price,
-                order_type="market",
+                order_type="limit",
             )
             order = result.get("order", {})
             order_id = order.get("order_id", "?")
