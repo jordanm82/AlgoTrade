@@ -233,27 +233,50 @@ class Dashboard:
 
         label = f"Cycle {self._cycle_count}/{self.max_cycles}" if is_signal_cycle else f"Tick {self._tick_count}"
 
-        lines = [
-            "",
-            "=" * 78,
-            f"  ALGOTRADE [{mode}]  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  {label}  |  Up {h}h{m}m",
-            "=" * 78,
-            "",
-            f"  COINBASE: ${self._coinbase_balance:,.2f} + positions ${position_value:,.2f}  |  KALSHI: ${self._kalshi_balance:,.2f}  |  TOTAL: ${total_value:,.2f}",
-            f"  DAILY P&L: ${combined_pnl:+,.2f} ({combined_pct:+.2f}%)  |  Realized: ${realized_pnl:+,.2f}  |  Unrealized: ${unrealized_pnl:+,.2f}",
-            f"  POSITIONS: {len(positions)}/{MAX_CONCURRENT_POSITIONS}  |  EXPOSURE: ${exposure:,.2f}  |  TRADES: {total} (W:{wins} L:{losses} WR:{wr:.0f}%)",
-        ]
+        if self.daemon.kalshi_only:
+            # Kalshi-only mode — show Kalshi stats, not Coinbase
+            # Get real Kalshi balance even in dry-run
+            kalshi_bal = self._kalshi_balance
+            if kalshi_bal == 0 and not hasattr(self, '_kalshi_balance_fetched'):
+                try:
+                    self.daemon._init_kalshi_client()
+                    if self.daemon.kalshi_client:
+                        bal_resp = self.daemon.kalshi_client.get_balance()
+                        kalshi_bal = bal_resp.get("balance", 0) / 100
+                        self._kalshi_balance = kalshi_bal
+                        self._kalshi_balance_fetched = True
+                except Exception:
+                    pass
 
-        # Dry-run Kalshi bet tracking
-        if self.daemon.dry_run and self.daemon.kalshi_only:
             dw = self.daemon._dryrun_wins
             dl = self.daemon._dryrun_losses
             dt = dw + dl
             dwr = dw / dt * 100 if dt > 0 else 0
             pending = len(self.daemon._dryrun_bets)
-            lines.append(f"  KALSHI DRY-RUN: W:{dw} L:{dl} WR:{dwr:.0f}%  |  Pending settlement: {pending}")
+            from config.production import MAX_CONCURRENT_KALSHI_BETS
 
-        lines.append("")
+            lines = [
+                "",
+                "=" * 78,
+                f"  K15 UPDOWN [{mode}] V3  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  Tick {self._tick_count}  |  Up {h}h{m}m",
+                "=" * 78,
+                "",
+                f"  KALSHI BALANCE: ${kalshi_bal:,.2f}  |  BETS: {pending} pending settlement",
+                f"  SESSION: W:{dw} L:{dl} WR:{dwr:.0f}%  |  Max concurrent: {MAX_CONCURRENT_KALSHI_BETS}",
+                "",
+            ]
+        else:
+            lines = [
+                "",
+                "=" * 78,
+                f"  ALGOTRADE [{mode}]  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  {label}  |  Up {h}h{m}m",
+                "=" * 78,
+                "",
+                f"  COINBASE: ${self._coinbase_balance:,.2f} + positions ${position_value:,.2f}  |  KALSHI: ${self._kalshi_balance:,.2f}  |  TOTAL: ${total_value:,.2f}",
+                f"  DAILY P&L: ${combined_pnl:+,.2f} ({combined_pct:+.2f}%)  |  Realized: ${realized_pnl:+,.2f}  |  Unrealized: ${unrealized_pnl:+,.2f}",
+                f"  POSITIONS: {len(positions)}/{MAX_CONCURRENT_POSITIONS}  |  EXPOSURE: ${exposure:,.2f}  |  TRADES: {total} (W:{wins} L:{losses} WR:{wr:.0f}%)",
+                "",
+            ]
 
         # Indicator freshness label
         if self._last_signal_time:
@@ -302,8 +325,8 @@ class Dashboard:
             bb_u_str = self._fmt_price(bb_u)
             lines.append(f"  {sym:<12} {price_str} {rsi:5.1f} {bb_l_str} {bb_m_str} {bb_u_str} {regime:<13}{sig_str}{lev_tag}")
 
-        # Open positions with live P&L
-        if positions:
+        # Open positions with live P&L (skip in kalshi-only)
+        if positions and not self.daemon.kalshi_only:
             lines.append("")
             lines.append("  OPEN POSITIONS:")
             lines.append(f"  {'KEY':<32} {'SIDE':<5} {'ENTRY':>10} {'NOW':>10} {'P&L':>10} {'STOP':>10}")
@@ -322,9 +345,9 @@ class Dashboard:
                     f"${pnl_sign}{upnl:.2f}{'':>4} {stop_str}"
                 )
 
-        # Signals (with confluence detection)
+        # Signals (with confluence detection) — skip in kalshi-only
         sigs = signals if is_signal_cycle else self._last_signals
-        if sigs:
+        if sigs and not self.daemon.kalshi_only:
             lines.append("")
             # Group signals by (symbol, action) for confluence detection
             grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -353,12 +376,12 @@ class Dashboard:
             lines.append(f"  SIGNALS ({len(sigs)}):")
             for cl in confluence_lines[-8:]:
                 lines.append(cl)
-        else:
+        elif not self.daemon.kalshi_only:
             lines.append("")
             lines.append("  No signals this cycle")
 
-        # Closed trades
-        if closed:
+        # Closed trades (skip in kalshi-only)
+        if closed and not self.daemon.kalshi_only:
             lines.append("")
             lines.append(f"  CLOSED TRADES (last 5):")
             for t in closed[-5:]:
@@ -443,35 +466,67 @@ class Dashboard:
         wr = (wins / total * 100) if total > 0 else 0
 
         mode = "DRY-RUN" if self.dry_run else "LIVE"
-        lines = [
-            "",
-            "=" * 78,
-            f"  SESSION COMPLETE [{mode}]",
-            "=" * 78,
-            "",
-            f"  Duration:     {uptime}",
-            f"  Cycles:       {self._cycle_count}",
-            f"  Ticks:        {self._tick_count}",
-            "",
-            f"  Start Equity: ${self._start_equity:,.2f}",
-            f"  End Equity:   ${equity:,.2f}",
-            f"  P&L:          ${pnl:+,.2f} ({pnl_pct:+.2f}%)",
-            "",
-            f"  Total Trades: {total}",
-            f"  Wins:         {wins}",
-            f"  Losses:       {losses}",
-            f"  Win Rate:     {wr:.1f}%",
-            "",
-            f"  Open Positions: {len(self.daemon.tracker.open_positions())}",
-            "",
-        ]
-        if closed:
-            lines.append("  ALL TRADES:")
-            for i, t in enumerate(closed):
-                sym = t.get("symbol", "?")[:25]
-                pnl_t = t.get("pnl_usd", 0)
-                sign = "+" if pnl_t >= 0 else ""
-                lines.append(f"    {i+1}. {sym:<25} ${sign}{pnl_t:.2f}")
+
+        if self.daemon.kalshi_only:
+            dw = self.daemon._dryrun_wins
+            dl = self.daemon._dryrun_losses
+            dt = dw + dl
+            dwr = dw / dt * 100 if dt > 0 else 0
+            pending = len(self.daemon._dryrun_bets)
+            lines = [
+                "",
+                "=" * 78,
+                f"  K15 SESSION COMPLETE [{mode}]",
+                "=" * 78,
+                "",
+                f"  Duration:     {uptime}",
+                f"  Ticks:        {self._tick_count}",
+                "",
+                f"  Kalshi Bets:  {dt}",
+                f"  Wins:         {dw}",
+                f"  Losses:       {dl}",
+                f"  Win Rate:     {dwr:.1f}%",
+                f"  Pending:      {pending}",
+                "",
+                "  RESULTS:",
+            ]
+            for r in self.daemon._dryrun_results:
+                color = "WIN " if r["result"] == "WIN" else "LOSS"
+                lines.append(
+                    f"    {color} {r['asset']:<5} {r['direction']:<4} "
+                    f"strike=${r['strike']:,.2f} actual=${r.get('settle_price',0):,.2f}"
+                )
+            lines.append("")
+        else:
+            lines = [
+                "",
+                "=" * 78,
+                f"  SESSION COMPLETE [{mode}]",
+                "=" * 78,
+                "",
+                f"  Duration:     {uptime}",
+                f"  Cycles:       {self._cycle_count}",
+                f"  Ticks:        {self._tick_count}",
+                "",
+                f"  Start Equity: ${self._start_equity:,.2f}",
+                f"  End Equity:   ${equity:,.2f}",
+                f"  P&L:          ${pnl:+,.2f} ({pnl_pct:+.2f}%)",
+                "",
+                f"  Total Trades: {total}",
+                f"  Wins:         {wins}",
+                f"  Losses:       {losses}",
+                f"  Win Rate:     {wr:.1f}%",
+                "",
+                f"  Open Positions: {len(self.daemon.tracker.open_positions())}",
+                "",
+            ]
+            if closed:
+                lines.append("  ALL TRADES:")
+                for i, t in enumerate(closed):
+                    sym = t.get("symbol", "?")[:25]
+                    pnl_t = t.get("pnl_usd", 0)
+                    sign = "+" if pnl_t >= 0 else ""
+                    lines.append(f"    {i+1}. {sym:<25} ${sign}{pnl_t:.2f}")
 
         lines.append("")
         lines.append("=" * 78)
