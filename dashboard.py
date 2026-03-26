@@ -156,46 +156,77 @@ class Dashboard:
         return 0.0
 
     def _draw_opening(self):
-        """Opening status screen."""
+        """Opening status screen — shows relevant info per bot."""
         now = datetime.now(timezone.utc)
         mode = "DRY-RUN" if self.dry_run else "LIVE"
-        lines = [
-            "",
-            "=" * 78,
-            "",
-            "     ___    __    _____ ____  ______ ____  ___    ____  ______",
-            "    /   |  / /   / ___// __ \\/_  __// __ \\/   |  / __ \\/ ____/",
-            "   / /| | / /   / __ \\/ / / / / /  / /_/ / /| | / / / / __/",
-            "  / ___ |/ /___/ /_/ / /_/ / / /  / _, _/ ___ |/ /_/ / /___",
-            " /_/  |_/_____/\\____/\\____/ /_/  /_/ |_/_/  |_/_____/_____/",
-            "",
-            "=" * 78,
-            f"  MODE: {mode}          {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
-            f"  COINBASE: ${self._start_coinbase:,.2f}  |  KALSHI: ${self._start_kalshi:,.2f}  |  TOTAL: ${self._start_coinbase + self._start_kalshi:,.2f}",
-            f"  MAX CYCLES: {self.max_cycles}  (~{self.max_cycles * 15} minutes)",
-            "=" * 78,
-            "",
-            "  STRATEGIES (per-pair optimized thresholds):",
-            "    1. BB Grid Long+Short — per-pair RSI buy/short thresholds",
-            "    2. RSI Mean Reversion Long+Short — per-pair oversold/overbought",
-            "",
-            "  RISK CONTROLS:",
-            f"    - Position size: {POSITION_SIZE_PCT:.0%} of equity (compounding)",
-            f"    - Max leverage: {MAX_LEVERAGE}x",
-            f"    - Stop-loss: {STOP_LOSS_PCT:.0%} hard stop",
-            f"    - Max positions: {MAX_CONCURRENT_POSITIONS}",
-            "    - Daily drawdown halt: 5%",
-            "",
-            "  MONITORED PAIRS:",
-            f"    {'  '.join(ALL_PAIRS)}",
-            "",
-            "  BACKTEST PERFORMANCE (6 months, Sep 2025 - Mar 2026):",
-            "    ATOM BB Grid 2x:  88.2% WR | +592% return | 551 trades",
-            "    FIL  BB Grid 2x:  71.5% WR | +325% return | 492 trades",
-            "    DOT  BB Grid 2x:  76.2% WR | +101% return | 564 trades",
-            "",
-            "=" * 78,
-        ]
+
+        if self.daemon.kalshi_only:
+            # K15 UpDown banner
+            thresholds = getattr(self.daemon, 'KALSHI_THRESHOLDS', {})
+            pairs = list(getattr(self.daemon, 'KALSHI_PAIRS', {}).keys())
+            lines = [
+                "",
+                "=" * 78,
+                "",
+                "  K15 UPDOWN — Kalshi 15-Minute Prediction Bot",
+                "",
+                "=" * 78,
+                f"  MODE: {mode}          {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                f"  KALSHI BALANCE: ${self._start_kalshi:,.2f}",
+                f"  CYCLES: {self.max_cycles}  (~{self.max_cycles * 15} minutes)",
+                "=" * 78,
+                "",
+                "  MODEL: V3 Strike-Relative + KNN Early Entry",
+                "  ENTRY: Minute 3+ (contracts near 50c)",
+                f"  MAX CONCURRENT BETS: {MAX_CONCURRENT_KALSHI_BETS}",
+                "",
+                "  ASSET THRESHOLDS (tiered by backtest performance):",
+            ]
+            for sym, thresh in thresholds.items():
+                asset = sym.split("/")[0]
+                tier = "Tier 1" if thresh == 60 else "Tier 2" if thresh == 65 else "Tier 3"
+                lines.append(f"    {asset:<5} >= {thresh}%  ({tier})")
+            lines.extend([
+                "",
+                f"  PAIRS: {', '.join(p.split('/')[0] for p in pairs)}",
+                "",
+                "=" * 78,
+            ])
+        else:
+            # Spot trading banner
+            lines = [
+                "",
+                "=" * 78,
+                "",
+                "     ___    __    _____ ____  ______ ____  ___    ____  ______",
+                "    /   |  / /   / ___// __ \\/_  __// __ \\/   |  / __ \\/ ____/",
+                "   / /| | / /   / __ \\/ / / / / /  / /_/ / /| | / / / / __/",
+                "  / ___ |/ /___/ /_/ / /_/ / / /  / _, _/ ___ |/ /_/ / /___",
+                " /_/  |_/_____/\\____/\\____/ /_/  /_/ |_/_/  |_/_____/_____/",
+                "",
+                "=" * 78,
+                f"  MODE: {mode}          {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                f"  COINBASE: ${self._start_coinbase:,.2f}  |  KALSHI: ${self._start_kalshi:,.2f}  |  TOTAL: ${self._start_coinbase + self._start_kalshi:,.2f}",
+                f"  MAX CYCLES: {self.max_cycles}  (~{self.max_cycles * 15} minutes)",
+                "=" * 78,
+                "",
+                "  STRATEGIES (per-pair optimized thresholds):",
+                "    1. BB Grid Long+Short — per-pair RSI buy/short thresholds",
+                "    2. RSI Mean Reversion Long+Short — per-pair oversold/overbought",
+                "",
+                "  RISK CONTROLS:",
+                f"    - Position size: {POSITION_SIZE_PCT:.0%} of equity (compounding)",
+                f"    - Max leverage: {MAX_LEVERAGE}x",
+                f"    - Stop-loss: {STOP_LOSS_PCT:.0%} hard stop",
+                f"    - Max positions: {MAX_CONCURRENT_POSITIONS}",
+                "    - Daily drawdown halt: 5%",
+                "",
+                "  MONITORED PAIRS:",
+                f"    {'  '.join(ALL_PAIRS)}",
+                "",
+                "=" * 78,
+            ]
+
         self._write_log(lines)
         time.sleep(2)
 
