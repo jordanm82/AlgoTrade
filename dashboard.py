@@ -704,19 +704,17 @@ def main():
     parser.add_argument("--dry-run", action="store_true", default=True, help="Paper trading (default)")
     parser.add_argument("--live", action="store_true", help="Live trading")
     parser.add_argument("--cycles", type=int, default=15, help="Signal cycles to run")
-    parser.add_argument("--bot", choices=["k15", "spot"], default="k15",
-                        help="Which bot to run: k15 (Kalshi 15m predictions) or spot (Coinbase BB Grid)")
-    # Legacy flags still accepted for compatibility
-    parser.add_argument("--kalshi-only", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--predictor", choices=["v1", "v2", "v3"], default="v3", help=argparse.SUPPRESS)
+    parser.add_argument("--k15", action="store_true", default=True, help="Run K15 Kalshi 15m prediction bot (default)")
+    parser.add_argument("--spot", action="store_true", help="Run Coinbase spot trading bot (BB Grid + RSI MR)")
     parser.add_argument("--simple", action="store_true", help="Force plain text output (for logs/pipes)")
     args = parser.parse_args()
 
-    # --kalshi-only is now the same as --bot k15
-    kalshi_only = args.bot == "k15" or args.kalshi_only
+    # --spot overrides the default --k15
+    kalshi_only = not args.spot
 
     dry_run = not args.live
-    Dashboard(dry_run=dry_run, max_cycles=args.cycles, kalshi_only=kalshi_only, predictor_version=args.predictor).run()
+    predictor_version = "v3" if kalshi_only else "v1"
+    Dashboard(dry_run=dry_run, max_cycles=args.cycles, kalshi_only=kalshi_only, predictor_version=predictor_version).run()
 
 
 if __name__ == "__main__":
