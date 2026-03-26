@@ -473,30 +473,57 @@ class Dashboard:
             dt = dw + dl
             dwr = dw / dt * 100 if dt > 0 else 0
             pending = len(self.daemon._pending_bets)
+            total_placed = self.daemon._session_bets_placed
+
+            # Before showing summary, do a final settlement check
+            self.daemon._check_dryrun_settlements()
+            # Re-count after final check
+            dw = self.daemon._session_wins
+            dl = self.daemon._session_losses
+            dt = dw + dl
+            dwr = dw / dt * 100 if dt > 0 else 0
+            pending = len(self.daemon._pending_bets)
+
             lines = [
                 "",
                 "=" * 78,
                 f"  K15 SESSION COMPLETE [{mode}]",
                 "=" * 78,
                 "",
-                f"  Duration:     {uptime}",
-                f"  Ticks:        {self._tick_count}",
+                f"  Duration:       {uptime}",
+                f"  Ticks:          {self._tick_count}",
                 "",
-                f"  Kalshi Bets:  {dt}",
-                f"  Wins:         {dw}",
-                f"  Losses:       {dl}",
-                f"  Win Rate:     {dwr:.1f}%",
-                f"  Pending:      {pending}",
-                "",
-                "  RESULTS:",
+                f"  Bets Placed:    {total_placed}",
+                f"  Settled:        {dt}",
+                f"  Wins:           {dw}",
+                f"  Losses:         {dl}",
+                f"  Win Rate:       {dwr:.1f}%",
             ]
-            for r in self.daemon._completed_bets:
-                color = "WIN " if r["result"] == "WIN" else "LOSS"
-                lines.append(
-                    f"    {color} {r['asset']:<5} {r['direction']:<4} "
-                    f"strike=${r['strike']:,.2f} actual=${r.get('settle_price',0):,.2f}"
-                )
+            if pending > 0:
+                lines.append(f"  Still Pending:  {pending} (not yet settled)")
             lines.append("")
+
+            if self.daemon._completed_bets:
+                lines.append("  SETTLED BETS:")
+                lines.append(f"    {'':>4} {'ASSET':<5} {'SIDE':<4} {'STRIKE':>12} {'SETTLED':>12} {'RESULT':>6}")
+                lines.append(f"    {'─'*50}")
+                for i, r in enumerate(self.daemon._completed_bets, 1):
+                    result_tag = "WIN" if r["result"] == "WIN" else "LOSS"
+                    lines.append(
+                        f"    {i:>3}. {r['asset']:<5} {r['direction']:<4} "
+                        f"${r['strike']:>10,.2f} ${r.get('settle_price',0):>10,.2f} "
+                        f"{'  ' + result_tag:>6}"
+                    )
+                lines.append("")
+
+            if pending > 0:
+                lines.append("  PENDING BETS (not yet settled):")
+                for b in self.daemon._pending_bets:
+                    lines.append(
+                        f"    {b['asset']:<5} {b['direction']:<4} "
+                        f"strike=${b['strike']:,.2f} settles={b['settle_time'].strftime('%H:%M:%S')} UTC"
+                    )
+                lines.append("")
         else:
             lines = [
                 "",
