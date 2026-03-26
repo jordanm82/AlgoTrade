@@ -319,13 +319,13 @@ class KalshiPredictorV3:
 
     def _decide_bet(self, adjusted_prob: float) -> tuple[str, int]:
         """Decide bet side and max price from adjusted probability."""
-        if adjusted_prob >= 0.65:
+        if adjusted_prob >= 0.60:
             # Bet YES — price likely closes above strike
             fair_price = int(adjusted_prob * 100)
             max_price = min(MAX_BET_PRICE, fair_price - int(EDGE_MARGIN * 100))
             if max_price >= 5:  # minimum viable price
                 return "YES", max_price
-        elif adjusted_prob <= 0.35:
+        elif adjusted_prob <= 0.40:
             # Bet NO — price likely closes below strike
             no_prob = 1.0 - adjusted_prob
             fair_price = int(no_prob * 100)
@@ -334,3 +334,38 @@ class KalshiPredictorV3:
                 return "NO", max_price
 
         return "SKIP", 0
+
+    @staticmethod
+    def kelly_size(probability: float, contract_price_cents: int,
+                   balance_cents: int, fraction: float = 0.5) -> int:
+        """Calculate Kelly-optimal position size in number of contracts.
+
+        Args:
+            probability: our estimated probability of winning (0-1)
+            contract_price_cents: what we'd pay per contract
+            balance_cents: total available balance in cents
+            fraction: Kelly fraction (0.5 = half-Kelly for safety)
+
+        Returns:
+            Number of contracts to buy
+        """
+        if contract_price_cents <= 0 or contract_price_cents >= 100:
+            return 0
+
+        # Binary payoff: win (100 - price), lose (price)
+        b = (100 - contract_price_cents) / contract_price_cents  # net odds
+        q = 1.0 - probability
+
+        # Kelly formula: f* = (bp - q) / b
+        kelly_f = (b * probability - q) / b
+        if kelly_f <= 0:
+            return 0  # negative edge, don't bet
+
+        # Apply fractional Kelly
+        f = kelly_f * fraction
+
+        # Convert to contract count
+        risk_amount = int(balance_cents * f)
+        count = risk_amount // contract_price_cents
+
+        return max(0, count)

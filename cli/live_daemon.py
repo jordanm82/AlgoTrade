@@ -1247,9 +1247,27 @@ class LiveDaemon:
                 except Exception:
                     pass
 
-            # Calculate simulated P&L
-            risk_budget = 500  # simulate 5% of $100 balance = $5 = 500c
-            count = max(1, risk_budget // contract_price) if contract_price > 0 else 1
+            # Calculate position size using Kelly criterion
+            # Get balance from Kalshi (or simulate)
+            dry_balance_cents = 10000  # default $100 simulated balance
+            try:
+                if self.kalshi_client:
+                    bal = self.kalshi_client.get_balance()
+                    dry_balance_cents = bal.get("balance", 10000)
+            except Exception:
+                pass
+
+            if isinstance(signal, KalshiV3Signal) and contract_price > 0:
+                count = KalshiPredictorV3.kelly_size(
+                    probability=signal.probability,
+                    contract_price_cents=contract_price,
+                    balance_cents=dry_balance_cents,
+                    fraction=0.5,  # half-Kelly for safety
+                )
+                count = max(1, count)  # minimum 1 contract
+            else:
+                risk_budget = int(dry_balance_cents * 0.05)
+                count = max(1, risk_budget // contract_price) if contract_price > 0 else 1
             cost = count * contract_price
             potential_profit = count * (100 - contract_price)
 
@@ -1369,9 +1387,19 @@ class LiveDaemon:
                     "yellow"))
                 return pred
 
-            # Position size from risk budget: count = max_loss / entry_price
-            # entry_price IS the max loss per contract (we hold to settlement)
-            count = max(1, risk_budget_cents // fill_price)
+            # Position size: Kelly criterion for V3, flat % for V1/V2
+            from strategy.strategies.kalshi_predictor_v3 import KalshiV3Signal as _V3Sig
+            if isinstance(signal, _V3Sig) and fill_price > 0:
+                from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3
+                count = KalshiPredictorV3.kelly_size(
+                    probability=signal.probability,
+                    contract_price_cents=fill_price,
+                    balance_cents=balance_cents,
+                    fraction=0.5,  # half-Kelly
+                )
+                count = max(1, count)
+            else:
+                count = max(1, risk_budget_cents // fill_price)
             potential_profit = count * (100 - fill_price)
             potential_loss = count * fill_price
             rr_ratio = potential_profit / potential_loss if potential_loss > 0 else 0
