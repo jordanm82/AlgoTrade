@@ -41,16 +41,16 @@ class KalshiDaemon:
         "BNB/USDT": "KXBNB15M",
     }
 
-    # Per-asset minimum confidence thresholds (from 3-month backtest optimization)
-    # Class A (threshold 30): BTC — strong at lower confidence
-    # Class A (threshold 35): ETH, SOL, BNB — best WR at moderate confidence
-    # Class B (threshold 30): XRP — degrades at higher thresholds
+    # Per-asset confidence thresholds (tiered from 1m backtest at minute 3)
+    # Tier 1: BNB — strongest edge, lower threshold for more bets (67% WR @60%)
+    # Tier 2: SOL, XRP — solid edge, moderate threshold (66-67% WR @65%)
+    # Tier 3: ETH, BTC — weaker but still profitable at high conf (73-74% WR @70%)
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 30,
-        "ETH/USDT": 35,
-        "SOL/USDT": 35,
-        "XRP/USDT": 30,
-        "BNB/USDT": 35,
+        "BTC/USDT": 70,   # Tier 3 — only high confidence
+        "ETH/USDT": 70,   # Tier 3 — only high confidence
+        "SOL/USDT": 65,   # Tier 2 — moderate threshold
+        "XRP/USDT": 65,   # Tier 2 — moderate threshold
+        "BNB/USDT": 60,   # Tier 1 — strongest edge, more bets
     }
 
     # Coinbase symbol mapping for V3 live price (closer to CF Benchmarks BRTI)
@@ -663,8 +663,12 @@ class KalshiDaemon:
 
                     if isinstance(signal, KalshiV3Signal) and signal.recommended_side != "SKIP":
                         pending["confirmed"] = True
-                        # Only bet at CONFIRMED (min 10+) or LAST_LOOK, not OBSERVING
-                        if state in ("CONFIRMED", "LAST_LOOK"):
+                        # Apply per-asset confidence threshold
+                        asset_threshold = self.KALSHI_THRESHOLDS.get(symbol, 60)
+                        prob_pct = int(signal.probability * 100)
+                        meets_threshold = prob_pct >= asset_threshold or prob_pct <= (100 - asset_threshold)
+
+                        if state in ("CONFIRMED", "LAST_LOOK") and meets_threshold:
                             actionable_signals.append({
                                 "symbol": symbol, "series_ticker": series_ticker,
                                 "signal": signal, "market_data": market_data,
@@ -673,9 +677,11 @@ class KalshiDaemon:
                         predictions.append({
                             "symbol": symbol, "asset": asset,
                             "direction": signal.recommended_side,
-                            "confidence": int(signal.probability * 100),
+                            "confidence": prob_pct,
                             "reason": f"{state.lower()}: V3 prob={signal.probability:.2f} side={signal.recommended_side}"
-                                      + (" -> BETTING" if state in ("CONFIRMED", "LAST_LOOK") else " (observing)"),
+                                      + (f" -> BETTING (>={asset_threshold}%)" if state in ("CONFIRMED", "LAST_LOOK") and meets_threshold
+                                         else f" (below {asset_threshold}% threshold)" if not meets_threshold
+                                         else " (waiting)"),
                             "ob": ob_imb, "flow": net_flow, "state": state,
                         })
                     else:
