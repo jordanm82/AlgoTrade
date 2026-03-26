@@ -212,9 +212,14 @@ class Dashboard:
         self._fetch_account_balances()
 
         equity = self.daemon._equity
-        positions = self.daemon.tracker.open_positions()
-        exposure = self.daemon.tracker.total_exposure()
-        closed = self.daemon.tracker.closed_trades()
+        if self.daemon.tracker is not None:
+            positions = self.daemon.tracker.open_positions()
+            exposure = self.daemon.tracker.total_exposure()
+            closed = self.daemon.tracker.closed_trades()
+        else:
+            positions = []
+            exposure = 0
+            closed = []
         wins = sum(1 for t in closed if t.get("pnl_usd", 0) > 0)
         losses = sum(1 for t in closed if t.get("pnl_usd", 0) <= 0)
         total = wins + losses
