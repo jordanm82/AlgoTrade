@@ -510,7 +510,10 @@ class Dashboard:
         equity = self.daemon._equity
         pnl = self.daemon._pnl_today
         pnl_pct = (equity - self._start_equity) / self._start_equity * 100 if self._start_equity > 0 else 0
-        closed = self.daemon.tracker.closed_trades()
+        if self.daemon.tracker is not None:
+            closed = self.daemon.tracker.closed_trades()
+        else:
+            closed = []
         wins = sum(1 for t in closed if t.get("pnl_usd", 0) > 0)
         losses = sum(1 for t in closed if t.get("pnl_usd", 0) <= 0)
         total = wins + losses
@@ -725,9 +728,9 @@ class Dashboard:
                     self.daemon._update_equity()
                     current_minute = datetime.now(timezone.utc).minute
                     now_ts = time.time()
-                    should_eval = (current_minute % 5 == 1 and now_ts - self.daemon._last_kalshi_eval >= 240) \
-                               or (current_minute % 15 == 12 and now_ts - self.daemon._last_kalshi_eval >= 50) \
-                               or (current_minute % 15 == 1 and now_ts - self.daemon._last_kalshi_eval >= 50)
+                    min_in_window = current_minute % 15
+                    should_eval = (min_in_window == 1 and now_ts - self.daemon._last_kalshi_eval >= 50) \
+                               or (min_in_window == 3 and now_ts - self.daemon._last_kalshi_eval >= 50)
                     if should_eval:
                         try:
                             self.daemon._kalshi_eval()
