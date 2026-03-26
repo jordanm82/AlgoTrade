@@ -262,7 +262,13 @@ class Dashboard:
                 "=" * 78,
                 "",
                 f"  KALSHI BALANCE: ${kalshi_bal:,.2f}  |  BETS: {pending} pending settlement",
-                f"  SESSION: W:{dw} L:{dl} WR:{dwr:.0f}%  |  Max concurrent: {MAX_CONCURRENT_KALSHI_BETS}",
+            ]
+            session_pnl = sum(b.get("pnl_dollars", 0) for b in self.daemon._completed_bets)
+            pnl_sign = "+" if session_pnl >= 0 else ""
+            lines.append(
+                f"  SESSION: W:{dw} L:{dl} WR:{dwr:.0f}%  |  P&L: ${pnl_sign}{session_pnl:.2f}  |  Max bets: {MAX_CONCURRENT_KALSHI_BETS}"
+            )
+            lines.extend([
                 "",
             ]
         else:
@@ -484,6 +490,11 @@ class Dashboard:
             dwr = dw / dt * 100 if dt > 0 else 0
             pending = len(self.daemon._pending_bets)
 
+            # Calculate total P&L
+            total_pnl = sum(b.get("pnl_dollars", 0) for b in self.daemon._completed_bets)
+            total_risked = sum(b.get("cost_cents", 0) for b in self.daemon._completed_bets) / 100
+            roi = (total_pnl / total_risked * 100) if total_risked > 0 else 0
+
             lines = [
                 "",
                 "=" * 78,
@@ -498,21 +509,30 @@ class Dashboard:
                 f"  Wins:           {dw}",
                 f"  Losses:         {dl}",
                 f"  Win Rate:       {dwr:.1f}%",
+                "",
+                f"  Total Risked:   ${total_risked:,.2f}",
+                f"  Net P&L:        ${total_pnl:+,.2f}",
+                f"  ROI:            {roi:+.1f}%",
             ]
             if pending > 0:
-                lines.append(f"  Still Pending:  {pending} (not yet settled)")
+                lines.append(f"\n  Still Pending:  {pending} (not yet settled)")
             lines.append("")
 
             if self.daemon._completed_bets:
                 lines.append("  SETTLED BETS:")
-                lines.append(f"    {'':>4} {'ASSET':<5} {'SIDE':<4} {'STRIKE':>12} {'SETTLED':>12} {'RESULT':>6}")
-                lines.append(f"    {'─'*50}")
+                lines.append(f"    {'':>4} {'ASSET':<5} {'SIDE':<4} {'ENTRY':>6} {'QTY':>4} {'STRIKE':>12} {'SETTLED':>12} {'RESULT':>6} {'P&L':>8}")
+                lines.append(f"    {'─'*65}")
                 for i, r in enumerate(self.daemon._completed_bets, 1):
                     result_tag = "WIN" if r["result"] == "WIN" else "LOSS"
+                    entry = r.get("contract_price", 0)
+                    qty = r.get("count", 1)
+                    pnl = r.get("pnl_dollars", 0)
+                    pnl_sign = "+" if pnl >= 0 else ""
                     lines.append(
                         f"    {i:>3}. {r['asset']:<5} {r['direction']:<4} "
+                        f"{entry:>4}c x{qty:<3} "
                         f"${r['strike']:>10,.2f} ${r.get('settle_price',0):>10,.2f} "
-                        f"{'  ' + result_tag:>6}"
+                        f" {result_tag:<4} ${pnl_sign}{pnl:.2f}"
                     )
                 lines.append("")
 

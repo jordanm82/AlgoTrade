@@ -640,17 +640,29 @@ class LiveDaemon:
                         result_str = "WIN" if won else "LOSS"
                         color = "green" if won else "red"
 
+                        # Calculate P&L
+                        entry_price = bet.get("contract_price", 0)
+                        count = bet.get("count", 1)
+                        if won:
+                            pnl_cents = count * (100 - entry_price)
+                        else:
+                            pnl_cents = -(count * entry_price)
+                        pnl_dollars = pnl_cents / 100
+
                         print(colored(
                             f"  [SETTLED] {asset} {bet['direction']} "
+                            f"@ {entry_price}c x{count} "
                             f"strike=${bet['strike']:,.2f} "
                             f"settled=${float(expiration_value):,.2f} "
-                            f"result={result.upper()} → {result_str}",
+                            f"→ {result_str} ${pnl_dollars:+.2f}",
                             color,
                         ))
 
                         bet["result"] = result_str
                         bet["settle_price"] = float(expiration_value)
                         bet["kalshi_result"] = result
+                        bet["pnl_cents"] = pnl_cents
+                        bet["pnl_dollars"] = pnl_dollars
                         self._completed_bets.append(bet)
                         if won:
                             self._session_wins += 1
@@ -1195,14 +1207,51 @@ class LiveDaemon:
         pred["reason"] = f"would bet {side.upper()} (conf={conf_display})"
 
         if self.dry_run:
-            # Record dry-run bet for settlement tracking
+            # Record dry-run bet with ACTUAL contract price from Kalshi
             from strategy.strategies.kalshi_predictor_v3 import KalshiV3Signal
             strike = 0
             settle_time = None
+            contract_price = 0
+            ticker = ""
+
             if isinstance(signal, KalshiV3Signal):
                 strike = signal.strike_price
                 pending = self._kalshi_pending_signals.get(asset, {})
                 settle_time = pending.get("close_time")
+
+            # Query Kalshi for actual contract price
+            self._init_kalshi_client()
+            if self.kalshi_client and strike:
+                try:
+                    series = self.KALSHI_PAIRS.get(symbol, "")
+                    markets = self.kalshi_client.get_markets(series_ticker=series, status="open")
+                    if markets:
+                        m = markets[0]
+                        ticker = m.get("ticker", "")
+                        # Get the ask price for our side
+                        if side == "yes":
+                            contract_price = int(float(m.get("yes_ask_dollars", 0)) * 100)
+                        else:
+                            contract_price = int(float(m.get("no_ask_dollars", 0)) * 100)
+
+                        # Also try orderbook for better price
+                        try:
+                            book = self.kalshi_client.get_orderbook(ticker)
+                            ob_data = book.get("orderbook", {})
+                            asks = ob_data.get(side, [])
+                            if asks and len(asks) > 0:
+                                best_ask = asks[0][0] if isinstance(asks[0], list) else asks[0]
+                                contract_price = int(best_ask)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Calculate simulated P&L
+            risk_budget = 500  # simulate 5% of $100 balance = $5 = 500c
+            count = max(1, risk_budget // contract_price) if contract_price > 0 else 1
+            cost = count * contract_price
+            potential_profit = count * (100 - contract_price)
 
             if strike and settle_time:
                 self._pending_bets.append({
@@ -1214,13 +1263,19 @@ class LiveDaemon:
                     "confidence": conf_display,
                     "bet_time": datetime.now(timezone.utc),
                     "settle_time": settle_time,
+                    "contract_price": contract_price,
+                    "count": count,
+                    "cost_cents": cost,
+                    "potential_profit_cents": potential_profit,
                 })
+                self._session_bets_placed += 1
 
             print(colored(
                 f"  [KALSHI DRY] {asset} {direction_label} "
-                f"conf={conf_display} | "
-                f"OB={ob_imb:+.2f} flow={net_flow:+.2f} | "
-                f"bet {side.upper()} strike=${strike:,.2f} (hold to settlement)",
+                f"prob={conf_display}% | "
+                f"{side.upper()} x{count} @ {contract_price}c "
+                f"risk=${cost/100:.2f} profit=${potential_profit/100:.2f} "
+                f"strike=${strike:,.2f}",
                 "magenta",
             ))
             return pred
