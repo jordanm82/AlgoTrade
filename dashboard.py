@@ -270,7 +270,7 @@ class Dashboard:
             )
             lines.extend([
                 "",
-            ]
+            ])
         else:
             lines = [
                 "",
