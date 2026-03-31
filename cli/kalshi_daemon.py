@@ -1430,6 +1430,7 @@ class KalshiDaemon:
                     "count": 0,
                     "contract_price": fill_price,
                     "order_id": order_id,
+                    "ticker": ticker,
                     "live": True,
                     "needs_fill_check": True,
                 }
@@ -1577,16 +1578,21 @@ class KalshiDaemon:
                     ))
                     continue  # don't add back to resting list
 
-                if minute_in_window >= 10 and order_status == "resting":
-                    # Cancel at minute 10 — too close to settlement
+                # Cancel if: minute >= 10 OR order is from a previous window (settle_time passed)
+                order_expired = False
+                settle_time = order.get("settle_time")
+                if settle_time and now_utc > settle_time:
+                    order_expired = True
+
+                if (minute_in_window >= 10 or order_expired) and order_status == "resting":
+                    reason = "previous window" if order_expired else f"min {minute_in_window}"
                     try:
                         self.kalshi_client.cancel_order_safe(order_id)
                         print(colored(
                             f"  [RESTING CANCEL] {asset} {order['side'].upper()} "
-                            f"@ {order['fill_price']}c — cancelled at min {minute_in_window}",
+                            f"@ {order['fill_price']}c — cancelled ({reason})",
                             "yellow",
                         ))
-                        # Remove from pending bets too
                         self._pending_bets = [
                             b for b in self._pending_bets
                             if b.get("order_id") != order_id
@@ -1595,23 +1601,22 @@ class KalshiDaemon:
                         print(colored(f"  [CANCEL ERR] {asset}: {e}", "red"))
                     continue  # don't add back
 
-                # Still resting — show current ask price so we can see the gap
+                # Still resting — query the ORDER's status for current market ask
                 current_ask = "?"
                 try:
-                    side = order.get("side", "yes")
-                    symbol = order.get("symbol", "")
-                    series = self.KALSHI_PAIRS.get(symbol, "")
-                    if series:
-                        mkts = self.kalshi_client.get_markets(series_ticker=series, status="open")
-                        if mkts:
-                            mkts.sort(key=lambda x: x.get("close_time", "9999"))
-                            m = mkts[0]
-                            if side == "yes":
-                                raw = m.get("yes_ask_dollars") or m.get("yes_ask")
-                            else:
-                                raw = m.get("no_ask_dollars") or m.get("no_ask")
-                            if raw:
-                                current_ask = f"{int(float(raw) * 100)}c"
+                    # Use the order status we already fetched — check the order's own ticker
+                    order_ticker = status.get("ticker") or order.get("ticker", "")
+                    if order_ticker:
+                        mkt = self.kalshi_client.get_market(order_ticker)
+                        market_data = mkt.get("market", mkt)
+                        side = order.get("side", "yes")
+                        if side == "yes":
+                            raw = market_data.get("yes_ask") or market_data.get("yes_ask_dollars")
+                        else:
+                            raw = market_data.get("no_ask") or market_data.get("no_ask_dollars")
+                        if raw:
+                            ask_val = float(raw) * 100 if float(raw) < 1.5 else float(raw)
+                            current_ask = f"{int(ask_val)}c"
                 except Exception:
                     pass
 
