@@ -91,6 +91,7 @@ class KalshiDaemon:
 
         self.kalshi_client = None  # lazy init
         self.kalshi_ws = None      # WebSocket for real-time prices
+        self._brti_proxy = None    # multi-exchange BRTI approximation
         self.kalshi_threshold = 30  # minimum confidence to bet
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
         self._active_kalshi_bets = {}  # {ticker: placement_time}
@@ -660,9 +661,9 @@ class KalshiDaemon:
         predictions = []
         actionable_signals = []
 
-        # Pre-fetch 1m data for all assets in PARALLEL (cuts 8-12s → 2-3s)
+        # Pre-fetch 1m data + BRTI prices in PARALLEL
         _prefetched_1m = {}
-        _prefetched_prices = {}  # cache latest 1m close as Coinbase price
+        _prefetched_prices = {}  # BRTI-approximated prices (multi-exchange average)
         if minute_in_window >= 1:  # only during CONFIRMED, not SETUP
             from concurrent.futures import ThreadPoolExecutor
             def _fetch_1m(sym):
@@ -674,7 +675,21 @@ class KalshiDaemon:
                 for sym, df in pool.map(lambda s: _fetch_1m(s), self.KALSHI_PAIRS):
                     if df is not None and not df.empty:
                         _prefetched_1m[sym] = df
-                        _prefetched_prices[sym] = float(df.iloc[-1]["close"])
+
+            # Get BRTI-approximated prices (Coinbase + Kraken + Bitstamp average)
+            if self._brti_proxy is None:
+                from data.brti_proxy import BRTIProxy
+                self._brti_proxy = BRTIProxy()
+            # Convert USDT symbols to USD for exchange queries
+            usd_symbols = [s.replace("/USDT", "/USD") for s in self.KALSHI_PAIRS]
+            brti_prices = self._brti_proxy.get_prices_batch(usd_symbols)
+            for sym in self.KALSHI_PAIRS:
+                usd_sym = sym.replace("/USDT", "/USD")
+                if usd_sym in brti_prices:
+                    _prefetched_prices[sym] = brti_prices[usd_sym]
+                elif sym in _prefetched_1m:
+                    # Fallback to Coinbase 1m close
+                    _prefetched_prices[sym] = float(_prefetched_1m[sym].iloc[-1]["close"])
 
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
             asset = symbol.split("/")[0]
