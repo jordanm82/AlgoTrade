@@ -117,6 +117,71 @@ class RichDashboard:
             self._log_lines.append(Text(f"{ts} [BAL ERR] {e}", style="red"))
             pass
 
+    def _force_cancel_resting(self):
+        """Force-cancel ALL resting orders at minute 10+. Runs every 15s from dashboard."""
+        if not self.daemon._resting_orders:
+            return
+
+        self.daemon._init_kalshi_client()
+        if not self.daemon.kalshi_client:
+            return
+
+        still_resting = []
+        for order in self.daemon._resting_orders:
+            order_id = order.get("order_id", "")
+            asset = order.get("asset", "?")
+            if not order_id or order_id == "?":
+                continue
+
+            try:
+                # Check if filled first
+                status = self.daemon.kalshi_client.get_order_status(order_id)
+                filled = float(status.get("fill_count_fp", 0))
+                order_status = status.get("status", "")
+
+                if filled > 0 or order_status == "executed":
+                    # Actually filled — keep it
+                    order["count"] = max(int(filled), 1)
+                    order["needs_fill_check"] = False
+                    if asset in self.daemon._kalshi_pending_signals:
+                        self.daemon._kalshi_pending_signals[asset]["bet_placed"] = True
+                    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                    self._log_lines.append(Text(
+                        f"{ts} [RESTING FILL] {asset} {order['side'].upper()} "
+                        f"x{order['count']} @ {order.get('fill_price', '?')}c — filled!",
+                        style="green"))
+                    continue  # remove from resting
+
+                # Cancel it
+                result = self.daemon.kalshi_client.cancel_order_safe(order_id)
+                if result.get("status") == "filled":
+                    # Was actually filled (404 on cancel = already executed)
+                    order["count"] = 1
+                    order["needs_fill_check"] = False
+                    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                    self._log_lines.append(Text(
+                        f"{ts} [RESTING FILL] {asset} {order['side'].upper()} "
+                        f"@ {order.get('fill_price', '?')}c — filled (on cancel)!",
+                        style="green"))
+                    continue
+
+                # Successfully cancelled
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                self._log_lines.append(Text(
+                    f"{ts} [CANCEL] {asset} {order['side'].upper()} "
+                    f"@ {order.get('fill_price', '?')}c — cancelled at min 10+",
+                    style="yellow"))
+                # Remove from pending bets
+                self.daemon._pending_bets = [
+                    b for b in self.daemon._pending_bets
+                    if b.get("order_id") != order_id
+                ]
+
+            except Exception:
+                still_resting.append(order)  # keep trying next cycle
+
+        self.daemon._resting_orders = still_resting
+
     def _refresh_positions(self):
         """Refresh positions — from Kalshi API (live/demo) or pending bets (dry-run)."""
         now = time.time()
@@ -690,9 +755,14 @@ class RichDashboard:
                 in_entry_window = min_in_refresh <= 2
                 if seconds_elapsed % POSITION_REFRESH_INTERVAL == 0:
                     try:
-                        # Settlement checks always run — fast and non-competing
+                        # Settlement checks always run
                         if hasattr(self.daemon, '_check_dryrun_settlements'):
                             self.daemon._check_dryrun_settlements()
+
+                        # Force-cancel stale resting orders at minute 10+
+                        # Runs every 15s independent of eval cycle
+                        if min_in_refresh >= 10 and hasattr(self.daemon, '_resting_orders'):
+                            self._force_cancel_resting()
 
                         # Position/balance/watches skip during entry window
                         if not in_entry_window:
