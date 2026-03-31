@@ -1667,20 +1667,47 @@ class KalshiDaemon:
                 filled = float(status.get("fill_count_fp", 0))
                 order_status = status.get("status", "")
 
-                # CANCEL FIRST if past deadline — don't accept late fills
+                # CHECK FILLS FIRST — always accept a fill, even after minute 10
+                # (the order was placed during the valid window, the fill just took time)
+                if filled > 0 or order_status == "executed":
+                    fill_count = max(int(filled), 1)  # at least 1 if executed
+                    order["count"] = fill_count
+                    order["needs_fill_check"] = False
+                    if asset in self._kalshi_pending_signals:
+                        self._kalshi_pending_signals[asset]["bet_placed"] = True
+                    print(colored(
+                        f"  [RESTING FILL] {asset} {order['side'].upper()} "
+                        f"x{fill_count} @ {order['fill_price']}c — filled!",
+                        "green",
+                    ))
+                    continue  # don't add back to resting list
+
+                # THEN cancel if past deadline and still unfilled
                 order_expired = False
                 settle_time = order.get("settle_time")
                 if settle_time and now_utc > settle_time:
                     order_expired = True
 
-                should_cancel = minute_in_window >= 10 or order_expired
-                if should_cancel and order_status != "executed":
+                if (minute_in_window >= 10 or order_expired) and order_status != "executed":
                     reason = "previous window" if order_expired else f"min {minute_in_window}"
                     try:
-                        self.kalshi_client.cancel_order_safe(order_id)
+                        result = self.kalshi_client.cancel_order_safe(order_id)
+                        # cancel_order_safe returns {"status": "filled"} on 404
+                        if result.get("status") == "filled":
+                            # Actually filled! Don't cancel.
+                            order["count"] = int(order.get("count", 0)) or 1
+                            order["needs_fill_check"] = False
+                            if asset in self._kalshi_pending_signals:
+                                self._kalshi_pending_signals[asset]["bet_placed"] = True
+                            print(colored(
+                                f"  [RESTING FILL] {asset} {order['side'].upper()} "
+                                f"@ {order['fill_price']}c — filled (detected on cancel attempt)!",
+                                "green",
+                            ))
+                            continue
                         print(colored(
                             f"  [RESTING CANCEL] {asset} {order['side'].upper()} "
-                            f"@ {order['fill_price']}c — cancelled ({reason}, was {order_status})",
+                            f"@ {order['fill_price']}c — cancelled ({reason})",
                             "yellow",
                         ))
                         self._pending_bets = [
@@ -1690,19 +1717,6 @@ class KalshiDaemon:
                     except Exception as e:
                         print(colored(f"  [CANCEL ERR] {asset}: {e}", "red"))
                     continue  # don't add back
-
-                if filled > 0:
-                    # Filled (within the allowed window)
-                    order["count"] = int(filled)
-                    order["needs_fill_check"] = False
-                    if asset in self._kalshi_pending_signals:
-                        self._kalshi_pending_signals[asset]["bet_placed"] = True
-                    print(colored(
-                        f"  [RESTING FILL] {asset} {order['side'].upper()} "
-                        f"x{int(filled)} @ {order['fill_price']}c — filled!",
-                        "green",
-                    ))
-                    continue  # don't add back to resting list
 
                 # Still resting — query the ORDER's status for current market ask
                 current_ask = "?"
