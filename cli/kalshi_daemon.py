@@ -540,11 +540,14 @@ class KalshiDaemon:
         # Pandas-compatible timestamp for DataFrame index comparisons
         current_window_start_pd = pd.Timestamp(current_window_start.replace(tzinfo=None))
 
-        # Prune expired bets
+        # Prune active bets — clear at window boundary so new window can bet immediately
+        # Old 900s timer kept previous window's bets "active" into the next window,
+        # blocking new bets when maxbets=1
         now_ts = time.time()
+        window_start_ts = current_window_start.replace(tzinfo=timezone.utc).timestamp()
         self._active_kalshi_bets = {
             t: placed for t, placed in self._active_kalshi_bets.items()
-            if now_ts - placed < 900
+            if placed >= window_start_ts  # only keep bets from THIS window
         }
 
         if minute_in_window >= KALSHI_CUTOFF_MINUTES:

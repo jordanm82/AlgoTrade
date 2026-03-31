@@ -67,17 +67,25 @@ class KalshiClient:
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
-        headers = self._headers("GET", path)
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            headers = self._headers("GET", path)
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            if resp.status_code == 500 and attempt < 2:
+                time.sleep(0.5)
+                continue
+            resp.raise_for_status()
+            return resp.json()
 
     def _post(self, path: str, data: dict) -> dict:
         url = f"{self.base_url}{path}"
-        headers = self._headers("POST", path)
-        resp = requests.post(url, headers=headers, json=data, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            headers = self._headers("POST", path)
+            resp = requests.post(url, headers=headers, json=data, timeout=10)
+            if resp.status_code == 500 and attempt < 2:
+                time.sleep(0.5)
+                continue
+            resp.raise_for_status()
+            return resp.json()
 
     def _delete(self, path: str) -> dict:
         url = f"{self.base_url}{path}"
