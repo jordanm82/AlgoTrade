@@ -1564,21 +1564,7 @@ class KalshiDaemon:
                 filled = float(status.get("fill_count_fp", 0))
                 order_status = status.get("status", "")
 
-                if filled > 0:
-                    # Filled! Update the pending bet entry
-                    order["count"] = int(filled)
-                    order["needs_fill_check"] = False
-                    # Mark bet_placed so eval doesn't retry this asset
-                    if asset in self._kalshi_pending_signals:
-                        self._kalshi_pending_signals[asset]["bet_placed"] = True
-                    print(colored(
-                        f"  [RESTING FILL] {asset} {order['side'].upper()} "
-                        f"x{int(filled)} @ {order['fill_price']}c — filled!",
-                        "green",
-                    ))
-                    continue  # don't add back to resting list
-
-                # Cancel if: minute >= 10 OR order is from a previous window (settle_time passed)
+                # CANCEL FIRST if past deadline — don't accept late fills
                 order_expired = False
                 settle_time = order.get("settle_time")
                 if settle_time and now_utc > settle_time:
@@ -1600,6 +1586,19 @@ class KalshiDaemon:
                     except Exception as e:
                         print(colored(f"  [CANCEL ERR] {asset}: {e}", "red"))
                     continue  # don't add back
+
+                if filled > 0:
+                    # Filled (within the allowed window)
+                    order["count"] = int(filled)
+                    order["needs_fill_check"] = False
+                    if asset in self._kalshi_pending_signals:
+                        self._kalshi_pending_signals[asset]["bet_placed"] = True
+                    print(colored(
+                        f"  [RESTING FILL] {asset} {order['side'].upper()} "
+                        f"x{int(filled)} @ {order['fill_price']}c — filled!",
+                        "green",
+                    ))
+                    continue  # don't add back to resting list
 
                 # Still resting — query the ORDER's status for current market ask
                 current_ask = "?"
