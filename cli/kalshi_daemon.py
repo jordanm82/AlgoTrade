@@ -41,12 +41,12 @@ class KalshiDaemon:
         "XRP/USDT": "KXXRP15M",
     }
 
-    # Per-asset KNN thresholds (balanced K=20 model, Coinbase data)
+    # Per-asset LR thresholds (dual trend+conviction model, walk-forward validated)
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 55,
-        "ETH/USDT": 55,
-        "SOL/USDT": 55,
-        "XRP/USDT": 55,
+        "BTC/USDT": 53,
+        "ETH/USDT": 53,
+        "SOL/USDT": 53,
+        "XRP/USDT": 53,
     }
 
     # Per-asset TEK (technical/probability table) thresholds
@@ -1553,23 +1553,23 @@ class KalshiDaemon:
             ))
 
     def _retrain_model(self):
-        """Retrain LogReg model using walk-forward validation.
+        """Retrain dual-signal model (trend + conviction) with walk-forward validation.
 
-        Uses scripts/retrain_walkforward.py which:
-        - Trains on 120 days of older data (walk-forward, no overfitting)
-        - Tests on 59 days of recent unseen data
-        - Uses 15 features (12 original + 3 trend)
+        Uses scripts/retrain_dual_signal.py which:
+        - Trend model: momentum/flow features, NO RSI (picks direction)
+        - Conviction model: RSI/BB features (confirms confidence)
+        - Walk-forward: train on 120 days oldest, test on 59 days newest
         - Fetches from Coinbase (matches BRTI settlement source)
-        - Validates with and without TEK confluence
+        - Tests with TEK confluence at various thresholds
         """
         import subprocess
 
-        print(colored("  [MODEL] Starting walk-forward retrain (~10 min)...", "yellow"))
-        print(colored("  [MODEL] Train: days 59-179 | Test: days 0-59 (out-of-sample)", "yellow"))
+        print(colored("  [MODEL] Starting dual-signal retrain (~10 min)...", "yellow"))
+        print(colored("  [MODEL] Trend (direction) + Conviction (confidence)", "yellow"))
 
         try:
             result = subprocess.run(
-                ["./venv/bin/python", "scripts/retrain_walkforward.py",
+                ["./venv/bin/python", "scripts/retrain_dual_signal.py",
                  "--days", "179", "--output", "models/knn_kalshi.pkl"],
                 capture_output=True, text=True, timeout=900,
             )
@@ -1578,20 +1578,18 @@ class KalshiDaemon:
             for line in result.stdout.strip().split("\n"):
                 line = line.strip()
                 if line and any(k in line for k in [
-                    "Train WR", "Test LR", "TEK adds", "Best P&L",
-                    "Saved", "VERDICT", "degradation", "samples",
+                    "TREND model", "CONVICTION model", "SINGLE model",
+                    "Best config", "Saved", "samples", "Train:", "Test:",
                 ]):
                     print(f"  [MODEL] {line}")
 
             if result.returncode == 0:
-                print(colored("  [MODEL] Walk-forward retrain complete!", "green"))
-                # Reload the model
-                import pickle
-                with open("models/knn_kalshi.pkl", "rb") as f:
-                    model_data = pickle.load(f)
-                    self.kalshi_predictor._knn = model_data["knn"]
-                    self.kalshi_predictor._knn_scaler = model_data["scaler"]
-                print(colored("  [MODEL] Model reloaded into predictor", "green"))
+                print(colored("  [MODEL] Dual-signal retrain complete!", "green"))
+                # Reload — re-init predictor to pick up new model format
+                from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3
+                self.kalshi_predictor = KalshiPredictorV3()
+                mt = self.kalshi_predictor._model_type or "unknown"
+                print(colored(f"  [MODEL] Predictor reloaded (type: {mt})", "green"))
             else:
                 print(colored(f"  [MODEL] Retrain failed: {result.stderr[-300:]}", "red"))
 

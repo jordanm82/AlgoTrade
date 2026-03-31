@@ -121,12 +121,14 @@ Three predictor versions available via `--predictor v1|v2|v3`:
 
 Two-factor prediction: **LR (LogReg)** for direction + **TEK (probability table)** for confirmation.
 
-**LR — LogReg Direction Model (primary signal):**
-- 15-feature LogisticRegression trained on multi-timeframe Coinbase data (15m + 1h + 4h)
-- Features: RSI, StochRSI, MACD, normalized returns, volume ratio, BB position, EMA slope, ADX, ROC, plus price_vs_ema, hourly_return, trend_direction
-- Walk-forward validated: 60.9% WR solo, **78% WR with TEK** on 11,498 out-of-sample bets
-- Trained with `class_weight='balanced'` — produces both YES and NO predictions
-- Retrained via `scripts/retrain_walkforward.py` (walk-forward: train on older data only)
+**Dual-Signal Model — Trend (direction) + Conviction (confidence):**
+- Two LogReg models that must agree before betting
+- **Trend model** (9 features, NO RSI): MACD, norm_return, ema_slope, roc_5, macd_1h, price_vs_ema, hourly_return, trend_direction, vol_ratio — picks YES/NO from momentum
+- **Conviction model** (8 features, RSI-based): rsi_15m, stochrsi_15m, bb_position, adx, rsi_1h, rsi_4h, norm_return, vol_ratio — confirms confidence
+- Both must agree on direction (>= 53% each) before signal fires
+- Walk-forward validated: **77.8% WR with TEK>=30** on 4,950 out-of-sample bets
+- Balanced YES:NO ratio of 0.7:1 — predicts BOTH sides in any market regime
+- Retrained via `scripts/retrain_dual_signal.py` (walk-forward: train on older data only)
 
 **TEK — Probability Table Confluence (filter):**
 - Pre-computed 2D probability table (distance_ATR × time_remaining)
@@ -165,9 +167,10 @@ Two-factor prediction: **LR (LogReg)** for direction + **TEK (probability table)
 **Settlement tracking:** Queries Kalshi API for authoritative settlement results (not approximated from price data). Tracks W/L/WR and P&L for both dry-run and live modes.
 
 **Model refresh:**
-- LogReg model (walk-forward): `./venv/bin/python scripts/retrain_walkforward.py --days 179`
-  - Trains on 120 days oldest data, validates on 59 days most recent (out-of-sample)
-  - Shows LR × TEK threshold grid with WR and P&L
+- Dual-signal model: `./venv/bin/python scripts/retrain_dual_signal.py --days 179`
+  - Trains trend + conviction models on 120 days oldest data
+  - Validates on 59 days most recent (out-of-sample)
+  - Shows Trend × Conviction × TEK threshold grid
   - Auto-triggered on daemon startup when model > 7 days old
 - Probability table: `./venv/bin/python scripts/build_prob_table.py --days 90`
 - Refresh weekly/monthly to stay current with market regime

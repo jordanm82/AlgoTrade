@@ -49,17 +49,30 @@ class KalshiPredictorV3:
         except (FileNotFoundError, json.JSONDecodeError):
             pass
 
-        # Load KNN model for early-entry prediction
-        self._knn = None
-        self._knn_scaler = None
+        # Load prediction model(s)
+        # Supports dual (trend + conviction) or single (legacy) model
+        self._knn = None           # trend model (or single model for legacy)
+        self._knn_scaler = None    # trend scaler
+        self._conv_model = None    # conviction model (dual mode only)
+        self._conv_scaler = None   # conviction scaler
+        self._model_type = None
         try:
             import pickle
             with open(knn_model_path, "rb") as f:
                 model_data = pickle.load(f)
-                self._knn = model_data["knn"]
-                self._knn_scaler = model_data["scaler"]
+                self._model_type = model_data.get("model_type", "single")
+                if self._model_type == "dual_trend_conviction":
+                    self._knn = model_data["trend_model"]
+                    self._knn_scaler = model_data["trend_scaler"]
+                    self._conv_model = model_data["conv_model"]
+                    self._conv_scaler = model_data["conv_scaler"]
+                    self._trend_features = model_data.get("trend_features", [])
+                    self._conv_features = model_data.get("conv_features", [])
+                else:
+                    self._knn = model_data["knn"]
+                    self._knn_scaler = model_data["scaler"]
         except (FileNotFoundError, Exception):
-            pass  # no KNN model — early entry disabled
+            pass  # no model — early entry disabled
 
     def predict(self, df: pd.DataFrame, strike_price: float,
                 minutes_remaining: float, market_data: dict | None = None,
@@ -176,10 +189,16 @@ class KalshiPredictorV3:
 
     def predict_knn(self, df: pd.DataFrame, df_1h: pd.DataFrame | None = None,
                     df_4h: pd.DataFrame | None = None) -> float | None:
-        """Use KNN model to predict probability of next candle going UP.
+        """Predict probability of next candle going UP.
 
-        Returns probability (0.0-1.0) or None if KNN model not available.
-        Used for early entry (minute 0-5) when distance from strike is minimal.
+        Dual-signal mode (trend + conviction):
+          - Trend model (no RSI) picks direction from momentum/flow
+          - Conviction model (RSI-based) must agree on direction
+          - Returns trend probability when both agree, None otherwise
+
+        Single-model mode (legacy): returns single model probability.
+
+        Returns probability (0.0-1.0) or None if models unavailable or disagree.
         """
         if self._knn is None or self._knn_scaler is None:
             return None
@@ -187,114 +206,124 @@ class KalshiPredictorV3:
             return None
 
         # Use the SECOND-TO-LAST row for indicator features (last completed 15m candle)
-        # The last row may be a synthetic row with modified close — don't recompute from it
-        # This matches training which uses completed candle indicators directly
         if len(df) >= 2:
-            indicator_row = df.iloc[-2]  # previous completed candle (has real indicators)
-            current_close = float(df.iloc[-1]["close"])  # synthetic or current close
+            indicator_row = df.iloc[-2]
+            current_close = float(df.iloc[-1]["close"])
         else:
             indicator_row = df.iloc[-1]
             current_close = float(df.iloc[-1]["close"])
 
         try:
-            # Features 1-9: use indicator_row values directly (matches training)
-            # Training does: r = df.iloc[i] where r is a completed candle
+            # === Extract all 15 features (same order as training) ===
             prev_close = float(indicator_row["close"])
             vol_sma = float(indicator_row.get("vol_sma_20", 0))
             bb_range = float(indicator_row.get("bb_upper", 0)) - float(indicator_row.get("bb_lower", 0))
 
-            # norm_return: use the completed candle's own return, not synthetic
-            pct = df["close"].iloc[:-1].pct_change()  # exclude synthetic row
+            pct = df["close"].iloc[:-1].pct_change()
             norm_ret_series = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
 
-            vals = [
-                float(indicator_row.get("rsi", 50)),
-                float(indicator_row.get("stochrsi_k", 50)),
-                float(indicator_row.get("macd_hist", 0)),
-                float(norm_ret_series.iloc[-1]) if len(norm_ret_series) > 0 and pd.notna(norm_ret_series.iloc[-1]) else 0,
-                float(indicator_row.get("volume", 0)) / vol_sma if vol_sma > 0 else 1.0,
-                (prev_close - float(indicator_row.get("bb_lower", 0))) / bb_range if bb_range > 0 else 0.5,
-                float(df["ema_12"].iloc[:-1].pct_change(3).iloc[-1] * 100) if len(df) >= 5 and pd.notna(df["ema_12"].iloc[:-1].pct_change(3).iloc[-1]) else 0,
-                float(indicator_row.get("adx", 20)),
-                float(indicator_row.get("roc_5", 0)),
-            ]
-
-            # 1h context
-            if df_1h is not None and len(df_1h) >= 20:
-                r1h = df_1h.iloc[-1]
-                vals.append(float(r1h.get("rsi", 50)))
-                vals.append(float(r1h.get("macd_hist", 0)))
-            else:
-                vals.extend([50.0, 0.0])
-
-            # 4h context
-            if df_4h is not None and len(df_4h) >= 10:
-                r4h = df_4h.iloc[-1]
-                vals.append(float(r4h.get("rsi", 50)))
-            else:
-                vals.append(50.0)
-
-            # Trend features — use indicator_row for SMA/ATR/ADX, prev_close for price
-            # Training uses the completed candle's own values
             sma_val = float(indicator_row.get("sma_20", prev_close))
             atr_val = float(indicator_row.get("atr", 1))
             adx_val = float(indicator_row.get("adx", 20))
 
-            # price_vs_ema: (close - SMA20) / ATR — uses completed candle close
             price_vs_ema = (prev_close - sma_val) / atr_val if atr_val > 0 else 0
-
-            # hourly_return: pct_change(4) = 4 candles back (matches training)
-            if len(df) >= 6:  # need iloc[-2] and 4 before that = iloc[-6]
+            if len(df) >= 6:
                 hr = (prev_close - float(df.iloc[-6]["close"])) / float(df.iloc[-6]["close"]) * 100
             else:
                 hr = 0
-
-            # trend_direction: ADX * sign(close - SMA)
             trend_sign = 1 if prev_close >= sma_val else -1
             trend_dir = adx_val * trend_sign
 
-            vals.append(price_vs_ema)
-            vals.append(hr)
-            vals.append(trend_dir)
+            # All 15 features in canonical order
+            all_features = {
+                "rsi_15m": float(indicator_row.get("rsi", 50)),
+                "stochrsi_15m": float(indicator_row.get("stochrsi_k", 50)),
+                "macd_15m": float(indicator_row.get("macd_hist", 0)),
+                "norm_return": float(norm_ret_series.iloc[-1]) if len(norm_ret_series) > 0 and pd.notna(norm_ret_series.iloc[-1]) else 0,
+                "vol_ratio": float(indicator_row.get("volume", 0)) / vol_sma if vol_sma > 0 else 1.0,
+                "bb_position": (prev_close - float(indicator_row.get("bb_lower", 0))) / bb_range if bb_range > 0 else 0.5,
+                "ema_slope": float(df["ema_12"].iloc[:-1].pct_change(3).iloc[-1] * 100) if len(df) >= 5 and pd.notna(df["ema_12"].iloc[:-1].pct_change(3).iloc[-1]) else 0,
+                "adx": adx_val,
+                "roc_5": float(indicator_row.get("roc_5", 0)),
+                "rsi_1h": float(df_1h.iloc[-1].get("rsi", 50)) if df_1h is not None and len(df_1h) >= 20 else 50.0,
+                "macd_1h": float(df_1h.iloc[-1].get("macd_hist", 0)) if df_1h is not None and len(df_1h) >= 20 else 0.0,
+                "rsi_4h": float(df_4h.iloc[-1].get("rsi", 50)) if df_4h is not None and len(df_4h) >= 10 else 50.0,
+                "price_vs_ema": price_vs_ema,
+                "hourly_return": hr,
+                "trend_direction": trend_dir,
+            }
 
-            # Check for NaN/inf
-            if any(pd.isna(v) or np.isinf(v) for v in vals):
+            if any(pd.isna(v) or np.isinf(v) for v in all_features.values()):
                 return None
 
-            X = np.array(vals).reshape(1, -1)
+            # === Dual-signal mode ===
+            if self._model_type == "dual_trend_conviction" and self._conv_model is not None:
+                CONV_THRESHOLD = 0.53  # conviction must agree at 53%+
+
+                # Trend model — picks direction
+                trend_vals = [all_features[f] for f in self._trend_features]
+                X_trend = np.array(trend_vals).reshape(1, -1)
+                trend_prob = float(self._knn.predict_proba(
+                    self._knn_scaler.transform(X_trend))[0][1])
+
+                # Conviction model — must agree on direction
+                conv_vals = [all_features[f] for f in self._conv_features]
+                X_conv = np.array(conv_vals).reshape(1, -1)
+                conv_prob = float(self._conv_model.predict_proba(
+                    self._conv_scaler.transform(X_conv))[0][1])
+
+                # Both must agree on direction
+                trend_yes = trend_prob >= CONV_THRESHOLD
+                trend_no = trend_prob <= (1 - CONV_THRESHOLD)
+                conv_yes = conv_prob >= CONV_THRESHOLD
+                conv_no = conv_prob <= (1 - CONV_THRESHOLD)
+
+                if trend_yes and conv_yes:
+                    prob_up = trend_prob  # direction from trend, confirmed by conviction
+                elif trend_no and conv_no:
+                    prob_up = trend_prob  # both say NO
+                else:
+                    prob_up = 0.50  # disagreement → neutral → SKIP
+
+                # Log
+                self._log_prediction(prev_close, sma_val, prob_up, all_features,
+                                     trend_prob=trend_prob, conv_prob=conv_prob)
+                return prob_up
+
+            # === Single-model mode (legacy) ===
+            all_vals = list(all_features.values())
+            X = np.array(all_vals).reshape(1, -1)
             X_scaled = self._knn_scaler.transform(X)
-            probs = self._knn.predict_proba(X_scaled)
-            prob_up = float(probs[0][1])
+            prob_up = float(self._knn.predict_proba(X_scaled)[0][1])
 
-            # Log features for live/backtest parity audit
-            try:
-                import json
-                from datetime import datetime, timezone
-                feature_names = [
-                    "rsi_15m", "stochrsi_15m", "macd_15m", "norm_return",
-                    "vol_ratio", "bb_position", "ema_slope", "adx", "roc_5",
-                    "rsi_1h", "macd_1h", "rsi_4h",
-                    "price_vs_ema", "hourly_return", "trend_direction",
-                ]
-                log_entry = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "close": prev_close,
-                    "sma_20": sma_val,
-                    "prob": round(prob_up, 4),
-                    "side": "YES" if prob_up >= 0.55 else "NO" if prob_up <= 0.45 else "SKIP",
-                }
-                for i, name in enumerate(feature_names):
-                    if i < len(vals):
-                        log_entry[name] = round(vals[i], 6)
-                with open("data/store/feature_log.jsonl", "a") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-            except Exception:
-                pass
-
+            self._log_prediction(prev_close, sma_val, prob_up, all_features)
             return prob_up
 
         except Exception:
             return None
+
+    def _log_prediction(self, close, sma, prob, features, trend_prob=None, conv_prob=None):
+        """Log prediction features for parity audit."""
+        try:
+            import json as _json
+            from datetime import datetime, timezone
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "close": close,
+                "sma_20": sma,
+                "prob": round(prob, 4),
+                "side": "YES" if prob >= 0.55 else "NO" if prob <= 0.45 else "SKIP",
+            }
+            if trend_prob is not None:
+                entry["trend_prob"] = round(trend_prob, 4)
+                entry["conv_prob"] = round(conv_prob, 4)
+                entry["model"] = "dual"
+            for name, val in features.items():
+                entry[name] = round(val, 6)
+            with open("data/store/feature_log.jsonl", "a") as f:
+                f.write(_json.dumps(entry) + "\n")
+        except Exception:
+            pass
 
     def _lookup_probability(self, distance_atr: float, minutes_remaining: float) -> float:
         """Look up base probability from the pre-computed table."""
