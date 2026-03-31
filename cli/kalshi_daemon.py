@@ -602,13 +602,14 @@ class KalshiDaemon:
                 })
                 continue
 
-            # Lifecycle (exact backtest parity):
-            # Min 0-4: SETUP — cache 15m/1h, preview scores
-            # Min 5-6: CONFIRMED — 5m candle closed, decide + execute (matches backtest)
-            # Min 7+:  MONITORING — dashboard display only, no new decisions
-            if minute_in_window <= 4:
+            # Lifecycle:
+            # Min 0-2: SETUP — cache 15m/1h, preview scores
+            # Min 3-8: CONFIRMED — use 1m candles for price, decide + execute
+            #          (earlier entry = cheaper contracts, model needs only ±0.06 ATR)
+            # Min 9+:  MONITORING — dashboard display only, no new decisions
+            if minute_in_window <= 2:
                 state = "SETUP"
-            elif minute_in_window <= 6 and not (pending and pending.get("bet_placed")):
+            elif minute_in_window <= 8 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
             else:
                 state = "MONITORING"
@@ -779,11 +780,11 @@ class KalshiDaemon:
                     except Exception:
                         pass
 
-                # Build snapshot using 5m candle (closed at minute 5 — exact backtest parity)
+                # Build snapshot using 1m candles for early entry (contracts still cheap)
                 try:
-                    df_5m = self.fetcher.ohlcv(symbol, "5m", limit=5)
-                    if df_15m is not None and df_5m is not None and len(df_5m) > 0:
-                        snapshot = build_minute3_snapshot(df_15m, df_5m, current_window_start_pd)
+                    df_sub = self.fetcher.ohlcv(symbol, "1m", limit=10)
+                    if df_15m is not None and df_sub is not None and len(df_sub) > 0:
+                        snapshot = build_minute3_snapshot(df_15m, df_sub, current_window_start_pd)
                         if snapshot is not None:
                             df_15m = snapshot
                         else:
