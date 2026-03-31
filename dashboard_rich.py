@@ -679,15 +679,16 @@ class RichDashboard:
                     break
                 seconds_elapsed += 1
 
-                # Every 5 seconds: refresh positions, balance, settlements
-                if seconds_elapsed % POSITION_REFRESH_INTERVAL == 0:
+                # Every 15 seconds: refresh positions, balance, settlements
+                # BUT skip during minute 0-2 of window (critical entry window — don't compete for API)
+                min_in_refresh = datetime.now(timezone.utc).minute % 15
+                in_entry_window = min_in_refresh <= 2
+                if seconds_elapsed % POSITION_REFRESH_INTERVAL == 0 and not in_entry_window:
                     try:
                         self._refresh_positions()
                         self._fetch_balance()
-                        # Check price watches (price-blocked signals waiting for entry)
                         if hasattr(self.daemon, 'check_price_watches'):
                             self.daemon.check_price_watches()
-                        # Check settlements
                         if hasattr(self.daemon, '_check_dryrun_settlements'):
                             self.daemon._check_dryrun_settlements()
                     except Exception:
