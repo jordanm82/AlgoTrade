@@ -432,13 +432,17 @@ class RichDashboard:
                     target = pending.get("strike_price", 0)
                     if target:
                         symbol = f"{asset}/USDT"
-                        # XRP needs 4 decimal places to see movement
                         decimals = 4 if asset == "XRP" else 2
                         target_str = f"${target:,.{decimals}f}"
-                        cb = self.daemon._get_coinbase_price(symbol) if hasattr(self.daemon, '_get_coinbase_price') else None
-                        if cb:
-                            current_str = f"${cb:,.{decimals}f}"
-                            diff = cb - target
+                        # Use BRTI price (same source as Kalshi settlement)
+                        brti = None
+                        if hasattr(self.daemon, '_brti_proxy') and self.daemon._brti_proxy:
+                            brti = self.daemon._brti_proxy.get_price(symbol)
+                        if not brti and hasattr(self.daemon, '_get_coinbase_price'):
+                            brti = self.daemon._get_coinbase_price(symbol)
+                        if brti:
+                            current_str = f"${brti:,.{decimals}f}"
+                            diff = brti - target
                             dist_str = f"{'+' if diff >= 0 else ''}{diff:.{decimals}f}"
 
                 state_style = "cyan bold" if "BETTING" in state or "BET_PLACED" in state else "dim" if state in ("DONE", "CANCELLED") else "white"
