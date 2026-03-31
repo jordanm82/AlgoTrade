@@ -869,7 +869,9 @@ class KalshiDaemon:
                                         f"and dropping ({hourly_chg:+.2f}%)",
                                         "red"))
 
-                        all_pass = meets_knn and tbl_agrees and not trend_kill
+                        # TEK gate bypassed — strike-relative model already has distance_from_strike
+                        # as its #1 feature, making TEK redundant (0 disagreements across all distances)
+                        all_pass = meets_knn and not trend_kill
 
                         # Store TBL score for BET_PLACED display
                         if pending:
