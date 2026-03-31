@@ -661,11 +661,13 @@ class KalshiDaemon:
         predictions = []
         actionable_signals = []
 
-        # Pre-fetch 1m data + BRTI prices in PARALLEL
+        # Pre-fetch: Coinbase 1m (for snapshot/indicators) + multi-exchange price (for distance)
         _prefetched_1m = {}
-        _prefetched_prices = {}  # BRTI-approximated prices (multi-exchange average)
+        _prefetched_prices = {}  # Coinbase+Bitstamp average (matches training data)
         if minute_in_window >= 1:  # only during CONFIRMED, not SETUP
             from concurrent.futures import ThreadPoolExecutor
+
+            # Fetch Coinbase 1m candles for snapshot building
             def _fetch_1m(sym):
                 try:
                     return sym, self.fetcher.ohlcv(sym, "1m", limit=10)
@@ -676,10 +678,20 @@ class KalshiDaemon:
                     if df is not None and not df.empty:
                         _prefetched_1m[sym] = df
 
-            # Use Coinbase 1m close for model pricing (exact training parity)
-            # Model was trained on Coinbase data — using anything else shifts distances
+            # Multi-exchange price for distance_from_strike (matches training)
+            # Model was trained on Coinbase+Bitstamp 5m average
+            if self._brti_proxy is None:
+                from data.brti_proxy import BRTIProxy
+                self._brti_proxy = BRTIProxy()
+            brti_prices = self._brti_proxy.get_prices_batch(
+                [s.replace("/USDT", "/USD") for s in self.KALSHI_PAIRS]
+            )
             for sym in self.KALSHI_PAIRS:
-                if sym in _prefetched_1m:
+                usd_sym = sym.replace("/USDT", "/USD")
+                if usd_sym in brti_prices:
+                    _prefetched_prices[sym] = brti_prices[usd_sym]
+                elif sym in _prefetched_1m:
+                    # Fallback to Coinbase if multi-exchange fails
                     _prefetched_prices[sym] = float(_prefetched_1m[sym].iloc[-1]["close"])
 
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
@@ -875,7 +887,7 @@ class KalshiDaemon:
 
                 # Use CACHED data — no extra API calls in the critical path
                 market_data = None
-                # Use 1m close as Coinbase price (same data, avoids extra API call)
+                # Multi-exchange price for distance (Coinbase+Bitstamp avg, matches training)
                 cb_price = _prefetched_prices.get(symbol) or self._get_coinbase_price(symbol)
                 df_15m = self._kalshi_cached_dataframes.get(symbol)
 
@@ -1788,24 +1800,24 @@ class KalshiDaemon:
             ))
 
     def _retrain_model(self):
-        """Retrain strike-relative model with walk-forward validation.
+        """Retrain with Kalshi settlement labels + multi-exchange price.
 
-        Uses scripts/retrain_strike_relative.py which:
-        - Predicts the actual Kalshi question: 'will price close above strike?'
-        - Key feature: distance_from_strike (price at min5 vs strike, in ATR)
-        - Walk-forward: train on 120 days oldest, test on 59 days newest
-        - Fetches from Coinbase (matches BRTI settlement source)
+        Uses scripts/retrain_kalshi_labels.py which:
+        - Labels: Kalshi settled result (yes/no) — ground truth
+        - Strike: Kalshi floor_strike — actual settlement strike
+        - Price: Coinbase + Bitstamp 5m average — BRTI proxy
+        - Walk-forward: train on oldest 70%, test on newest 30%
         """
         import subprocess
 
-        print(colored("  [MODEL] Starting strike-relative retrain (~10 min)...", "yellow"))
-        print(colored("  [MODEL] Predicts: 'Will price close above strike?'", "yellow"))
+        print(colored("  [MODEL] Starting Kalshi-labeled retrain (~15 min)...", "yellow"))
+        print(colored("  [MODEL] Labels: Kalshi settlements | Price: Coinbase+Bitstamp avg", "yellow"))
 
         try:
             result = subprocess.run(
-                ["./venv/bin/python", "scripts/retrain_strike_relative.py",
-                 "--days", "179", "--output", "models/knn_kalshi.pkl"],
-                capture_output=True, text=True, timeout=900,
+                ["./venv/bin/python", "scripts/retrain_kalshi_labels.py",
+                 "--output", "models/knn_kalshi.pkl"],
+                capture_output=True, text=True, timeout=1200,
             )
 
             # Print key output lines
