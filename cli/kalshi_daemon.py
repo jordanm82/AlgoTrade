@@ -18,7 +18,7 @@ from config.production import MAX_CONCURRENT_KALSHI_BETS
 from config.settings import CDP_KEY_FILE, DATA_DIR
 from data.fetcher import DataFetcher
 from data.indicators import add_indicators
-from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3, KalshiV3Signal
+from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3, KalshiV3Signal, MAX_BET_PRICE
 from strategy.snapshot import build_minute3_snapshot, compute_btc_confluence
 
 # Intervals in seconds
@@ -100,6 +100,10 @@ class KalshiDaemon:
         self._session_wins = 0
         self._session_losses = 0
         self._session_bets_placed = 0
+
+        # Dry-run simulated balance — starts from actual Kalshi balance or $100
+        # Compounds with wins/losses so sizing is realistic
+        self._dry_balance_cents = 10000  # updated in startup from actual balance
 
         # Dashboard compatibility stubs (spot trading attributes not used)
         self.kalshi_only = True
@@ -425,6 +429,11 @@ class KalshiDaemon:
                             self._session_wins += 1
                         else:
                             self._session_losses += 1
+
+                        # Compound dry-run balance
+                        if self.dry_run:
+                            self._dry_balance_cents += pnl_cents
+
                         settled.append(bet)
                         break
 
@@ -1146,16 +1155,8 @@ class KalshiDaemon:
                     self._kalshi_pending_signals[asset]["watch_side"] = direction_label
                     self._kalshi_pending_signals[asset]["watch_series"] = self.KALSHI_PAIRS.get(symbol, "")
 
-            # Flat 5% position sizing — consistent every bet, no Kelly
-            dry_balance_cents = 10000  # default $100 simulated balance
-            try:
-                if self.kalshi_client:
-                    bal = self.kalshi_client.get_balance()
-                    dry_balance_cents = bal.get("balance", 10000)
-            except Exception:
-                pass
-
-            risk_budget = int(dry_balance_cents * 0.05)
+            # Flat 5% position sizing — uses simulated compounding balance
+            risk_budget = int(self._dry_balance_cents * 0.05)
             count = max(1, risk_budget // contract_price) if contract_price > 0 else 1
             cost = count * contract_price
             potential_profit = count * (100 - contract_price)
@@ -1200,7 +1201,6 @@ class KalshiDaemon:
             # Kalshi is source of truth for balance
             balance_resp = self.kalshi_client.get_balance()
             balance_cents = balance_resp.get("balance", 0)
-            risk_budget_cents = max(500, int(balance_cents * RISK_PER_BET_PCT))
 
             # Find the next 15-min market for this series
             events = self.kalshi_client._get("/trade-api/v2/events", {
@@ -1602,6 +1602,19 @@ class KalshiDaemon:
         # Check model freshness before anything else
         if self.kalshi_predictor_version == "v3":
             self._check_model_freshness()
+
+        # Initialize dry-run balance from actual Kalshi balance
+        if self.dry_run:
+            self._init_kalshi_client()
+            if self.kalshi_client:
+                try:
+                    bal = self.kalshi_client.get_balance()
+                    self._dry_balance_cents = bal.get("balance", 10000)
+                    print(colored(
+                        f"  [BALANCE] Dry-run starting balance: ${self._dry_balance_cents/100:.2f} (from Kalshi)",
+                        "green"))
+                except Exception:
+                    print(colored("  [BALANCE] Dry-run using default $100.00", "yellow"))
 
         print("\n[STARTUP] Fetching initial 15m data for Kalshi pairs...")
         self._fetch_all()

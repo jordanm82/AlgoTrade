@@ -98,10 +98,14 @@ class RichDashboard:
 
     def _fetch_balance(self):
         try:
-            self.daemon._init_kalshi_client()
-            if self.daemon.kalshi_client:
-                bal = self.daemon.kalshi_client.get_balance()
-                self._kalshi_balance = bal.get("balance", 0) / 100
+            if self.daemon.dry_run:
+                # Use compounding simulated balance
+                self._kalshi_balance = self.daemon._dry_balance_cents / 100
+            else:
+                self.daemon._init_kalshi_client()
+                if self.daemon.kalshi_client:
+                    bal = self.daemon.kalshi_client.get_balance()
+                    self._kalshi_balance = bal.get("balance", 0) / 100
         except Exception as e:
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             self._log_lines.append(Text(f"{ts} [BAL ERR] {e}", style="red"))
@@ -413,7 +417,7 @@ class RichDashboard:
         completed = getattr(self.daemon, '_completed_bets', [])
         active_count = 0
 
-        # Only show UNSETTLED pending orders
+        # Show UNSETTLED pending orders
         for bet in pending:
             if bet.get("result"):  # already settled, skip
                 continue
@@ -431,6 +435,25 @@ class RichDashboard:
                     f"{entry}c", str(count), f"${cost:.2f}",
                     Text(f"${profit:+.2f}", style="green"),
                     Text("PENDING", style="cyan"),
+                )
+                active_count += 1
+
+        # Show resting orders (waiting for fill)
+        resting = getattr(self.daemon, '_resting_orders', [])
+        for order in resting:
+            asset = order.get("asset", "?")
+            side = order.get("side", "?").upper()
+            entry = order.get("price", order.get("fill_price", 0))
+            count = order.get("count", 0)
+            if count > 0:
+                cost = count * entry / 100
+                profit = count - cost
+                table.add_row(
+                    asset,
+                    Text(side, style="green" if side == "YES" else "red"),
+                    f"{entry}c", str(count), f"${cost:.2f}",
+                    Text(f"${profit:+.2f}", style="yellow"),
+                    Text("RESTING", style="yellow"),
                 )
                 active_count += 1
 
