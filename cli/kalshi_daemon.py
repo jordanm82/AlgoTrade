@@ -318,6 +318,25 @@ class KalshiDaemon:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
     # ------------------------------------------------------------------
+    # Trade debug logging
+    # ------------------------------------------------------------------
+
+    def _log_trade_debug(self, asset: str, action: str, details: dict):
+        """Log trade lifecycle events to file for debugging live/demo issues."""
+        try:
+            import json as _json
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "asset": asset,
+                "action": action,
+                **details,
+            }
+            with open("data/store/trade_debug.jsonl", "a") as f:
+                f.write(_json.dumps(entry) + "\n")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Settlement checking
     # ------------------------------------------------------------------
 
@@ -425,6 +444,24 @@ class KalshiDaemon:
 
                         result_str = "WIN" if won else "LOSS"
                         color = "green" if won else "red"
+
+                        # Log settlement details for debugging
+                        self._log_trade_debug(
+                            asset=asset, action="SETTLED",
+                            details={
+                                "result": result_str,
+                                "bet_side": bet.get("side"),
+                                "bet_direction": bet.get("direction"),
+                                "kalshi_result": result,
+                                "strike": bet.get("strike"),
+                                "settled_value": settled_value,
+                                "entry_price": entry_price,
+                                "count": count,
+                                "pnl_cents": pnl_cents,
+                                "ticker": m.get("ticker"),
+                                "demo": self.demo,
+                            }
+                        )
 
                         print(colored(
                             f"  [SETTLED] {asset} {bet['direction']} "
@@ -1233,9 +1270,28 @@ class KalshiDaemon:
                 print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
                 return pred
 
-            # Pick the soonest-expiring open market
+            # Sort by close_time to ensure we pick the soonest-expiring market
+            all_markets.sort(key=lambda m: m.get("close_time", "9999"))
             market = all_markets[0]
             ticker = market.get("ticker", "")
+
+            # Log market selection for debugging demo/live issues
+            market_strike = market.get("floor_strike") or market.get("custom_strike")
+            market_close = market.get("close_time", "?")
+            model_strike = signal.strike_price if isinstance(signal, KalshiV3Signal) else 0
+            self._log_trade_debug(
+                asset=asset, action="MARKET_SELECT",
+                details={
+                    "ticker": ticker,
+                    "market_strike": market_strike,
+                    "model_strike": model_strike,
+                    "close_time": market_close,
+                    "side": side,
+                    "direction": direction_label,
+                    "n_markets": len(all_markets),
+                    "demo": self.demo,
+                }
+            )
 
             # Get current ask price — bid AT the ask for guaranteed fill
             if side == "yes":
@@ -1290,6 +1346,27 @@ class KalshiDaemon:
             order_id = order.get("order_id", "?")
             fill_count = order.get("fill_count_fp", "0")
             order_status = order.get("status", "?")
+
+            # Log order placement details
+            self._log_trade_debug(
+                asset=asset, action="ORDER_PLACED",
+                details={
+                    "ticker": ticker,
+                    "side": side,
+                    "direction": direction_label,
+                    "count": count,
+                    "fill_price": fill_price,
+                    "fill_count": fill_count,
+                    "status": order_status,
+                    "order_id": order_id,
+                    "model_prob": signal.probability if isinstance(signal, KalshiV3Signal) else 0,
+                    "model_dist": signal.distance_atr if isinstance(signal, KalshiV3Signal) else 0,
+                    "model_strike": signal.strike_price if isinstance(signal, KalshiV3Signal) else 0,
+                    "market_yes_ask": market.get("yes_ask_dollars") or market.get("yes_ask"),
+                    "market_no_ask": market.get("no_ask_dollars") or market.get("no_ask"),
+                    "demo": self.demo,
+                }
+            )
 
             # Verify fill via Kalshi (exchange is source of truth)
             if float(fill_count) < count and order_status == "resting":
