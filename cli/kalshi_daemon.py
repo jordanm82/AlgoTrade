@@ -437,9 +437,9 @@ class KalshiDaemon:
         now = datetime.now(timezone.utc)
         settled = []
 
-        # Only check bets past their settlement time (+ 1 min buffer for Kalshi to settle)
+        # Check bets past their settlement time (15s buffer for Kalshi to process)
         due_bets = [b for b in self._pending_bets
-                    if now >= b["settle_time"] + pd.Timedelta(minutes=1)]
+                    if now >= b["settle_time"] + pd.Timedelta(seconds=15)]
         if not due_bets:
             return
 
