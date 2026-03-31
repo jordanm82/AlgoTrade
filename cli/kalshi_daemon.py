@@ -574,6 +574,15 @@ class KalshiDaemon:
         predictions = []
         actionable_signals = []
 
+        # Pre-fetch 1m data for all assets in one batch (reduces serial API latency)
+        _prefetched_1m = {}
+        if minute_in_window >= 1:  # only during CONFIRMED, not SETUP
+            for sym in self.KALSHI_PAIRS:
+                try:
+                    _prefetched_1m[sym] = self.fetcher.ohlcv(sym, "1m", limit=10)
+                except Exception:
+                    pass
+
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
             asset = symbol.split("/")[0]
 
@@ -780,9 +789,9 @@ class KalshiDaemon:
                     except Exception:
                         pass
 
-                # Build snapshot using 1m candles for early entry (contracts still cheap)
+                # Build snapshot using pre-fetched 1m candles (already batched above)
                 try:
-                    df_sub = self.fetcher.ohlcv(symbol, "1m", limit=10)
+                    df_sub = _prefetched_1m.get(symbol)
                     if df_15m is not None and df_sub is not None and len(df_sub) > 0:
                         snapshot = build_minute3_snapshot(df_15m, df_sub, current_window_start_pd)
                         if snapshot is not None:
