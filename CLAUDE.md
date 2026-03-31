@@ -2,6 +2,15 @@
 
 Read this file completely before every trading session. It is your operational context.
 
+## CRITICAL CODING RULES
+
+**NO FALLBACK CODE. EVER.** If the correct data path fails, raise an error or skip the action. NEVER silently substitute different/stale/partial data. Every major bug in this project came from fallback code that hid errors and produced wrong predictions. Specifically:
+- If a data fetch fails → skip the trade, do NOT use cached/stale data
+- If a snapshot can't be built → return None, do NOT use raw partial candles
+- `except Exception: pass` is BANNED — always log the error
+- Never write `if X is None: use Y` where Y is a different data source
+- The only acceptable fallback is "do nothing" (skip), NEVER "do the wrong thing"
+
 ## System Overview
 
 You are the AI decision engine for an automated crypto trading system. You interact with it via **MCP tools** (`algotrade_*`) — no bash commands needed. The system trades on two exchanges: **Coinbase** (spot crypto) and **Kalshi** (15-minute prediction markets). Each exchange is its own source of truth for orders, positions, and balances.
@@ -110,26 +119,29 @@ Three predictor versions available via `--predictor v1|v2|v3`:
 
 **V3 (recommended) — Strike-Relative + KNN Hybrid Model:**
 
-Two prediction modes that activate automatically:
+Two-factor prediction: **LR (LogReg)** for direction + **TEK (probability table)** for confirmation.
 
-**Early Entry (KNN) — minute 0-5, near strike:**
-- 12-feature KNN model trained on multi-timeframe data (15m + 1h + 4h)
-- Features: RSI, StochRSI, MACD, normalized returns, volume ratio, BB position, EMA slope, ADX, ROC across 3 timeframes
-- Walk-forward validated: 61.3% WR on 6,178 bets, +22.6% ROI @50c contracts
-- Activates when: minutes_remaining >= 10 AND distance from strike < 0.5 ATR
-- Bypasses V3 adjustments — raw KNN probability is stronger than hand-tuned rules
-- This is where the money is — contracts near 50c with 60%+ prediction accuracy
+**LR — LogReg Direction Model (primary signal):**
+- 15-feature LogisticRegression trained on multi-timeframe Coinbase data (15m + 1h + 4h)
+- Features: RSI, StochRSI, MACD, normalized returns, volume ratio, BB position, EMA slope, ADX, ROC, plus price_vs_ema, hourly_return, trend_direction
+- Walk-forward validated: 60.9% WR solo, **78% WR with TEK** on 11,498 out-of-sample bets
+- Trained with `class_weight='balanced'` — produces both YES and NO predictions
+- Retrained via `scripts/retrain_walkforward.py` (walk-forward: train on older data only)
 
-**Late Entry (Probability Table) — minute 10+, far from strike:**
+**TEK — Probability Table Confluence (filter):**
 - Pre-computed 2D probability table (distance_ATR × time_remaining)
 - Built from historical 1m data: `./venv/bin/python scripts/build_prob_table.py --days 90`
+- At minute 5: uses actual Coinbase price vs Kalshi strike to compute distance
+- Called with `force_table=True` to ensure table lookup (not another LR prediction)
+- Adds +17pp WR by filtering bets where price hasn't moved to confirm LR direction
 - Technical adjustments: OB (±5%), trade flow (±5%), 1h trend (±5%), MACD (+3%), RSI extreme (-8%), RSI divergence (-8%), momentum gate (-15%)
-- Useful for high-probability late-window bets when price has moved far from strike
 
-**Bet decision:**
-- YES when probability >= 60%, NO when probability <= 40%
+**Bet decision (2-factor gate):**
+- LR predicts direction: YES when prob >= 55%, NO when prob <= 45%
+- TEK confirms: probability table score >= 30% for predicted side
+- Both must agree for bet execution
 - **Bets BOTH sides** — YES and NO
-- Edge margin: 5c minimum edge over implied contract price
+- Edge margin: 2c minimum edge over implied contract price
 - Max contract price: 85c hard cap
 - Price source: Coinbase (closest to CF Benchmarks BRTI settlement)
 
@@ -153,7 +165,10 @@ Two prediction modes that activate automatically:
 **Settlement tracking:** Queries Kalshi API for authoritative settlement results (not approximated from price data). Tracks W/L/WR and P&L for both dry-run and live modes.
 
 **Model refresh:**
-- KNN model: `./venv/bin/python scripts/build_knn_model.py --days 90 --k 50`
+- LogReg model (walk-forward): `./venv/bin/python scripts/retrain_walkforward.py --days 179`
+  - Trains on 120 days oldest data, validates on 59 days most recent (out-of-sample)
+  - Shows LR × TEK threshold grid with WR and P&L
+  - Auto-triggered on daemon startup when model > 7 days old
 - Probability table: `./venv/bin/python scripts/build_prob_table.py --days 90`
 - Refresh weekly/monthly to stay current with market regime
 

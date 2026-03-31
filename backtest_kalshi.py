@@ -47,7 +47,7 @@ def fetch_candles(fetcher: DataFetcher, symbol: str, timeframe: str, days: int) 
     now_ms = int(time.time() * 1000)
     period_ms = days * 24 * 60 * 60 * 1000
     since = now_ms - period_ms
-    batch_size = 1000
+    batch_size = 300  # Coinbase max per request
 
     if timeframe == "5m":
         candle_ms = 5 * 60 * 1000
@@ -58,19 +58,28 @@ def fetch_candles(fetcher: DataFetcher, symbol: str, timeframe: str, days: int) 
     else:
         candle_ms = 15 * 60 * 1000
 
+    batches = 0
     while since < now_ms:
         try:
             df = fetcher.ohlcv(symbol, timeframe, limit=batch_size, since=since)
             if df is None or df.empty:
-                break
+                # No data at this since — skip forward
+                since += batch_size * candle_ms
+                time.sleep(0.5)
+                continue
             all_frames.append(df)
             last_ts = int(df.index[-1].timestamp() * 1000)
             since = last_ts + candle_ms
-            if len(df) < batch_size:
-                break
-            time.sleep(0.3)
+            batches += 1
+            if batches % 10 == 0:
+                print(f"    Chunk {batches}: {sum(len(f) for f in all_frames)} candles so far")
+            # Don't break on short batches — Coinbase sometimes returns fewer
+            # Only break if we got zero new data
+            time.sleep(0.5)
         except Exception as e:
             print(f"    Warning: fetch error: {e}")
+            since += batch_size * candle_ms
+            time.sleep(2)
             since += batch_size * candle_ms
             time.sleep(1)
 

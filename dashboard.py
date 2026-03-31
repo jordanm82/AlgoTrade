@@ -39,10 +39,15 @@ LOG_FILE = Path("data/store/dashboard.log")
 
 
 class Dashboard:
-    def __init__(self, dry_run: bool = True, max_cycles: int = 15, kalshi_only: bool = False, predictor_version: str = "v1"):
-        if kalshi_only:
+    def __init__(self, dry_run: bool = True, max_cycles: int = 15, kalshi_only: bool = False, predictor_version: str = "v1", arb_mode: bool = False):
+        self.arb_mode = arb_mode
+        if arb_mode:
+            from cli.kalshi_arb import KalshiArbDaemon
+            self.daemon = KalshiArbDaemon(dry_run=dry_run)
+            self.daemon.kalshi_only = True
+        elif kalshi_only:
             self.daemon = KalshiDaemon(dry_run=dry_run, predictor_version=predictor_version)
-            self.daemon.kalshi_only = True  # for dashboard rendering checks
+            self.daemon.kalshi_only = True
         else:
             self.daemon = LiveDaemon(dry_run=dry_run, kalshi_only=kalshi_only, predictor_version=predictor_version)
         self.dry_run = dry_run
@@ -177,19 +182,22 @@ class Dashboard:
                 f"  CYCLES: {self.max_cycles}  (~{self.max_cycles * 15} minutes)",
                 "=" * 78,
                 "",
-                "  MODEL: V3 Strike-Relative + KNN Early Entry",
-                "  ENTRY: Minute 3+ (contracts near 50c)",
+                "  MODEL: V3 Strike-Relative + KNN + BTC Confluence",
+                "  ENTRY: Minute 3 (contracts near 50c)",
+                "  FACTORS: KNN (direction) + TEK (technical/distance)",
                 f"  MAX CONCURRENT BETS: {MAX_CONCURRENT_KALSHI_BETS}",
                 "",
-                "  ASSET THRESHOLDS (tiered by backtest performance):",
+                "  THRESHOLDS (2-factor, balanced KNN K=20 + debiased TEK):",
             ]
-            for sym, thresh in thresholds.items():
+            btc_thresh = getattr(self.daemon, 'BTC_CONFLUENCE_THRESHOLD', 50)
+            tbl_thresholds = getattr(self.daemon, 'KALSHI_TBL_THRESHOLDS', {})
+            for sym, knn_t in thresholds.items():
                 asset = sym.split("/")[0]
-                tier = "Tier 1" if thresh == 60 else "Tier 2" if thresh == 65 else "Tier 3"
-                lines.append(f"    {asset:<5} >= {thresh}%  ({tier})")
+                tbl_t = tbl_thresholds.get(sym, 50)
+                lines.append(f"    {asset:<5} KNN>={knn_t}%  TBL>={tbl_t}%  BTC>={btc_thresh}")
             lines.extend([
                 "",
-                f"  PAIRS: {', '.join(p.split('/')[0] for p in pairs)}",
+                f"  ALTS: {', '.join(p.split('/')[0] for p in pairs)}  |  BTC: confluence only",
                 "",
                 "=" * 78,
             ])
@@ -297,19 +305,31 @@ class Dashboard:
             pending = len(self.daemon._pending_bets)
             from config.production import MAX_CONCURRENT_KALSHI_BETS
 
+            mode_label = "ARB" if self.arb_mode else "UPDOWN"
             lines = [
                 "",
                 "=" * 78,
-                f"  K15 UPDOWN [{mode}] V3  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  Tick {self._tick_count}  |  Up {h}h{m}m",
+                f"  K15 {mode_label} [{mode}] V3  {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  Tick {self._tick_count}  |  Up {h}h{m}m",
                 "=" * 78,
                 "",
                 f"  KALSHI BALANCE: ${kalshi_bal:,.2f}  |  BETS: {pending} pending settlement",
             ]
             session_pnl = sum(b.get("pnl_dollars", 0) for b in self.daemon._completed_bets)
             pnl_sign = "+" if session_pnl >= 0 else ""
-            lines.append(
-                f"  SESSION: W:{dw} L:{dl} WR:{dwr:.0f}%  |  P&L: ${pnl_sign}{session_pnl:.2f}  |  Max bets: {MAX_CONCURRENT_KALSHI_BETS}"
-            )
+            if self.arb_mode:
+                arb_w = getattr(self.daemon, '_session_arb_wins', 0)
+                dir_h = getattr(self.daemon, '_session_directional', 0)
+                sold = getattr(self.daemon, '_session_cancelled', 0)
+                lines.append(
+                    f"  SESSION: W:{dw} L:{dl} WR:{dwr:.0f}%  |  P&L: ${pnl_sign}{session_pnl:.2f}"
+                )
+                lines.append(
+                    f"  ARB: {arb_w} locked  |  DIR: {dir_h} held  |  SOLD: {sold} cut"
+                )
+            else:
+                lines.append(
+                    f"  SESSION: W:{dw} L:{dl} WR:{dwr:.0f}%  |  P&L: ${pnl_sign}{session_pnl:.2f}  |  Max bets: {MAX_CONCURRENT_KALSHI_BETS}"
+                )
             lines.extend([
                 "",
             ])
@@ -441,11 +461,49 @@ class Dashboard:
 
         # Kalshi predictions
         kalshi_preds = getattr(self.daemon, "kalshi_predictions", [])
-        if kalshi_preds:
+        if kalshi_preds and self.arb_mode:
+            lines.append("")
+            lines.append("  BOTH-SIDES ARBITRAGE:")
+            lines.append(
+                f"    {'ASSET':<5} {'YES':>5} {'NO':>5}  "
+                f"{'PRICE':>12} {'TARGET':>12} {'DIST':>8}  "
+                f"{'STATE':<18}"
+            )
+            lines.append(f"    {'─'*75}")
+            for pred in kalshi_preds:
+                asset = pred.get("asset", "?")
+                state = pred.get("state", "")
+                yes_est = pred.get("yes_est", 0)
+                no_est = pred.get("no_est", 0)
+                yes_filled = pred.get("yes_filled", False)
+                no_filled = pred.get("no_filled", False)
+
+                # Format YES/NO with fill indicator
+                yes_str = f"{yes_est}c" + ("*" if yes_filled else " ")
+                no_str = f"{no_est}c" + ("*" if no_filled else " ")
+
+                current = pred.get("current_price", 0)
+                strike = pred.get("strike", 0)
+                current_str = f"${current:,.2f}" if current else ""
+                target_str = f"${strike:,.2f}" if strike else ""
+                dist_str = pred.get("dist", "")
+
+                lines.append(
+                    f"    {asset:<5} {yes_str:>5} {no_str:>5}  "
+                    f"{current_str:>12} {target_str:>12} {dist_str:>8}  "
+                    f"{state:<18}"
+                )
+
+        elif kalshi_preds:
             lines.append("")
             lines.append("  KALSHI PREDICTIONS:")
-            lines.append(f"    {'ASSET':<5} {'SIDE':<5} {'PROB':>5}  {'PRICE':>12} {'TARGET':>12} {'DIST':>8}  {'MDL':<4}{'STATE':<18}")
-            lines.append(f"    {'─'*70}")
+            lines.append(
+                f"    {'ASSET':<5} {'SIDE':<4} "
+                f"{'KNN':>7} {'TBL':>7} {'BTC':>7}  "
+                f"{'PRICE':>12} {'TARGET':>12} {'DIST':>8}  "
+                f"{'STATE':<18}"
+            )
+            lines.append(f"    {'─'*86}")
             for pred in kalshi_preds:
                 asset = pred.get("asset", "?")
                 direction = pred.get("direction", "--")
@@ -461,13 +519,11 @@ class Dashboard:
                     target = pending.get("strike_price", 0)
                     if target:
                         target_str = f"${target:,.2f}"
-                        # Get current price from Coinbase (closer to BRTI settlement)
                         symbol = f"{asset}/USDT"
                         cb_price = self.daemon._get_coinbase_price(symbol) if hasattr(self.daemon, '_get_coinbase_price') else None
                         if cb_price:
                             current = cb_price
                         else:
-                            # Fallback to cached candle data
                             df = self.daemon._dataframes.get(symbol) or self.daemon._kalshi_cached_dataframes.get(symbol)
                             current = float(df.iloc[-1]["close"]) if df is not None and len(df) > 0 else 0
                         if current:
@@ -477,16 +533,94 @@ class Dashboard:
                             dist_str = f"{sign}{diff:.2f}"
 
                 side_display = direction if direction != "--" else "--"
-                prob_display = f"{conf}%" if conf > 0 else "--"
 
-                # Show which model produced the prediction
-                reason = pred.get("reason", "")
-                model_tag = "KNN" if "knn" in reason.lower() else "TBL"
+                # KNN, TBL, BTC columns with pass/fail indicators
+                knn_s = pred.get("knn_score", 0)
+                knn_t = pred.get("knn_thresh", 60)
+                tbl_s = pred.get("tbl_score", 0)
+                tbl_t = pred.get("tbl_thresh", 55)
+                btc_s = pred.get("btc_score", 0)
+                btc_t = pred.get("btc_thresh", 50)
+
+                # Show each factor's OWN directional opinion with color
+                # Y = green, N = red
+                def _color_factor(score, direction):
+                    """Format a factor score with color: green for Y, red for N."""
+                    if direction == "Y":
+                        return colored(f"{score}%Y", "green")
+                    else:
+                        return colored(f"{score}%N", "red")
+
+                # KNN direction
+                if knn_s > 0 and side_display in ("YES", "NO"):
+                    knn_dir = "Y" if side_display == "YES" else "N"
+                elif knn_s > 0:
+                    knn_dir = "Y" if knn_s >= 50 else "N"
+                else:
+                    knn_dir = None
+
+                # TBL direction
+                if tbl_s > 0 and side_display in ("YES", "NO"):
+                    if tbl_s >= 50:
+                        tbl_dir = "Y" if side_display == "YES" else "N"
+                    else:
+                        tbl_dir = "Y" if side_display == "NO" else "N"
+                        tbl_s = 100 - tbl_s
+                elif tbl_s > 0:
+                    tbl_dir = "Y" if tbl_s >= 50 else "N"
+                else:
+                    tbl_dir = None
+
+                # BTC direction
+                if btc_s > 0:
+                    if side_display in ("YES", "NO"):
+                        if btc_s >= 50:
+                            btc_dir = "Y" if side_display == "YES" else "N"
+                        else:
+                            btc_dir = "Y" if side_display == "NO" else "N"
+                            btc_s = 100 - btc_s
+                    else:
+                        btc_dir = "Y" if btc_s >= 50 else "N"
+                else:
+                    btc_dir = None
+
+                # Pad raw strings first, THEN colorize (ANSI codes break padding)
+                def _pad_color(text, width, color):
+                    return colored(f"{text:>{width}}", color)
+
+                knn_raw = f"{knn_s}%{knn_dir}" if knn_dir else "--"
+                tbl_raw = f"{tbl_s}%{tbl_dir}" if tbl_dir else "--"
+                btc_raw = f"{btc_s}%{btc_dir}" if btc_dir else "--"
+
+                knn_color = "green" if knn_dir == "Y" else "red" if knn_dir == "N" else "dark_grey"
+                tbl_color = "green" if tbl_dir == "Y" else "red" if tbl_dir == "N" else "dark_grey"
+                btc_color = "green" if btc_dir == "Y" else "red" if btc_dir == "N" else "dark_grey"
+
+                knn_c = _pad_color(knn_raw, 7, knn_color)
+                tbl_c = _pad_color(tbl_raw, 7, tbl_color)
+                btc_c = _pad_color(btc_raw, 7, btc_color)
+
+                if side_display == "YES":
+                    side_c = colored(f"{'YES':<4}", "green")
+                elif side_display == "NO":
+                    side_c = colored(f"{'NO':<4}", "red")
+                else:
+                    side_c = colored(f"{'--':<4}", "dark_grey")
+
+                if "BETTING" in state or "SIGNAL" in state:
+                    state_c = colored(f"{state:<18}", "cyan")
+                elif "ARB" in state:
+                    state_c = colored(f"{state:<18}", "green")
+                elif state in ("SOLD", "CANCELLED", "DONE", "NO FILL", "EXPIRED"):
+                    state_c = colored(f"{state:<18}", "dark_grey")
+                else:
+                    state_c = f"{state:<18}"
 
                 lines.append(
-                    f"    {asset:<5} {side_display:<5} {prob_display:>5}  "
+                    f"    {asset:<5} {side_c}"
+                    f"{knn_c} {tbl_c} {btc_c}  "
                     f"{current_str:>12} {target_str:>12} {dist_str:>8}  "
-                    f"{model_tag:<4}{state:<18}"
+                    f"{state_c}"
                 )
 
         # Footer — show time to next Kalshi window
@@ -495,11 +629,14 @@ class Dashboard:
         mins_to_next_window = 15 - min_in_window
         window_start = now_utc.minute - min_in_window
         window_end = (window_start + 15) % 60
-        next_eval_mins = 5 - (min_in_window % 5)
-        if next_eval_mins == 0:
-            next_eval_mins = 5
+        if 1 <= min_in_window <= 10:
+            next_eval_str = "~1 min"
+        elif min_in_window == 0:
+            next_eval_str = "~1 min"
+        else:
+            next_eval_str = f"next window"
         lines.append(f"\n  Window: :{window_start:02d}-:{window_end:02d} (min {min_in_window}/15)  |  "
-                     f"Next eval: ~{next_eval_mins} min  |  Next window: ~{mins_to_next_window} min")
+                     f"Next eval: {next_eval_str}  |  Next window: ~{mins_to_next_window} min")
         lines.append("=" * 78)
 
         self._write_log(lines)
@@ -580,7 +717,7 @@ class Dashboard:
                     lines.append(
                         f"    {i:>3}. {r['asset']:<5} {r['direction']:<4} "
                         f"{entry:>4}c x{qty:<3} "
-                        f"${r['strike']:>10,.2f} ${r.get('settle_price',0):>10,.2f} "
+                        f"${r.get('strike',0):>10,.2f} ${r.get('settle_price',0):>10,.2f} "
                         f" {result_tag:<4} ${pnl_sign}{pnl:.2f}"
                     )
                 lines.append("")
@@ -654,11 +791,12 @@ class Dashboard:
             self.daemon._fetch_all()
 
             # Run initial eval immediately
+            eval_fn = self.daemon._arb_eval if self.arb_mode else self.daemon._kalshi_eval
             try:
-                self.daemon._kalshi_eval()
+                eval_fn()
                 self.daemon._last_kalshi_eval = time.time()
             except Exception as e:
-                print(f"  [KALSHI EVAL ERR] {e}")
+                print(f"  [EVAL ERR] {e}")
             self._draw_dashboard(is_signal_cycle=True, signals=None)
 
             total_ticks = self.max_cycles * 15  # convert cycles to minutes
@@ -678,13 +816,17 @@ class Dashboard:
                 current_minute = datetime.now(timezone.utc).minute
                 now_ts = time.time()
                 min_in_window = current_minute % 15
-                should_eval = (min_in_window == 1 and now_ts - self.daemon._last_kalshi_eval >= 50) \
-                           or (min_in_window == 3 and now_ts - self.daemon._last_kalshi_eval >= 50)
+                if self.arb_mode:
+                    should_eval = now_ts - self.daemon._last_kalshi_eval >= 50
+                else:
+                    should_eval = (min_in_window == 1 and now_ts - self.daemon._last_kalshi_eval >= 50) \
+                               or (min_in_window == 3 and now_ts - self.daemon._last_kalshi_eval >= 50)
                 if should_eval:
+                    eval_fn = self.daemon._arb_eval if self.arb_mode else self.daemon._kalshi_eval
                     try:
-                        self.daemon._kalshi_eval()
+                        eval_fn()
                     except Exception as e:
-                        print(f"  [KALSHI EVAL ERR] {e}")
+                        print(f"  [EVAL ERR] {e}")
                     self.daemon._last_kalshi_eval = now_ts
 
                 self.daemon._update_equity()
@@ -700,11 +842,12 @@ class Dashboard:
                 self._last_signals = signals or []
                 self._last_signal_time = datetime.now(timezone.utc)
                 self._fetch_live_prices()
+                eval_fn = self.daemon._arb_eval if self.arb_mode else self.daemon._kalshi_eval
                 try:
-                    self.daemon._kalshi_eval()
+                    eval_fn()
                     self.daemon._last_kalshi_eval = time.time()
                 except Exception as e:
-                    print(f"  [KALSHI EVAL ERR] {e}")
+                    print(f"  [EVAL ERR] {e}")
                 self._draw_dashboard(is_signal_cycle=True, signals=self._last_signals)
 
                 if self._cycle_count >= self.max_cycles:
@@ -749,16 +892,22 @@ def main():
     parser.add_argument("--live", action="store_true", help="Live trading")
     parser.add_argument("--cycles", type=int, default=15, help="Signal cycles to run")
     parser.add_argument("--k15", action="store_true", default=True, help="Run K15 Kalshi 15m prediction bot (default)")
+    parser.add_argument("--arb", action="store_true", help="Run K15 both-sides arbitrage mode")
     parser.add_argument("--spot", action="store_true", help="Run Coinbase spot trading bot (BB Grid + RSI MR)")
     parser.add_argument("--simple", action="store_true", help="Force plain text output (for logs/pipes)")
     args = parser.parse_args()
 
-    # --spot overrides the default --k15
-    kalshi_only = not args.spot
-
-    dry_run = not args.live
-    predictor_version = "v3" if kalshi_only else "v1"
-    Dashboard(dry_run=dry_run, max_cycles=args.cycles, kalshi_only=kalshi_only, predictor_version=predictor_version).run()
+    if args.arb:
+        from cli.kalshi_arb import KalshiArbDaemon
+        dry_run = not args.live
+        Dashboard(dry_run=dry_run, max_cycles=args.cycles, kalshi_only=True,
+                  predictor_version="v3", arb_mode=True).run()
+    else:
+        # --spot overrides the default --k15
+        kalshi_only = not args.spot
+        dry_run = not args.live
+        predictor_version = "v3" if kalshi_only else "v1"
+        Dashboard(dry_run=dry_run, max_cycles=args.cycles, kalshi_only=kalshi_only, predictor_version=predictor_version).run()
 
 
 if __name__ == "__main__":

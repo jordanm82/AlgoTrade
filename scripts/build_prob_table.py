@@ -24,11 +24,10 @@ from data.fetcher import DataFetcher
 from data.indicators import add_indicators
 
 ASSETS = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT",
-    "BNB": "BNB/USDT",
+    "BTC": "BTC/USD",
+    "ETH": "ETH/USD",
+    "SOL": "SOL/USD",
+    "XRP": "XRP/USD",
 }
 
 # Distance buckets (in ATR units)
@@ -57,7 +56,7 @@ def fetch_1m_chunked(fetcher: DataFetcher, symbol: str, days: int) -> pd.DataFra
         batch_since = since
         while batch_since < until:
             try:
-                df = fetcher.ohlcv(symbol, "1m", limit=1000, since=batch_since)
+                df = fetcher.ohlcv(symbol, "1m", limit=300, since=batch_since)
                 if df is None or df.empty:
                     break
                 all_frames.append(df)
@@ -68,7 +67,7 @@ def fetch_1m_chunked(fetcher: DataFetcher, symbol: str, days: int) -> pd.DataFra
                 time.sleep(0.3)
             except Exception as e:
                 print(f"    Warning: {e}")
-                batch_since += 1000 * candle_ms
+                batch_since += 300 * candle_ms
                 time.sleep(1)
 
         print(f"    Chunk {chunk+1}/{total_chunks}: {len(all_frames)} batches so far")

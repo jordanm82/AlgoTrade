@@ -14,8 +14,8 @@ from pathlib import Path
 DISTANCE_BINS = [-3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
 TIME_BINS = [14, 12, 10, 8, 6, 4, 2]
 
-EDGE_MARGIN = 0.05    # require 5% edge over implied contract price
-MAX_BET_PRICE = 85    # max price scales with probability, hard cap at 85c
+EDGE_MARGIN = 0.02    # require 2% edge over implied contract price
+MAX_BET_PRICE = 57    # hard cap — orderbook data shows winning side avg 53-56c at min 3
 
 
 @dataclass
@@ -65,13 +65,16 @@ class KalshiPredictorV3:
                 minutes_remaining: float, market_data: dict | None = None,
                 df_1h: pd.DataFrame | None = None,
                 current_price: float | None = None,
-                df_4h: pd.DataFrame | None = None) -> KalshiV3Signal | None:
+                df_4h: pd.DataFrame | None = None,
+                force_table: bool = False) -> KalshiV3Signal | None:
         """Compute strike-relative probability and bet recommendation.
 
         Args:
             current_price: Override price for distance calculation.
                 Use Coinbase price (closer to CF Benchmarks BRTI settlement source)
                 instead of BinanceUS candle close which has a ~$15-30 spread.
+            force_table: If True, skip KNN and use probability table directly.
+                Used by daemon for TEK (technical) confluence scoring.
         """
         if df is None or len(df) < 20:
             return None
@@ -88,9 +91,11 @@ class KalshiPredictorV3:
         distance_atr = (current_price - strike_price) / atr
 
         # 2. Choose prediction mode based on timing + distance
-        # KNN for early entry (>= 8 min left) — contracts are still cheap
-        # Probability table for late entry (< 8 min left) — distance-based
-        use_knn = (minutes_remaining >= 8
+        # KNN for early entry (>= 5 min left) — contracts are still cheap
+        # Probability table for late entry (< 5 min left) — distance-based
+        # force_table=True skips KNN entirely (used for TEK confluence scoring)
+        use_knn = (not force_table
+                   and minutes_remaining >= 5
                    and self._knn is not None)
 
         if use_knn:
@@ -181,25 +186,37 @@ class KalshiPredictorV3:
         if df is None or len(df) < 20:
             return None
 
-        last = df.iloc[-1]
+        # Use the SECOND-TO-LAST row for indicator features (last completed 15m candle)
+        # The last row may be a synthetic row with modified close — don't recompute from it
+        # This matches training which uses completed candle indicators directly
+        if len(df) >= 2:
+            indicator_row = df.iloc[-2]  # previous completed candle (has real indicators)
+            current_close = float(df.iloc[-1]["close"])  # synthetic or current close
+        else:
+            indicator_row = df.iloc[-1]
+            current_close = float(df.iloc[-1]["close"])
 
-        # Extract same 12 features used in training
         try:
-            pct = df["close"].pct_change()
+            # Features 1-9: use indicator_row values directly (matches training)
+            # Training does: r = df.iloc[i] where r is a completed candle
+            prev_close = float(indicator_row["close"])
+            vol_sma = float(indicator_row.get("vol_sma_20", 0))
+            bb_range = float(indicator_row.get("bb_upper", 0)) - float(indicator_row.get("bb_lower", 0))
+
+            # norm_return: use the completed candle's own return, not synthetic
+            pct = df["close"].iloc[:-1].pct_change()  # exclude synthetic row
             norm_ret_series = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
-            vol_sma = float(last.get("vol_sma_20", 0))
-            bb_range = float(last.get("bb_upper", 0)) - float(last.get("bb_lower", 0))
 
             vals = [
-                float(last.get("rsi", 50)),
-                float(last.get("stochrsi_k", 50)),
-                float(last.get("macd_hist", 0)),
-                float(norm_ret_series.iloc[-1]) if pd.notna(norm_ret_series.iloc[-1]) else 0,
-                float(last.get("volume", 0)) / vol_sma if vol_sma > 0 else 1.0,
-                (float(last["close"]) - float(last.get("bb_lower", 0))) / bb_range if bb_range > 0 else 0.5,
-                float(df["ema_12"].pct_change(3).iloc[-1] * 100) if len(df) >= 4 and pd.notna(df["ema_12"].pct_change(3).iloc[-1]) else 0,
-                float(last.get("adx", 20)),
-                float(last.get("roc_5", 0)),
+                float(indicator_row.get("rsi", 50)),
+                float(indicator_row.get("stochrsi_k", 50)),
+                float(indicator_row.get("macd_hist", 0)),
+                float(norm_ret_series.iloc[-1]) if len(norm_ret_series) > 0 and pd.notna(norm_ret_series.iloc[-1]) else 0,
+                float(indicator_row.get("volume", 0)) / vol_sma if vol_sma > 0 else 1.0,
+                (prev_close - float(indicator_row.get("bb_lower", 0))) / bb_range if bb_range > 0 else 0.5,
+                float(df["ema_12"].iloc[:-1].pct_change(3).iloc[-1] * 100) if len(df) >= 5 and pd.notna(df["ema_12"].iloc[:-1].pct_change(3).iloc[-1]) else 0,
+                float(indicator_row.get("adx", 20)),
+                float(indicator_row.get("roc_5", 0)),
             ]
 
             # 1h context
@@ -217,6 +234,29 @@ class KalshiPredictorV3:
             else:
                 vals.append(50.0)
 
+            # Trend features — use indicator_row for SMA/ATR/ADX, prev_close for price
+            # Training uses the completed candle's own values
+            sma_val = float(indicator_row.get("sma_20", prev_close))
+            atr_val = float(indicator_row.get("atr", 1))
+            adx_val = float(indicator_row.get("adx", 20))
+
+            # price_vs_ema: (close - SMA20) / ATR — uses completed candle close
+            price_vs_ema = (prev_close - sma_val) / atr_val if atr_val > 0 else 0
+
+            # hourly_return: pct_change(4) = 4 candles back (matches training)
+            if len(df) >= 6:  # need iloc[-2] and 4 before that = iloc[-6]
+                hr = (prev_close - float(df.iloc[-6]["close"])) / float(df.iloc[-6]["close"]) * 100
+            else:
+                hr = 0
+
+            # trend_direction: ADX * sign(close - SMA)
+            trend_sign = 1 if prev_close >= sma_val else -1
+            trend_dir = adx_val * trend_sign
+
+            vals.append(price_vs_ema)
+            vals.append(hr)
+            vals.append(trend_dir)
+
             # Check for NaN/inf
             if any(pd.isna(v) or np.isinf(v) for v in vals):
                 return None
@@ -224,7 +264,34 @@ class KalshiPredictorV3:
             X = np.array(vals).reshape(1, -1)
             X_scaled = self._knn_scaler.transform(X)
             probs = self._knn.predict_proba(X_scaled)
-            return float(probs[0][1])  # probability of UP
+            prob_up = float(probs[0][1])
+
+            # Log features for live/backtest parity audit
+            try:
+                import json
+                from datetime import datetime, timezone
+                feature_names = [
+                    "rsi_15m", "stochrsi_15m", "macd_15m", "norm_return",
+                    "vol_ratio", "bb_position", "ema_slope", "adx", "roc_5",
+                    "rsi_1h", "macd_1h", "rsi_4h",
+                    "price_vs_ema", "hourly_return", "trend_direction",
+                ]
+                log_entry = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "close": prev_close,
+                    "sma_20": sma_val,
+                    "prob": round(prob_up, 4),
+                    "side": "YES" if prob_up >= 0.55 else "NO" if prob_up <= 0.45 else "SKIP",
+                }
+                for i, name in enumerate(feature_names):
+                    if i < len(vals):
+                        log_entry[name] = round(vals[i], 6)
+                with open("data/store/feature_log.jsonl", "a") as f:
+                    f.write(json.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+
+            return prob_up
 
         except Exception:
             return None
@@ -317,20 +384,17 @@ class KalshiPredictorV3:
         return adjustments
 
     def _decide_bet(self, adjusted_prob: float) -> tuple[str, int]:
-        """Decide bet side and max price from adjusted probability."""
-        if adjusted_prob >= 0.60:
-            # Bet YES — price likely closes above strike
-            fair_price = int(adjusted_prob * 100)
-            max_price = min(MAX_BET_PRICE, fair_price - int(EDGE_MARGIN * 100))
-            if max_price >= 5:  # minimum viable price
-                return "YES", max_price
-        elif adjusted_prob <= 0.40:
-            # Bet NO — price likely closes below strike
-            no_prob = 1.0 - adjusted_prob
-            fair_price = int(no_prob * 100)
-            max_price = min(MAX_BET_PRICE, fair_price - int(EDGE_MARGIN * 100))
-            if max_price >= 5:
-                return "NO", max_price
+        """Decide bet side and max price from adjusted probability.
+
+        Gate at 55/45 to match per-asset KNN thresholds (55-60%).
+        The daemon's per-asset thresholds do the real filtering.
+        """
+        if adjusted_prob >= 0.55:
+            # Bet YES — max price is the hard cap
+            return "YES", MAX_BET_PRICE
+        elif adjusted_prob <= 0.45:
+            # Bet NO — max price is the hard cap
+            return "NO", MAX_BET_PRICE
 
         return "SKIP", 0
 

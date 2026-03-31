@@ -218,3 +218,16 @@ class KalshiClient:
         """Get open orders."""
         resp = self._get("/trade-api/v2/portfolio/orders", {"status": status, "limit": 100})
         return resp.get("orders", [])
+
+    def get_fills(self, ticker: str = None, limit: int = 20) -> list[dict]:
+        """Get recent trade fills with actual prices."""
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        resp = self._get("/trade-api/v2/portfolio/fills", params)
+        return resp.get("fills", [])
+
+    def get_settlements(self, limit: int = 20) -> list[dict]:
+        """Get recent settlements with actual revenue and costs."""
+        resp = self._get("/trade-api/v2/portfolio/settlements", {"limit": limit})
+        return resp.get("settlements", [])

@@ -26,11 +26,10 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 
 ASSETS = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT",
-    "BNB": "BNB/USDT",
+    "BTC": "BTC/USD",
+    "ETH": "ETH/USD",
+    "SOL": "SOL/USD",
+    "XRP": "XRP/USD",
 }
 
 FEATURE_NAMES = [
@@ -143,22 +142,61 @@ def main():
     print(f"\nTotal training samples: {len(X_all)}")
     print(f"Base rate UP: {y_all.mean():.1%}")
 
-    # Fit scaler
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_all)
+    # Balance classes — undersample the majority class
+    up_mask = y_all == 1
+    down_mask = y_all == 0
+    up_count = up_mask.sum()
+    down_count = down_mask.sum()
+    print(f"Before balancing: UP={up_count} DOWN={down_count}")
 
-    # Fit KNN
+    if up_count > down_count:
+        # Undersample UP to match DOWN
+        up_indices = np.where(up_mask)[0]
+        np.random.seed(42)
+        keep = np.random.choice(up_indices, size=down_count, replace=False)
+        balanced_indices = np.concatenate([keep, np.where(down_mask)[0]])
+    else:
+        # Undersample DOWN to match UP
+        down_indices = np.where(down_mask)[0]
+        np.random.seed(42)
+        keep = np.random.choice(down_indices, size=up_count, replace=False)
+        balanced_indices = np.concatenate([np.where(up_mask)[0], keep])
+
+    np.random.shuffle(balanced_indices)
+    X_balanced = X_all[balanced_indices]
+    y_balanced = y_all[balanced_indices]
+    print(f"After balancing: {len(X_balanced)} samples (UP={int(y_balanced.sum())} DOWN={int(len(y_balanced)-y_balanced.sum())})")
+
+    # Fit scaler on balanced data
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_balanced)
+
+    # Fit KNN on balanced data
     print(f"\nTraining KNN with K={args.k}...")
     knn = KNeighborsClassifier(n_neighbors=args.k, weights="distance")
-    knn.fit(X_scaled, y_all)
+    knn.fit(X_scaled, y_balanced)
 
-    # Quick self-check (not out-of-sample — just verifying the model works)
+    # Quick self-check
     probs = knn.predict_proba(X_scaled)
     high_conf = (probs[:, 1] >= 0.60) | (probs[:, 1] <= 0.40)
     if high_conf.sum() > 0:
         hc_preds = np.where(probs[high_conf, 1] > 0.5, 1, 0)
-        hc_wr = (hc_preds == y_all[high_conf]).mean() * 100
+        hc_wr = (hc_preds == y_balanced[high_conf]).mean() * 100
         print(f"Self-check (in-sample, >=60% conf): {hc_wr:.1f}% WR ({high_conf.sum()} bets)")
+
+    # Check bias at mean features
+    mean_prob = knn.predict_proba(np.zeros((1, X_scaled.shape[1])))[0][1]
+    print(f"Bias check at mean: {mean_prob:.3f} (should be ~0.50)")
+
+    # Check NO predictions are possible
+    # Simulate bearish conditions
+    test_bearish = scaler.mean_.copy()
+    test_bearish[0] = 25   # low RSI
+    test_bearish[1] = 5    # low stochrsi
+    test_bearish[8] = -1   # negative roc
+    test_bearish_scaled = scaler.transform(test_bearish.reshape(1, -1))
+    bearish_prob = knn.predict_proba(test_bearish_scaled)[0][1]
+    print(f"Bearish test: {bearish_prob:.3f} ({'YES' if bearish_prob >= 0.55 else 'NO' if bearish_prob <= 0.45 else 'SKIP'})")
 
     # Save model + scaler
     output_path = Path(args.output)
