@@ -369,8 +369,8 @@ class KalshiDaemon:
                 if not series:
                     continue
 
-                # Live: check if resting order filled
-                if not self.dry_run and bet.get("needs_fill_check") and bet.get("order_id"):
+                # Live/demo: check if resting order filled before settlement
+                if not (self.dry_run and not self.demo) and bet.get("needs_fill_check") and bet.get("order_id"):
                     try:
                         order_info = self.kalshi_client.get_order_status(bet["order_id"])
                         filled = float(order_info.get("fill_count_fp", 0))
@@ -378,13 +378,21 @@ class KalshiDaemon:
                             bet["count"] = int(filled)
                             bet["needs_fill_check"] = False
                         else:
+                            # Never filled — remove without counting as W/L
+                            print(colored(
+                                f"  [EXPIRED] {asset} {bet.get('direction', '?')} "
+                                f"@ {bet.get('contract_price', 0)}c — never filled, removing",
+                                "dark_grey"))
                             settled.append(bet)
                             continue
                     except Exception:
                         pass
 
-                # Skip if live order never filled
-                if not self.dry_run and bet.get("count", 0) == 0:
+                # Skip unfilled live/demo orders — no W/L for unfilled bets
+                if not (self.dry_run and not self.demo) and bet.get("count", 0) == 0:
+                    print(colored(
+                        f"  [EXPIRED] {asset} {bet.get('direction', '?')} — unfilled, removing",
+                        "dark_grey"))
                     settled.append(bet)
                     continue
 
@@ -973,11 +981,6 @@ class KalshiDaemon:
                         elif state == "CONFIRMED":
                             reason_suffix = f" -> BETTING (LR+TEK)"
                         elif state == "MONITORING":
-                            if all_pass:
-                                print(colored(
-                                    f"  [MONITOR] {asset} {signal.recommended_side} "
-                                    f"LR={dir_c}% TEK={tbl_display}% — would bet (window closed)",
-                                    "dark_grey"))
                             reason_suffix = " (monitoring)"
                         else:
                             reason_suffix = " (waiting)"
@@ -1596,7 +1599,30 @@ class KalshiDaemon:
                         print(colored(f"  [CANCEL ERR] {asset}: {e}", "red"))
                     continue  # don't add back
 
-                # Still resting, keep tracking
+                # Still resting — show current ask price so we can see the gap
+                current_ask = "?"
+                try:
+                    side = order.get("side", "yes")
+                    symbol = order.get("symbol", "")
+                    series = self.KALSHI_PAIRS.get(symbol, "")
+                    if series:
+                        mkts = self.kalshi_client.get_markets(series_ticker=series, status="open")
+                        if mkts:
+                            mkts.sort(key=lambda x: x.get("close_time", "9999"))
+                            m = mkts[0]
+                            if side == "yes":
+                                raw = m.get("yes_ask_dollars") or m.get("yes_ask")
+                            else:
+                                raw = m.get("no_ask_dollars") or m.get("no_ask")
+                            if raw:
+                                current_ask = f"{int(float(raw) * 100)}c"
+                except Exception:
+                    pass
+
+                print(colored(
+                    f"  [RESTING] {asset} {order['side'].upper()} "
+                    f"@ {order['fill_price']}c — still waiting (ask={current_ask}, min {minute_in_window})",
+                    "dark_grey"))
                 still_resting.append(order)
 
             except Exception:

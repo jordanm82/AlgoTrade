@@ -114,7 +114,7 @@ class RichDashboard:
             pass
 
     def _refresh_positions(self):
-        """Refresh live positions from Kalshi API (source of truth)."""
+        """Refresh positions — from Kalshi API (live/demo) or pending bets (dry-run)."""
         now = time.time()
         if now - self._last_position_refresh < POSITION_REFRESH_INTERVAL:
             return
@@ -231,6 +231,30 @@ class RichDashboard:
 
         except Exception:
             pass
+
+        # In dry-run (non-demo): show pending bets as simulated positions
+        if self.daemon.dry_run and not self.demo:
+            for bet in getattr(self.daemon, '_pending_bets', []):
+                if bet.get("result"):  # already settled
+                    continue
+                count = bet.get("count", 0)
+                if count <= 0:
+                    continue
+                asset = bet.get("asset", "?")
+                side = bet.get("side", "yes").upper()
+                entry = bet.get("contract_price", bet.get("fill_price", 0))
+                positions.append({
+                    "asset": asset,
+                    "side": side,
+                    "entry": entry,
+                    "count": count,
+                    "status": "PENDING",
+                    "strike": bet.get("strike", 0),
+                    "ticker": "",
+                    "current_yes": 0,
+                    "current_no": 0,
+                    "winning": None,
+                })
 
         self._live_positions = positions
 
@@ -486,68 +510,70 @@ class RichDashboard:
         return Panel(table, title=f"[bold]ORDERS[/] ({active_count} active)", border_style="green")
 
     def _build_positions_panel(self) -> Panel:
-        """Show live position status with current YES/NO prices, updated every 5s."""
+        """Show position status: RESTING → FILLED → SETTLED. Updated every 15s."""
         table = Table(show_header=True, header_style="bold", expand=True,
                       show_lines=False, pad_edge=False)
         table.add_column("ASSET", style="bold", width=5)
-        table.add_column("OUR SIDE", width=8)
+        table.add_column("SIDE", width=4)
         table.add_column("ENTRY", justify="right", width=6)
         table.add_column("QTY", justify="right", width=4)
-        table.add_column("Y BID", justify="right", width=6)
-        table.add_column("N BID", justify="right", width=6)
+        table.add_column("STATUS", width=10)
         table.add_column("WINNING", width=8)
         table.add_column("UNREALIZED", justify="right", width=10)
 
         if self._live_positions:
             for pos in self._live_positions:
-                if pos.get("count", 0) == 0 and pos.get("status") != "RESTING":
-                    continue
-
                 asset = pos["asset"]
                 side = pos["side"]
                 entry = pos.get("entry", 0)
                 count = pos.get("count", 0)
+                status = pos.get("status", "OPEN")
                 yes_bid = pos.get("current_yes", 0)
                 no_bid = pos.get("current_no", 0)
                 winning = pos.get("winning")
 
-                # Compute unrealized P&L
-                if count > 0 and entry > 0:
-                    if side == "YES":
-                        current_val = yes_bid
-                    else:
-                        current_val = no_bid
+                # Status styling
+                status_styles = {
+                    "RESTING": "yellow",
+                    "PARTIAL": "yellow bold",
+                    "FILLED": "green",
+                    "OPEN": "green",
+                    "PENDING": "cyan",
+                }
+                status_text = Text(status, style=status_styles.get(status, "dim"))
+
+                # Unrealized P&L (only for filled positions with bid data)
+                if count > 0 and entry > 0 and (yes_bid or no_bid):
+                    current_val = yes_bid if side == "YES" else no_bid
                     unrealized_cents = count * (current_val - entry)
                     unrealized = unrealized_cents / 100
                     unreal_style = "green" if unrealized >= 0 else "red"
+                    unreal_text = Text(f"${unrealized:+.2f}", style=unreal_style)
                 else:
-                    unrealized = 0
-                    unreal_style = "dim"
+                    unreal_text = Text("--", style="dim")
 
                 # Winning indicator
                 if winning:
-                    if winning == side:
-                        win_text = Text(f"  {winning}", style="green bold")
-                    else:
-                        win_text = Text(f"  {winning}", style="red bold")
+                    win_text = Text(f"  {winning}", style="green bold" if winning == side else "red bold")
                 else:
                     win_text = Text("  --", style="dim")
 
                 side_style = "green" if side == "YES" else "red"
+                qty_str = str(count) if count > 0 else "—"
 
                 table.add_row(
                     asset,
                     Text(side, style=side_style),
                     f"{entry}c" if entry else "?",
-                    str(count) if count > 0 else "?",
-                    f"{yes_bid}c" if yes_bid else "--",
-                    f"{no_bid}c" if no_bid else "--",
+                    qty_str,
+                    status_text,
                     win_text,
-                    Text(f"${unrealized:+.2f}", style=unreal_style) if count > 0 else Text("--", style="dim"),
+                    unreal_text,
                 )
         else:
-            table.add_row("--", Text("--", style="dim"), "--", "--", "--", "--",
-                          Text("--", style="dim"), Text("NO POSITIONS", style="dim"))
+            table.add_row("--", Text("--", style="dim"), "--", "--",
+                          Text("--", style="dim"), Text("--", style="dim"),
+                          Text("NO POSITIONS", style="dim"))
 
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         return Panel(table, title="[bold]LIVE POSITIONS[/]",
