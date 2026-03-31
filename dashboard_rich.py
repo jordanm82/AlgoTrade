@@ -29,7 +29,8 @@ POSITION_REFRESH_INTERVAL = 15  # seconds — matches resting order monitoring
 
 
 class RichDashboard:
-    def __init__(self, dry_run: bool = True, arb_mode: bool = False, max_cycles: int = 96, demo: bool = False):
+    def __init__(self, dry_run: bool = True, arb_mode: bool = False, max_cycles: int = 96,
+                 demo: bool = False, max_bets: int = 0, max_size_pct: float = 0):
         self.arb_mode = arb_mode
         self.dry_run = dry_run
         self.demo = demo
@@ -39,7 +40,10 @@ class RichDashboard:
             from cli.kalshi_arb import KalshiArbDaemon
             self.daemon = KalshiArbDaemon(dry_run=dry_run)
         else:
-            self.daemon = KalshiDaemon(dry_run=dry_run or demo, predictor_version="v3", demo=demo)
+            self.daemon = KalshiDaemon(
+                dry_run=dry_run or demo, predictor_version="v3", demo=demo,
+                max_bets=max_bets, max_size_pct=max_size_pct,
+            )
         self.daemon.kalshi_only = True
 
         self._start_time = datetime.now(timezone.utc)
@@ -797,10 +801,17 @@ def main():
                         help="Use Kalshi demo exchange (real orders, play money)")
     parser.add_argument("--arb", action="store_true")
     parser.add_argument("--cycles", type=int, default=96)
+    parser.add_argument("--maxbets", type=int, default=0,
+                        help="Max concurrent bets (0 = default). Highest confidence wins.")
+    parser.add_argument("--maxsize", type=float, default=0,
+                        help="Position size as %% of balance (0 = default 5%%). E.g. --maxsize=2.5")
     args = parser.parse_args()
 
     dry_run = not args.live and not args.demo
-    RichDashboard(dry_run=dry_run, arb_mode=args.arb, max_cycles=args.cycles, demo=args.demo).run()
+    RichDashboard(
+        dry_run=dry_run, arb_mode=args.arb, max_cycles=args.cycles,
+        demo=args.demo, max_bets=args.maxbets, max_size_pct=args.maxsize,
+    ).run()
 
 
 if __name__ == "__main__":

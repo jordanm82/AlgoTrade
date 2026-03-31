@@ -65,10 +65,14 @@ class KalshiDaemon:
         "XRP/USDT": "XRP-USD",
     }
 
-    def __init__(self, dry_run: bool = True, predictor_version: str = "v3", demo: bool = False):
+    def __init__(self, dry_run: bool = True, predictor_version: str = "v3", demo: bool = False,
+                 max_bets: int = 0, max_size_pct: float = 0):
         self.dry_run = dry_run
         self.demo = demo  # use Kalshi demo exchange (real orders, play money)
         self.kalshi_predictor_version = predictor_version
+        # CLI overrides — 0 means use defaults
+        self._cli_max_bets = max_bets      # max concurrent bets (0 = use default)
+        self._cli_max_size_pct = max_size_pct / 100 if max_size_pct > 0 else 0  # e.g. 2.5 → 0.025
         self.fetcher = DataFetcher()
         self._running = False
 
@@ -1090,7 +1094,10 @@ class KalshiDaemon:
         # Count only ACTUAL fills toward max_bets, not price-blocked attempts
         actual_fills_this_eval = 0
         for vs in actionable_signals:
-            max_bets = 4 if self.dry_run else MAX_CONCURRENT_KALSHI_BETS
+            if self._cli_max_bets > 0:
+                max_bets = self._cli_max_bets
+            else:
+                max_bets = 4 if self.dry_run else MAX_CONCURRENT_KALSHI_BETS
             if len(self._active_kalshi_bets) + actual_fills_this_eval >= max_bets:
                 break
             result = self._kalshi_execute_bet(
@@ -1213,8 +1220,9 @@ class KalshiDaemon:
                     self._kalshi_pending_signals[asset]["watch_side"] = direction_label
                     self._kalshi_pending_signals[asset]["watch_series"] = self.KALSHI_PAIRS.get(symbol, "")
 
-            # Flat 5% position sizing — uses simulated compounding balance
-            risk_budget = int(self._dry_balance_cents * 0.05)
+            # Position sizing — CLI override or default 5%
+            size_pct = self._cli_max_size_pct if self._cli_max_size_pct > 0 else 0.05
+            risk_budget = int(self._dry_balance_cents * size_pct)
             count = max(1, risk_budget // contract_price) if contract_price > 0 else 1
             cost = count * contract_price
             potential_profit = count * (100 - contract_price)
@@ -1316,8 +1324,9 @@ class KalshiDaemon:
                     f"  [KALSHI REST] {asset} {side.upper()} ask too high — limit order @ {MAX_ENTRY_CENTS}c",
                     "yellow"))
 
-            # Flat 5% position sizing — consistent every bet, no Kelly
-            risk_budget_cents = int(balance_cents * 0.05)
+            # Position sizing — CLI override or default 5%
+            size_pct = self._cli_max_size_pct if self._cli_max_size_pct > 0 else 0.05
+            risk_budget_cents = int(balance_cents * size_pct)
             count = max(1, risk_budget_cents // fill_price) if fill_price > 0 else 1
             potential_profit = count * (100 - fill_price)
             potential_loss = count * fill_price
@@ -1493,7 +1502,10 @@ class KalshiDaemon:
 
                 if ask <= MAX_BET_PRICE:
                     # Check max positions before entering
-                    max_bets = 4 if self.dry_run else MAX_CONCURRENT_KALSHI_BETS
+                    if self._cli_max_bets > 0:
+                        max_bets = self._cli_max_bets
+                    else:
+                        max_bets = 4 if self.dry_run else MAX_CONCURRENT_KALSHI_BETS
                     active_count = sum(1 for p in self._kalshi_pending_signals.values()
                                        if p.get("bet_placed") and not p.get("result"))
                     if active_count >= max_bets:
@@ -1722,6 +1734,12 @@ class KalshiDaemon:
         print(colored(f"  Predictor: {label}", "cyan"))
         print(colored(f"  Pairs: {', '.join(self.KALSHI_PAIRS.keys())}", "cyan"))
         print(colored(f"  Thresholds: {self.KALSHI_THRESHOLDS}", "cyan"))
+        if self._cli_max_bets > 0:
+            print(colored(f"  Max concurrent bets: {self._cli_max_bets} (CLI override)", "yellow"))
+        if self._cli_max_size_pct > 0:
+            print(colored(f"  Position size: {self._cli_max_size_pct*100:.1f}% (CLI override)", "yellow"))
+        else:
+            print(colored(f"  Position size: 5.0% (default)", "cyan"))
         print(colored(f"{'='*70}", "cyan"))
 
         # Check model freshness before anything else
@@ -1885,13 +1903,22 @@ def main():
         "--demo", action="store_true",
         help="Use Kalshi demo exchange (real orders, play money). Requires KalshiDemoKeys.txt",
     )
+    parser.add_argument(
+        "--maxbets", type=int, default=0,
+        help="Max concurrent bets (0 = default). Highest confidence wins when limited.",
+    )
+    parser.add_argument(
+        "--maxsize", type=float, default=0,
+        help="Position size as %% of balance (0 = default 5%%). E.g. --maxsize=2.5",
+    )
     args = parser.parse_args()
 
-    # Demo mode implies dry_run=True (for dashboard tagging) but places real orders on demo exchange
     daemon = KalshiDaemon(
         dry_run=args.dry_run or args.demo,
         predictor_version=args.predictor,
         demo=args.demo,
+        max_bets=args.maxbets,
+        max_size_pct=args.maxsize,
     )
     daemon.run(max_cycles=args.cycles)
 
