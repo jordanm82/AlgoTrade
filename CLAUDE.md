@@ -121,14 +121,15 @@ Three predictor versions available via `--predictor v1|v2|v3`:
 
 Two-factor prediction: **LR (LogReg)** for direction + **TEK (probability table)** for confirmation.
 
-**Dual-Signal Model — Trend (direction) + Conviction (confidence):**
-- Two LogReg models that must agree before betting
-- **Trend model** (9 features, NO RSI): MACD, norm_return, ema_slope, roc_5, macd_1h, price_vs_ema, hourly_return, trend_direction, vol_ratio — picks YES/NO from momentum
-- **Conviction model** (8 features, RSI-based): rsi_15m, stochrsi_15m, bb_position, adx, rsi_1h, rsi_4h, norm_return, vol_ratio — confirms confidence
-- Both must agree on direction (>= 53% each) before signal fires
-- Walk-forward validated: **77.8% WR with TEK>=30** on 4,950 out-of-sample bets
-- Balanced YES:NO ratio of 0.7:1 — predicts BOTH sides in any market regime
-- Retrained via `scripts/retrain_dual_signal.py` (walk-forward: train on older data only)
+**Strike-Relative Model — predicts the actual Kalshi question:**
+- Single LogReg model answering: "Will price close above strike?"
+- **Key feature**: `distance_from_strike` (price at minute 5 vs strike, in ATR units) — coefficient +1.41
+- This is a CONTINUATION predictor: price above strike → stays above, below → stays below
+- NOT mean-reversion — doesn't rely on RSI for direction
+- 13 features: MACD, norm_return, ema_slope, roc_5, macd_1h, price_vs_ema, hourly_return, trend_direction, vol_ratio, adx, rsi_1h, rsi_4h, distance_from_strike
+- Walk-forward validated: **74.8% WR** on 30-day out-of-sample, **0 losing days**
+- Balanced YES:NO ratio of 0.9:1 — predicts BOTH sides in any market
+- Retrained via `scripts/retrain_strike_relative.py`
 
 **TEK — Probability Table Confluence (filter):**
 - Pre-computed 2D probability table (distance_ATR × time_remaining)
@@ -147,15 +148,7 @@ Two-factor prediction: **LR (LogReg)** for direction + **TEK (probability table)
 - Max contract price: 85c hard cap
 - Price source: Coinbase (closest to CF Benchmarks BRTI settlement)
 
-**Position sizing (tiered by confidence):**
-
-| Confidence | Max Risk (% of balance) |
-|-----------|------------------------|
-| 70%+ | 10% |
-| 65-69% | 7.5% |
-| 60-64% | 5% |
-| 55-59% | 2.5% |
-| Below 55% | No bet |
+**Position sizing:** Flat 5% of Kalshi balance per bet, every bet. No Kelly, no tiered sizing. Consistent risk regardless of confidence level.
 
 **Evaluation lifecycle (wall-clock aligned at :01, :06, :11, :12):**
 - **SETUP (min 0-4):** Score direction. No betting.
@@ -167,10 +160,9 @@ Two-factor prediction: **LR (LogReg)** for direction + **TEK (probability table)
 **Settlement tracking:** Queries Kalshi API for authoritative settlement results (not approximated from price data). Tracks W/L/WR and P&L for both dry-run and live modes.
 
 **Model refresh:**
-- Dual-signal model: `./venv/bin/python scripts/retrain_dual_signal.py --days 179`
-  - Trains trend + conviction models on 120 days oldest data
-  - Validates on 59 days most recent (out-of-sample)
-  - Shows Trend × Conviction × TEK threshold grid
+- Strike-relative model: `./venv/bin/python scripts/retrain_strike_relative.py --days 179`
+  - Trains on 120 days oldest data, validates on 59 days newest
+  - Key feature: distance_from_strike (continuation predictor)
   - Auto-triggered on daemon startup when model > 7 days old
 - Probability table: `./venv/bin/python scripts/build_prob_table.py --days 90`
 - Refresh weekly/monthly to stay current with market regime

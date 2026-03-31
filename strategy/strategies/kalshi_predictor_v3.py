@@ -112,9 +112,8 @@ class KalshiPredictorV3:
                    and self._knn is not None)
 
         if use_knn:
-            # KNN predicts probability of next candle going UP
-            # KNN already captures multi-timeframe context — skip hand-tuned adjustments
-            knn_prob = self.predict_knn(df, df_1h, df_4h)
+            # Model predicts probability — strike-relative model needs distance_atr
+            knn_prob = self.predict_knn(df, df_1h, df_4h, distance_from_strike=distance_atr)
             if knn_prob is not None:
                 # Use raw KNN probability directly — no adjustments, no gates
                 recommended_side, max_price = self._decide_bet(knn_prob)
@@ -188,17 +187,15 @@ class KalshiPredictorV3:
         )
 
     def predict_knn(self, df: pd.DataFrame, df_1h: pd.DataFrame | None = None,
-                    df_4h: pd.DataFrame | None = None) -> float | None:
-        """Predict probability of next candle going UP.
+                    df_4h: pd.DataFrame | None = None,
+                    distance_from_strike: float | None = None) -> float | None:
+        """Predict probability that price closes above strike.
 
-        Dual-signal mode (trend + conviction):
-          - Trend model (no RSI) picks direction from momentum/flow
-          - Conviction model (RSI-based) must agree on direction
-          - Returns trend probability when both agree, None otherwise
-
+        Strike-relative mode: uses distance_from_strike as primary feature.
+        Dual-signal mode: trend + conviction must agree.
         Single-model mode (legacy): returns single model probability.
 
-        Returns probability (0.0-1.0) or None if models unavailable or disagree.
+        Returns probability (0.0-1.0) or None if models unavailable.
         """
         if self._knn is None or self._knn_scaler is None:
             return None
@@ -256,36 +253,54 @@ class KalshiPredictorV3:
             if any(pd.isna(v) or np.isinf(v) for v in all_features.values()):
                 return None
 
+            # === Strike-relative mode ===
+            if self._model_type == "strike_relative":
+                if distance_from_strike is None:
+                    return None  # need distance — called without strike context
+
+                all_features["distance_from_strike"] = distance_from_strike
+
+                # Get features in model's expected order
+                model_features = self._knn_scaler.feature_names_in_ if hasattr(self._knn_scaler, 'feature_names_in_') else None
+                feature_names = model_features if model_features is not None else [
+                    "macd_15m", "norm_return", "ema_slope", "roc_5",
+                    "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
+                    "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
+                ]
+                vals = [all_features[f] for f in feature_names]
+                X = np.array(vals).reshape(1, -1)
+                prob_up = float(self._knn.predict_proba(
+                    self._knn_scaler.transform(X))[0][1])
+
+                self._log_prediction(prev_close, sma_val, prob_up, all_features)
+                return prob_up
+
             # === Dual-signal mode ===
             if self._model_type == "dual_trend_conviction" and self._conv_model is not None:
-                CONV_THRESHOLD = 0.53  # conviction must agree at 53%+
+                CONV_THRESHOLD = 0.53
 
-                # Trend model — picks direction
                 trend_vals = [all_features[f] for f in self._trend_features]
                 X_trend = np.array(trend_vals).reshape(1, -1)
                 trend_prob = float(self._knn.predict_proba(
                     self._knn_scaler.transform(X_trend))[0][1])
 
-                # Conviction model — must agree on direction
                 conv_vals = [all_features[f] for f in self._conv_features]
                 X_conv = np.array(conv_vals).reshape(1, -1)
                 conv_prob = float(self._conv_model.predict_proba(
                     self._conv_scaler.transform(X_conv))[0][1])
 
-                # Both must agree on direction
                 trend_yes = trend_prob >= CONV_THRESHOLD
                 trend_no = trend_prob <= (1 - CONV_THRESHOLD)
                 conv_yes = conv_prob >= CONV_THRESHOLD
                 conv_no = conv_prob <= (1 - CONV_THRESHOLD)
 
                 if trend_yes and conv_yes:
-                    prob_up = trend_prob  # direction from trend, confirmed by conviction
+                    prob_up = trend_prob
                 elif trend_no and conv_no:
-                    prob_up = trend_prob  # both say NO
+                    prob_up = trend_prob
                 else:
-                    prob_up = 0.50  # disagreement → neutral → SKIP
+                    prob_up = 0.50
 
-                # Log
                 self._log_prediction(prev_close, sma_val, prob_up, all_features,
                                      trend_prob=trend_prob, conv_prob=conv_prob)
                 return prob_up

@@ -1144,7 +1144,7 @@ class KalshiDaemon:
                     self._kalshi_pending_signals[asset]["watch_side"] = direction_label
                     self._kalshi_pending_signals[asset]["watch_series"] = self.KALSHI_PAIRS.get(symbol, "")
 
-            # Calculate position size using Kelly criterion
+            # Flat 5% position sizing — consistent every bet, no Kelly
             dry_balance_cents = 10000  # default $100 simulated balance
             try:
                 if self.kalshi_client:
@@ -1153,17 +1153,8 @@ class KalshiDaemon:
             except Exception:
                 pass
 
-            if isinstance(signal, KalshiV3Signal) and contract_price > 0:
-                count = KalshiPredictorV3.kelly_size(
-                    probability=signal.probability,
-                    contract_price_cents=contract_price,
-                    balance_cents=dry_balance_cents,
-                    fraction=0.5,  # half-Kelly for safety
-                )
-                count = max(1, count)  # minimum 1 contract
-            else:
-                risk_budget = int(dry_balance_cents * 0.05)
-                count = max(1, risk_budget // contract_price) if contract_price > 0 else 1
+            risk_budget = int(dry_balance_cents * 0.05)
+            count = max(1, risk_budget // contract_price) if contract_price > 0 else 1
             cost = count * contract_price
             potential_profit = count * (100 - contract_price)
 
@@ -1246,17 +1237,9 @@ class KalshiDaemon:
                     f"  [KALSHI REST] {asset} {side.upper()} ask too high — limit order @ {MAX_ENTRY_CENTS}c",
                     "yellow"))
 
-            # Position size: Kelly criterion for V3, flat % for V1/V2
-            if isinstance(signal, KalshiV3Signal) and fill_price > 0:
-                count = KalshiPredictorV3.kelly_size(
-                    probability=signal.probability,
-                    contract_price_cents=fill_price,
-                    balance_cents=balance_cents,
-                    fraction=0.5,  # half-Kelly
-                )
-                count = max(1, count)
-            else:
-                count = max(1, risk_budget_cents // fill_price)
+            # Flat 5% position sizing — consistent every bet, no Kelly
+            risk_budget_cents = int(balance_cents * 0.05)
+            count = max(1, risk_budget_cents // fill_price) if fill_price > 0 else 1
             potential_profit = count * (100 - fill_price)
             potential_loss = count * fill_price
             rr_ratio = potential_profit / potential_loss if potential_loss > 0 else 0
@@ -1553,23 +1536,22 @@ class KalshiDaemon:
             ))
 
     def _retrain_model(self):
-        """Retrain dual-signal model (trend + conviction) with walk-forward validation.
+        """Retrain strike-relative model with walk-forward validation.
 
-        Uses scripts/retrain_dual_signal.py which:
-        - Trend model: momentum/flow features, NO RSI (picks direction)
-        - Conviction model: RSI/BB features (confirms confidence)
+        Uses scripts/retrain_strike_relative.py which:
+        - Predicts the actual Kalshi question: 'will price close above strike?'
+        - Key feature: distance_from_strike (price at min5 vs strike, in ATR)
         - Walk-forward: train on 120 days oldest, test on 59 days newest
         - Fetches from Coinbase (matches BRTI settlement source)
-        - Tests with TEK confluence at various thresholds
         """
         import subprocess
 
-        print(colored("  [MODEL] Starting dual-signal retrain (~10 min)...", "yellow"))
-        print(colored("  [MODEL] Trend (direction) + Conviction (confidence)", "yellow"))
+        print(colored("  [MODEL] Starting strike-relative retrain (~10 min)...", "yellow"))
+        print(colored("  [MODEL] Predicts: 'Will price close above strike?'", "yellow"))
 
         try:
             result = subprocess.run(
-                ["./venv/bin/python", "scripts/retrain_dual_signal.py",
+                ["./venv/bin/python", "scripts/retrain_strike_relative.py",
                  "--days", "179", "--output", "models/knn_kalshi.pkl"],
                 capture_output=True, text=True, timeout=900,
             )
@@ -1578,13 +1560,13 @@ class KalshiDaemon:
             for line in result.stdout.strip().split("\n"):
                 line = line.strip()
                 if line and any(k in line for k in [
-                    "TREND model", "CONVICTION model", "SINGLE model",
-                    "Best config", "Saved", "samples", "Train:", "Test:",
+                    "Train WR", "Feature", "distance_from_strike",
+                    "Best config", "Saved", "samples", "Total:",
                 ]):
                     print(f"  [MODEL] {line}")
 
             if result.returncode == 0:
-                print(colored("  [MODEL] Dual-signal retrain complete!", "green"))
+                print(colored("  [MODEL] Strike-relative retrain complete!", "green"))
                 # Reload — re-init predictor to pick up new model format
                 from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3
                 self.kalshi_predictor = KalshiPredictorV3()
