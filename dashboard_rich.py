@@ -200,7 +200,7 @@ class RichDashboard:
                     "winning": winning,
                 })
 
-            # Also check resting orders
+            # Also check resting orders from exchange
             resting = self.daemon.kalshi_client.get_orders(status="resting")
             for o in resting:
                 ticker = o.get("ticker", "")
@@ -213,15 +213,25 @@ class RichDashboard:
                     continue
 
                 side = o.get("side", "yes").upper()
-                price = float(o.get("yes_price_dollars", 0)) * 100 if side == "YES" else float(o.get("no_price_dollars", 0)) * 100
-                count = int(float(o.get("remaining_count_fp", 0)))
+                # Try multiple field names for price and count
+                if side == "YES":
+                    price_raw = o.get("yes_price") or o.get("yes_price_dollars") or 0
+                else:
+                    price_raw = o.get("no_price") or o.get("no_price_dollars") or 0
+                price = float(price_raw) * 100 if float(price_raw) < 1.5 else float(price_raw)
+                count_raw = o.get("remaining_count_fp") or o.get("remaining_count") or o.get("count") or 0
+                count = int(float(count_raw))
+                filled_raw = o.get("fill_count_fp") or o.get("fill_count") or 0
+                filled = int(float(filled_raw))
+
+                status = "PARTIAL" if filled > 0 and count > 0 else "RESTING"
 
                 positions.append({
                     "asset": asset,
                     "side": side,
                     "entry": int(price),
-                    "count": count,
-                    "status": "RESTING",
+                    "count": count + filled,  # total order size
+                    "status": status,
                     "strike": 0,
                     "ticker": ticker,
                     "current_yes": 0,
@@ -229,8 +239,9 @@ class RichDashboard:
                     "winning": None,
                 })
 
-        except Exception:
-            pass
+        except Exception as e:
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            self._log_lines.append(Text(f"{ts} [POS ERR] {e}", style="red"))
 
         # In dry-run (non-demo): show pending bets as simulated positions
         if self.daemon.dry_run and not self.demo:
