@@ -603,11 +603,11 @@ class KalshiDaemon:
                 continue
 
             # Lifecycle:
-            # Min 0-2: SETUP — cache 15m/1h, preview scores
-            # Min 3-8: CONFIRMED — use 1m candles for price, decide + execute
-            #          (earlier entry = cheaper contracts, model needs only ±0.06 ATR)
-            # Min 9+:  MONITORING — dashboard display only, no new decisions
-            if minute_in_window <= 2:
+            # Min 0:   SETUP — cache 15m/1h, query strike from Kalshi
+            # Min 1-8: CONFIRMED — 1m candle closed, compute distance, bet immediately
+            #          (83% WR at min 1 with contracts still ~50c)
+            # Min 9+:  MONITORING — no new bets, cancel resting at min 10
+            if minute_in_window < 1:
                 state = "SETUP"
             elif minute_in_window <= 8 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
