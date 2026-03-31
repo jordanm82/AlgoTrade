@@ -957,7 +957,8 @@ class KalshiDaemon:
 
                     if strike and close_time_dt:
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
-                        cb_price = self._get_coinbase_price(symbol)
+                        # Use BRTI price (already prefetched) — NOT Coinbase
+                        # cb_price flows to predict() → distance_from_strike calculation
                         signal = self.kalshi_predictor.predict(
                             df_15m, strike_price=float(strike),
                             minutes_remaining=mins_left,
