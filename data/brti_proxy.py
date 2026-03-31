@@ -1,125 +1,145 @@
 # data/brti_proxy.py
-"""CF BRTI price feed — the ACTUAL settlement source for Kalshi K15 markets.
+"""BRTI proxy — real-time multi-exchange price averaging.
 
-Fetches real-time index values from CF Benchmarks website SSR data.
-These are the exact same values Kalshi uses for settlement.
+BRTI settles on a VWAP of Coinbase, Kraken, Bitstamp, Gemini, and others.
+We average the top 3 constituent exchanges for a ~$5 approximation.
 
-Indices:
-  BTC → BRTI (Bitcoin Real Time Index)
-  ETH → ETHUSD_RTI (Ether Real Time Index)
-  SOL → SOLUSD_RTI (Solana Real Time Index)
-  XRP → XRPUSD_RTI (XRP Real Time Index)
-
-Falls back to multi-exchange average (Coinbase+Kraken+Bitstamp) if
-CF Benchmarks is unreachable.
+Each call is a LIVE API fetch — no stale SSR scraping.
+Parallel fetch, 10-second cache to avoid rate limits.
 """
-import json
-import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import requests
+import ccxt
 
 
 class BRTIProxy:
-    """CF Benchmarks Real Time Index price feed."""
-
-    # CF Benchmarks index IDs for each asset
-    CF_INDICES = {
-        "BTC/USD": "BRTI",
-        "ETH/USD": "ETHUSD_RTI",
-        "SOL/USD": "SOLUSD_RTI",
-        "XRP/USD": "XRPUSD_RTI",
-    }
-
-    # Also map USDT symbols
-    CF_INDICES_USDT = {
-        "BTC/USDT": "BRTI",
-        "ETH/USDT": "ETHUSD_RTI",
-        "SOL/USDT": "SOLUSD_RTI",
-        "XRP/USDT": "XRPUSD_RTI",
-    }
+    """Multi-exchange real-time price averaging (BRTI constituent exchanges)."""
 
     CACHE_TTL = 10  # seconds
 
     def __init__(self):
+        self._exchanges = {}
         self._cache = {}  # {symbol: (price, timestamp)}
         self._lock = threading.Lock()
 
-    def _fetch_cf_price(self, index_id: str) -> float | None:
-        """Fetch current value from CF Benchmarks SSR data."""
-        try:
-            url = f"https://www.cfbenchmarks.com/data/indices/{index_id}"
-            resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-            match = re.search(
-                r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                resp.text, re.DOTALL,
-            )
-            if match:
-                data = json.loads(match.group(1))
-                summary = data["props"]["pageProps"].get("indexSummary", {})
-                value = summary.get("value")
-                if value is not None:
-                    return float(value)
-        except Exception:
-            pass
-        return None
+    def _get_exchange(self, name: str):
+        if name not in self._exchanges:
+            constructors = {
+                "coinbase": lambda: ccxt.coinbase({"enableRateLimit": True}),
+                "kraken": lambda: ccxt.kraken({"enableRateLimit": True}),
+                "bitstamp": lambda: ccxt.bitstamp({"enableRateLimit": True}),
+            }
+            if name in constructors:
+                self._exchanges[name] = constructors[name]()
+        return self._exchanges.get(name)
 
     def get_price(self, symbol: str) -> float | None:
-        """Get BRTI price for a symbol (e.g., 'BTC/USD' or 'BTC/USDT').
+        """Get real-time averaged price for a symbol (e.g., 'BTC/USD').
 
-        Returns the actual CF Benchmarks index value (Kalshi settlement source).
-        Cached for 10 seconds.
+        Averages Coinbase + Kraken + Bitstamp last trade prices.
+        Cached for 10 seconds. Each underlying call is a live API fetch.
         """
+        # Normalize symbol
+        sym = symbol.replace("/USDT", "/USD")
+
         with self._lock:
-            cached = self._cache.get(symbol)
+            cached = self._cache.get(sym)
             if cached and time.time() - cached[1] < self.CACHE_TTL:
                 return cached[0]
 
-        index_id = self.CF_INDICES.get(symbol) or self.CF_INDICES_USDT.get(symbol)
-        if not index_id:
+        def _fetch(name):
+            try:
+                ex = self._get_exchange(name)
+                if ex is None:
+                    return None
+                ticker = ex.fetch_ticker(sym)
+                return ticker.get("last")
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(_fetch, ["coinbase", "kraken", "bitstamp"]))
+
+        prices = [p for p in results if p is not None]
+        if not prices:
             return None
 
-        price = self._fetch_cf_price(index_id)
-        if price is not None:
-            with self._lock:
-                self._cache[symbol] = (price, time.time())
-
-        return price
-
-    def get_prices_batch(self, symbols: list[str]) -> dict[str, float]:
-        """Get BRTI prices for multiple symbols in parallel.
-
-        Returns {symbol: price} dict. ~1-2 seconds for all 4 assets.
-        """
-        results = {}
-        to_fetch = []
-        now = time.time()
+        avg = sum(prices) / len(prices)
 
         with self._lock:
-            for sym in symbols:
-                cached = self._cache.get(sym)
+            self._cache[sym] = (avg, time.time())
+            # Also cache the USDT variant
+            usdt_sym = sym.replace("/USD", "/USDT")
+            self._cache[usdt_sym] = (avg, time.time())
+
+        return avg
+
+    def get_prices_batch(self, symbols: list[str]) -> dict[str, float]:
+        """Get prices for multiple symbols in one parallel batch."""
+        # Deduplicate and normalize
+        unique = set()
+        sym_map = {}
+        for s in symbols:
+            normalized = s.replace("/USDT", "/USD")
+            unique.add(normalized)
+            sym_map[s] = normalized
+
+        # Check cache
+        results = {}
+        to_fetch = set()
+        now = time.time()
+        with self._lock:
+            for orig_sym in symbols:
+                norm = sym_map[orig_sym]
+                cached = self._cache.get(norm)
                 if cached and now - cached[1] < self.CACHE_TTL:
-                    results[sym] = cached[0]
+                    results[orig_sym] = cached[0]
                 else:
-                    to_fetch.append(sym)
+                    to_fetch.add(norm)
 
         if not to_fetch:
             return results
 
-        def _fetch(sym):
-            index_id = self.CF_INDICES.get(sym) or self.CF_INDICES_USDT.get(sym)
-            if not index_id:
+        # Fetch all symbols from all exchanges in parallel
+        def _fetch(args):
+            name, sym = args
+            try:
+                ex = self._get_exchange(name)
+                if ex is None:
+                    return (sym, None)
+                ticker = ex.fetch_ticker(sym)
+                return (sym, ticker.get("last"))
+            except Exception:
                 return (sym, None)
-            price = self._fetch_cf_price(index_id)
-            return (sym, price)
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            for sym, price in pool.map(_fetch, to_fetch):
-                if price is not None:
-                    results[sym] = price
-                    with self._lock:
-                        self._cache[sym] = (price, time.time())
+        tasks = [(n, s) for s in to_fetch for n in ["coinbase", "kraken", "bitstamp"]]
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            fetch_results = list(pool.map(_fetch, tasks))
+
+        # Average per symbol
+        from collections import defaultdict
+        by_sym = defaultdict(list)
+        for sym, price in fetch_results:
+            if price is not None:
+                by_sym[sym].append(price)
+
+        with self._lock:
+            for norm_sym, prices in by_sym.items():
+                if prices:
+                    avg = sum(prices) / len(prices)
+                    self._cache[norm_sym] = (avg, time.time())
+                    usdt = norm_sym.replace("/USD", "/USDT")
+                    self._cache[usdt] = (avg, time.time())
+
+        # Map back to original symbols
+        for orig_sym in symbols:
+            if orig_sym not in results:
+                norm = sym_map[orig_sym]
+                with self._lock:
+                    cached = self._cache.get(norm)
+                    if cached:
+                        results[orig_sym] = cached[0]
 
         return results
