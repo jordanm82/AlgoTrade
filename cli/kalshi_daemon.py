@@ -297,9 +297,11 @@ class KalshiDaemon:
 
             if self.demo:
                 from config.settings import KALSHI_DEMO_KEY_FILE
-                # Demo key file format: first line = API key ID, rest = PEM key
+                # Demo key file format: first line = "API: <key-id>" or just key-id
                 with open(KALSHI_DEMO_KEY_FILE) as f:
-                    demo_key_id = f.readline().strip()
+                    first_line = f.readline().strip()
+                # Strip "API: " or "API:" prefix if present
+                demo_key_id = first_line.split(":", 1)[-1].strip() if ":" in first_line else first_line
                 self.kalshi_client = KalshiClient(
                     api_key_id=demo_key_id,
                     private_key_path=str(KALSHI_DEMO_KEY_FILE),
@@ -1265,10 +1267,14 @@ class KalshiDaemon:
             # Verify against actual Kalshi balance (exchange is source of truth)
             cost_cents = count * fill_price
             if cost_cents > balance_cents:
-                count = max(1, balance_cents // fill_price)
+                count = balance_cents // fill_price
                 if count < 1:
-                    pred["reason"] = f"insufficient Kalshi balance (${balance_cents/100:.2f})"
-                    return pred
+                    # Can't afford even 1 contract — buy 1 anyway if balance > 0
+                    if balance_cents >= fill_price:
+                        count = 1
+                    else:
+                        pred["reason"] = f"insufficient Kalshi balance (${balance_cents/100:.2f})"
+                        return pred
                 cost_cents = count * fill_price
                 potential_profit = count * (100 - fill_price)
                 rr_ratio = potential_profit / cost_cents if cost_cents > 0 else 0
