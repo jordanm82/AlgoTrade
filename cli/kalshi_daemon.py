@@ -928,26 +928,9 @@ class KalshiDaemon:
                             tp = int(tbl_sig.probability * 100)
                             tbl_display = tp if signal.recommended_side == "YES" else (100 - tp)
 
-                        # 2-factor gate: LR + TEK
-                        # Plus trend kill: don't bet YES if price is below SMA and dropping
-                        trend_kill = False
-                        if signal.recommended_side == "YES" and df_15m is not None and len(df_15m) >= 5:
-                            last_row = df_15m.iloc[-1]
-                            close = float(last_row.get("close", 0))
-                            sma = float(last_row.get("sma_20", 0))
-                            prev_close = float(df_15m.iloc[-5]["close"]) if len(df_15m) >= 5 else close
-                            hourly_chg = (close - prev_close) / prev_close * 100 if prev_close > 0 else 0
-                            if close < sma and hourly_chg < -0.1:
-                                trend_kill = True
-                                if minute_in_window >= 2:
-                                    print(colored(
-                                        f"  [TREND KILL] {asset} YES blocked — below SMA ({close:.2f}<{sma:.2f}) "
-                                        f"and dropping ({hourly_chg:+.2f}%)",
-                                        "red"))
-
-                        # TEK gate bypassed — strike-relative model already has distance_from_strike
-                        # as its #1 feature, making TEK redundant (0 disagreements across all distances)
-                        all_pass = meets_knn and not trend_kill
+                        # Strike-relative model handles direction via distance_from_strike.
+                        # TEK and trend kill removed — both redundant with this model.
+                        all_pass = meets_knn
 
                         # Store TBL score for BET_PLACED display
                         if pending:
