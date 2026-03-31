@@ -676,19 +676,10 @@ class KalshiDaemon:
                     if df is not None and not df.empty:
                         _prefetched_1m[sym] = df
 
-            # Get BRTI-approximated prices (Coinbase + Kraken + Bitstamp average)
-            if self._brti_proxy is None:
-                from data.brti_proxy import BRTIProxy
-                self._brti_proxy = BRTIProxy()
-            # Convert USDT symbols to USD for exchange queries
-            usd_symbols = [s.replace("/USDT", "/USD") for s in self.KALSHI_PAIRS]
-            brti_prices = self._brti_proxy.get_prices_batch(usd_symbols)
+            # Use Coinbase 1m close for model pricing (exact training parity)
+            # Model was trained on Coinbase data — using anything else shifts distances
             for sym in self.KALSHI_PAIRS:
-                usd_sym = sym.replace("/USDT", "/USD")
-                if usd_sym in brti_prices:
-                    _prefetched_prices[sym] = brti_prices[usd_sym]
-                elif sym in _prefetched_1m:
-                    # Fallback to Coinbase 1m close
+                if sym in _prefetched_1m:
                     _prefetched_prices[sym] = float(_prefetched_1m[sym].iloc[-1]["close"])
 
         for symbol, series_ticker in self.KALSHI_PAIRS.items():

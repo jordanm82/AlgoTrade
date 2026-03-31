@@ -499,10 +499,20 @@ class RichDashboard:
                         symbol = f"{asset}/USDT"
                         decimals = 4 if asset == "XRP" else 2
                         target_str = f"${target:,.{decimals}f}"
-                        # Use BRTI price (same source as Kalshi settlement)
+                        # Show CF BRTI price on dashboard (actual settlement source)
+                        # Model uses Coinbase internally — this is display only
                         brti = None
-                        if hasattr(self.daemon, '_brti_proxy') and self.daemon._brti_proxy:
-                            brti = self.daemon._brti_proxy.get_price(symbol)
+                        if not hasattr(self, '_brti_display'):
+                            try:
+                                from data.brti_display import get_brti_price
+                                self._brti_display = get_brti_price
+                            except Exception:
+                                self._brti_display = None
+                        if self._brti_display:
+                            try:
+                                brti = self._brti_display(asset)
+                            except Exception:
+                                pass
                         if not brti and hasattr(self.daemon, '_get_coinbase_price'):
                             brti = self.daemon._get_coinbase_price(symbol)
                         if brti:
