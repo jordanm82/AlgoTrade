@@ -29,16 +29,17 @@ POSITION_REFRESH_INTERVAL = 15  # seconds — matches resting order monitoring
 
 
 class RichDashboard:
-    def __init__(self, dry_run: bool = True, arb_mode: bool = False, max_cycles: int = 96):
+    def __init__(self, dry_run: bool = True, arb_mode: bool = False, max_cycles: int = 96, demo: bool = False):
         self.arb_mode = arb_mode
         self.dry_run = dry_run
+        self.demo = demo
         self.max_cycles = max_cycles
 
         if arb_mode:
             from cli.kalshi_arb import KalshiArbDaemon
             self.daemon = KalshiArbDaemon(dry_run=dry_run)
         else:
-            self.daemon = KalshiDaemon(dry_run=dry_run, predictor_version="v3")
+            self.daemon = KalshiDaemon(dry_run=dry_run or demo, predictor_version="v3", demo=demo)
         self.daemon.kalshi_only = True
 
         self._start_time = datetime.now(timezone.utc)
@@ -98,10 +99,11 @@ class RichDashboard:
 
     def _fetch_balance(self):
         try:
-            if self.daemon.dry_run:
-                # Use compounding simulated balance
+            if self.daemon.dry_run and not self.demo:
+                # Dry-run: use compounding simulated balance
                 self._kalshi_balance = self.daemon._dry_balance_cents / 100
             else:
+                # Live + demo: query actual exchange balance
                 self.daemon._init_kalshi_client()
                 if self.daemon.kalshi_client:
                     bal = self.daemon.kalshi_client.get_balance()
@@ -251,7 +253,9 @@ class RichDashboard:
 
         header = Text()
         header.append(f"K15 {mode_label} ", style="bold white")
-        if self.dry_run:
+        if self.demo:
+            header.append("[DEMO]  ", style="yellow bold")
+        elif self.dry_run:
             header.append("[DRY]  ", style="magenta bold")
         else:
             header.append("[LIVE]  ", style="red bold")
@@ -734,12 +738,14 @@ def main():
     parser = argparse.ArgumentParser(description="K15 Rich Dashboard")
     parser.add_argument("--dry-run", action="store_true", default=True)
     parser.add_argument("--live", action="store_true")
+    parser.add_argument("--demo", action="store_true",
+                        help="Use Kalshi demo exchange (real orders, play money)")
     parser.add_argument("--arb", action="store_true")
     parser.add_argument("--cycles", type=int, default=96)
     args = parser.parse_args()
 
-    dry_run = not args.live
-    RichDashboard(dry_run=dry_run, arb_mode=args.arb, max_cycles=args.cycles).run()
+    dry_run = not args.live and not args.demo
+    RichDashboard(dry_run=dry_run, arb_mode=args.arb, max_cycles=args.cycles, demo=args.demo).run()
 
 
 if __name__ == "__main__":

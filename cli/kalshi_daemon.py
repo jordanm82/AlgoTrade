@@ -65,8 +65,9 @@ class KalshiDaemon:
         "XRP/USDT": "XRP-USD",
     }
 
-    def __init__(self, dry_run: bool = True, predictor_version: str = "v3"):
+    def __init__(self, dry_run: bool = True, predictor_version: str = "v3", demo: bool = False):
         self.dry_run = dry_run
+        self.demo = demo  # use Kalshi demo exchange (real orders, play money)
         self.kalshi_predictor_version = predictor_version
         self.fetcher = DataFetcher()
         self._running = False
@@ -284,18 +285,33 @@ class KalshiDaemon:
 
     def _init_kalshi_client(self):
         """Lazy-initialize the Kalshi client.
-        Always uses production API — V3 needs real strike prices even in dry-run.
-        Dry-run only skips order placement, not market data queries."""
+
+        Demo mode: uses demo API + demo keys (real orders, play money).
+        Dry-run: uses production API for market data, skips order placement.
+        Live: uses production API for everything.
+        """
         if self.kalshi_client is not None:
             return
         try:
             from exchange.kalshi import KalshiClient
-            from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
-            self.kalshi_client = KalshiClient(
-                api_key_id=KALSHI_API_KEY_ID,
-                private_key_path=str(KALSHI_KEY_FILE),
-                demo=False,  # always production — need real strikes/prices
-            )
+
+            if self.demo:
+                from config.settings import KALSHI_DEMO_KEY_FILE
+                # Demo key file format: first line = API key ID, rest = PEM key
+                with open(KALSHI_DEMO_KEY_FILE) as f:
+                    demo_key_id = f.readline().strip()
+                self.kalshi_client = KalshiClient(
+                    api_key_id=demo_key_id,
+                    private_key_path=str(KALSHI_DEMO_KEY_FILE),
+                    demo=True,
+                )
+            else:
+                from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
+                self.kalshi_client = KalshiClient(
+                    api_key_id=KALSHI_API_KEY_ID,
+                    private_key_path=str(KALSHI_KEY_FILE),
+                    demo=False,
+                )
         except Exception as e:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
@@ -370,7 +386,7 @@ class KalshiDaemon:
                         count = bet.get("count", 1)
                         settled_value = float(m.get("expiration_value", 0))
 
-                        if self.dry_run:
+                        if self.dry_run and not self.demo:
                             # Dry-run: compute P&L from simulated entry
                             won = bet["side"] == result
                             if won:
@@ -430,8 +446,8 @@ class KalshiDaemon:
                         else:
                             self._session_losses += 1
 
-                        # Compound dry-run balance
-                        if self.dry_run:
+                        # Compound dry-run simulated balance (not demo — demo uses real balance)
+                        if self.dry_run and not self.demo:
                             self._dry_balance_cents += pnl_cents
 
                         settled.append(bet)
@@ -1103,7 +1119,7 @@ class KalshiDaemon:
 
         pred["reason"] = f"would bet {side.upper()} (conf={conf_display})"
 
-        if self.dry_run:
+        if self.dry_run and not self.demo:
             # Record dry-run bet with ACTUAL contract price from Kalshi
             strike = 0
             settle_time = None
@@ -1584,7 +1600,7 @@ class KalshiDaemon:
 
     def startup(self):
         """Fetch initial data, check model freshness, and run first eval."""
-        mode = "DRY-RUN" if self.dry_run else "LIVE"
+        mode = "DEMO" if self.demo else ("DRY-RUN" if self.dry_run else "LIVE")
         if self.kalshi_predictor_version == 'v3':
             label = 'V3 Strike-Relative'
         elif self.kalshi_predictor_version == 'v2':
@@ -1603,8 +1619,21 @@ class KalshiDaemon:
         if self.kalshi_predictor_version == "v3":
             self._check_model_freshness()
 
-        # Initialize dry-run balance from actual Kalshi balance
-        if self.dry_run:
+        # Initialize balance
+        if self.demo:
+            # Demo mode: query demo exchange for real play-money balance
+            self._init_kalshi_client()
+            if self.kalshi_client:
+                try:
+                    bal = self.kalshi_client.get_balance()
+                    balance = bal.get("balance", 0) / 100
+                    print(colored(
+                        f"  [BALANCE] Demo exchange balance: ${balance:.2f}",
+                        "green"))
+                except Exception as e:
+                    print(colored(f"  [BALANCE] Demo balance query failed: {e}", "red"))
+        elif self.dry_run:
+            # Dry-run: seed simulated balance from production Kalshi
             self._init_kalshi_client()
             if self.kalshi_client:
                 try:
@@ -1648,7 +1677,12 @@ class KalshiDaemon:
     def _print_status(self):
         """Print a concise status line."""
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        mode_tag = colored("[DRY-RUN]", "magenta") if self.dry_run else colored("[LIVE]", "green")
+        if self.demo:
+            mode_tag = colored("[DEMO]", "yellow")
+        elif self.dry_run:
+            mode_tag = colored("[DRY-RUN]", "magenta")
+        else:
+            mode_tag = colored("[LIVE]", "green")
 
         total = self._session_wins + self._session_losses
         wr = f"{self._session_wins}/{total} ({100*self._session_wins/total:.0f}%)" if total > 0 else "0/0"
@@ -1738,9 +1772,18 @@ def main():
         "--cycles", type=int, default=0,
         help="Stop after N ticks (0 = run forever)",
     )
+    parser.add_argument(
+        "--demo", action="store_true",
+        help="Use Kalshi demo exchange (real orders, play money). Requires KalshiDemoKeys.txt",
+    )
     args = parser.parse_args()
 
-    daemon = KalshiDaemon(dry_run=args.dry_run, predictor_version=args.predictor)
+    # Demo mode implies dry_run=True (for dashboard tagging) but places real orders on demo exchange
+    daemon = KalshiDaemon(
+        dry_run=args.dry_run or args.demo,
+        predictor_version=args.predictor,
+        demo=args.demo,
+    )
     daemon.run(max_cycles=args.cycles)
 
 
