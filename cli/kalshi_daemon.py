@@ -1774,15 +1774,19 @@ class KalshiDaemon:
         """Wall-clock Kalshi evaluation trigger (every minute)."""
         # Settlements and resting checks are now inside _kalshi_eval()
 
-        # Eval — fire immediately at minute 1 (entry window), then every 50s
+        # Eval — SETUP at minute 0, entry at minute 1:05, then every 50s
         now = time.time()
         now_utc = datetime.now(timezone.utc)
         min_in_window = now_utc.minute % 15
         sec_in = now_utc.second
         time_since = now - self._last_kalshi_eval
+        # Minute 0: run SETUP to cache strike before entry window
+        setup_trigger = (min_in_window == 0 and time_since >= 10)
+        # Minute 1 second 5+: fire immediately (1m candle closed, bet now)
         entry_trigger = (min_in_window == 1 and sec_in >= 5 and time_since >= 10)
-        normal_trigger = (min_in_window >= 1 and time_since >= 50)
-        should_eval = entry_trigger or normal_trigger
+        # Minutes 2+: normal cadence
+        normal_trigger = (min_in_window >= 2 and time_since >= 50)
+        should_eval = setup_trigger or entry_trigger or normal_trigger
         if should_eval:
             try:
                 self._kalshi_eval()

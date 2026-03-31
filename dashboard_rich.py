@@ -703,7 +703,7 @@ class RichDashboard:
                     if tick % 5 == 0:
                         self._fetch_balance()
 
-                    # Run eval — fire immediately at minute 1 (entry window), then every 50s
+                    # Run eval — SETUP at min 0, entry at min 1:05, then every 50s
                     now_ts = time.time()
                     now_utc = datetime.now(timezone.utc)
                     min_in = now_utc.minute % 15
@@ -712,11 +712,10 @@ class RichDashboard:
                     if self.arb_mode:
                         should_eval = time_since_eval >= 50
                     else:
-                        # At minute 1 second 5+: fire immediately (1m candle just closed)
-                        # Otherwise: every 50 seconds
+                        setup_trigger = (min_in == 0 and time_since_eval >= 10)
                         entry_trigger = (min_in == 1 and sec_in >= 5 and time_since_eval >= 10)
-                        normal_trigger = (min_in >= 1 and time_since_eval >= 50)
-                        should_eval = entry_trigger or normal_trigger
+                        normal_trigger = (min_in >= 2 and time_since_eval >= 50)
+                        should_eval = setup_trigger or entry_trigger or normal_trigger
 
                     if should_eval:
                         try:
