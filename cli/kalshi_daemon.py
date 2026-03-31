@@ -524,8 +524,8 @@ class KalshiDaemon:
         now_utc = datetime.now(timezone.utc)
         minute_in_window = now_utc.minute % 15
 
-        # Check resting orders only during entry window (not during SETUP/DONE)
-        if self._resting_orders and 2 <= minute_in_window <= 10:
+        # Check resting orders — monitor during entry window, cancel at minute 10+
+        if self._resting_orders and minute_in_window >= 2:
             self._check_resting_orders()
 
         # Settlement check moved to dashboard refresh cycle (every 5s)
