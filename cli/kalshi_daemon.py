@@ -90,6 +90,7 @@ class KalshiDaemon:
             self.kalshi_predictor = KalshiPredictor()
 
         self.kalshi_client = None  # lazy init
+        self.kalshi_ws = None      # WebSocket for real-time prices
         self.kalshi_threshold = 30  # minimum confidence to bet
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
         self._active_kalshi_bets = {}  # {ticker: placement_time}
@@ -322,6 +323,86 @@ class KalshiDaemon:
             print(colored(f"  [WARN] Kalshi client init failed: {e}", "yellow"))
 
     # ------------------------------------------------------------------
+    # Kalshi WebSocket
+    # ------------------------------------------------------------------
+
+    def _start_kalshi_ws(self):
+        """Start WebSocket for real-time Kalshi contract prices."""
+        try:
+            from exchange.kalshi_ws import KalshiWebSocket
+
+            if self.demo:
+                from config.settings import KALSHI_DEMO_KEY_FILE
+                with open(KALSHI_DEMO_KEY_FILE) as f:
+                    first_line = f.readline().strip()
+                key_id = first_line.split(":", 1)[-1].strip() if ":" in first_line else first_line
+                key_path = str(KALSHI_DEMO_KEY_FILE)
+                is_demo = True
+            else:
+                from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
+                key_id = KALSHI_API_KEY_ID
+                key_path = str(KALSHI_KEY_FILE)
+                is_demo = False
+
+            self.kalshi_ws = KalshiWebSocket(
+                api_key_id=key_id,
+                private_key_path=key_path,
+                demo=is_demo,
+            )
+            self.kalshi_ws.start()
+            print(colored("  [WS] Kalshi WebSocket started", "green"))
+
+            # Subscribe to current open markets
+            self._ws_subscribe_current_markets()
+
+        except Exception as e:
+            print(colored(f"  [WS] Failed to start: {e}", "yellow"))
+            self.kalshi_ws = None
+
+    def _ws_subscribe_current_markets(self):
+        """Subscribe to ticker updates for current open K15 markets."""
+        if not self.kalshi_ws:
+            return
+        self._init_kalshi_client()
+        if not self.kalshi_client:
+            return
+
+        for series_ticker in self.KALSHI_PAIRS.values():
+            try:
+                markets = self.kalshi_client.get_markets(
+                    series_ticker=series_ticker, status="open"
+                )
+                if markets:
+                    markets.sort(key=lambda m: m.get("close_time", "9999"))
+                    ticker = markets[0].get("ticker", "")
+                    if ticker:
+                        self.kalshi_ws.subscribe_ticker(ticker)
+            except Exception:
+                pass
+
+    def _get_ws_price(self, symbol: str, side: str = "yes") -> int | None:
+        """Get real-time contract price from WebSocket. Returns cents or None."""
+        if not self.kalshi_ws:
+            return None
+
+        series = self.KALSHI_PAIRS.get(symbol, "")
+        if not series:
+            return None
+
+        # Find the ticker for current open market
+        tickers = self.kalshi_ws.get_all_tickers()
+        for ticker, data in tickers.items():
+            if series[:6] in ticker:  # e.g. "KXBTC1" matches "KXBTC15M-..."
+                age = time.time() - data.get("ts", 0)
+                if age > 60:  # stale data
+                    continue
+                if side == "yes":
+                    return data.get("yes_ask", 0)
+                else:
+                    return data.get("no_ask", 0)
+        return None
+
+    # ------------------------------------------------------------------
     # Trade debug logging
     # ------------------------------------------------------------------
 
@@ -540,9 +621,11 @@ class KalshiDaemon:
         # Pandas-compatible timestamp for DataFrame index comparisons
         current_window_start_pd = pd.Timestamp(current_window_start.replace(tzinfo=None))
 
+        # Re-subscribe WebSocket to new markets at window boundary
+        if minute_in_window == 0 and self.kalshi_ws:
+            self._ws_subscribe_current_markets()
+
         # Prune active bets — clear at window boundary so new window can bet immediately
-        # Old 900s timer kept previous window's bets "active" into the next window,
-        # blocking new bets when maxbets=1
         now_ts = time.time()
         window_start_ts = current_window_start.replace(tzinfo=timezone.utc).timestamp()
         self._active_kalshi_bets = {
@@ -1789,6 +1872,9 @@ class KalshiDaemon:
             rsi = last.get("rsi", 0)
             close = float(last["close"])
             print(f"  {sym}: ${close:.4f} | RSI={rsi:.1f} | {len(df)} candles")
+
+        # Start Kalshi WebSocket for real-time contract prices
+        self._start_kalshi_ws()
 
     def tick(self):
         """Wall-clock Kalshi evaluation trigger (every minute)."""
