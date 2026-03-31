@@ -200,10 +200,29 @@ class RichDashboard:
                     "winning": winning,
                 })
 
-            # Also check resting orders from exchange
+            # Also check resting orders from exchange — only for current/future markets
+            now_utc = datetime.now(timezone.utc)
             resting = self.daemon.kalshi_client.get_orders(status="resting")
             for o in resting:
                 ticker = o.get("ticker", "")
+
+                # Skip orders for markets that have already closed
+                expiration = o.get("expiration_time") or o.get("close_time", "")
+                if expiration:
+                    try:
+                        exp_dt = datetime.fromisoformat(expiration.replace("Z", "+00:00"))
+                        if exp_dt < now_utc:
+                            # Stale order from settled market — try to cancel it
+                            try:
+                                order_id = o.get("order_id")
+                                if order_id:
+                                    self.daemon.kalshi_client.cancel_order_safe(order_id)
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
+                        pass
+
                 asset = ""
                 for a in ["ETH", "SOL", "XRP", "BNB", "BTC"]:
                     if f"KX{a}" in ticker:
@@ -213,7 +232,6 @@ class RichDashboard:
                     continue
 
                 side = o.get("side", "yes").upper()
-                # Try multiple field names for price and count
                 if side == "YES":
                     price_raw = o.get("yes_price") or o.get("yes_price_dollars") or 0
                 else:
@@ -230,7 +248,7 @@ class RichDashboard:
                     "asset": asset,
                     "side": side,
                     "entry": int(price),
-                    "count": count + filled,  # total order size
+                    "count": count + filled,
                     "status": status,
                     "strike": 0,
                     "ticker": ticker,
