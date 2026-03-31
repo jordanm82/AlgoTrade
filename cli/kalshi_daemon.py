@@ -1570,13 +1570,14 @@ class KalshiDaemon:
                 if settle_time and now_utc > settle_time:
                     order_expired = True
 
-                if (minute_in_window >= 10 or order_expired) and order_status == "resting":
+                should_cancel = minute_in_window >= 10 or order_expired
+                if should_cancel and order_status != "executed":
                     reason = "previous window" if order_expired else f"min {minute_in_window}"
                     try:
                         self.kalshi_client.cancel_order_safe(order_id)
                         print(colored(
                             f"  [RESTING CANCEL] {asset} {order['side'].upper()} "
-                            f"@ {order['fill_price']}c — cancelled ({reason})",
+                            f"@ {order['fill_price']}c — cancelled ({reason}, was {order_status})",
                             "yellow",
                         ))
                         self._pending_bets = [
