@@ -782,9 +782,8 @@ class RichDashboard:
                         if min_in_refresh >= 10 and hasattr(self.daemon, '_resting_orders'):
                             self._force_cancel_resting()
 
-                        # Stop loss check — every 15s, sell if contract dropped to 50% of entry
-                        if hasattr(self.daemon, '_check_stop_losses'):
-                            self.daemon._check_stop_losses()
+                        # Stop loss disabled — contract prices swing too much mid-window.
+                        # Minute-5 confirmation handles exit decisions with distance data.
 
                         # Position/balance/watches skip during entry window
                         if not in_entry_window:
