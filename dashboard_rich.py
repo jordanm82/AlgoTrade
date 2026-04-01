@@ -201,8 +201,13 @@ class RichDashboard:
 
             for kp in kalshi_positions:
                 ticker = kp.get("ticker", "")
-                count = int(float(kp.get("position_fp", 0)))
-                cost = float(kp.get("total_traded_dollars", 0))
+                # Try multiple field names for position count
+                count = int(float(
+                    kp.get("position_fp") or kp.get("position") or
+                    kp.get("total_traded_fp") or kp.get("yes_count_fp") or
+                    kp.get("no_count_fp") or 0
+                ))
+                cost = float(kp.get("total_traded_dollars") or kp.get("market_exposure") or 0)
                 if count <= 0:
                     continue
 
@@ -330,23 +335,27 @@ class RichDashboard:
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             self._log_lines.append(Text(f"{ts} [POS ERR] {e}", style="red"))
 
-        # In dry-run (non-demo): show pending bets as simulated positions
-        if self.daemon.dry_run and not self.demo:
-            for bet in getattr(self.daemon, '_pending_bets', []):
-                if bet.get("result"):  # already settled
-                    continue
-                count = bet.get("count", 0)
-                if count <= 0:
-                    continue
-                asset = bet.get("asset", "?")
-                side = bet.get("side", "yes").upper()
-                entry = bet.get("contract_price", bet.get("fill_price", 0))
-                positions.append({
-                    "asset": asset,
-                    "side": side,
-                    "entry": entry,
-                    "count": count,
-                    "status": "PENDING",
+        # Show filled pending bets as positions (all modes — Kalshi API positions are transient)
+        for bet in getattr(self.daemon, '_pending_bets', []):
+            if bet.get("result"):  # already settled
+                continue
+            count = bet.get("count", 0)
+            if count <= 0:
+                continue
+            # Skip if already shown from Kalshi positions API
+            asset = bet.get("asset", "?")
+            already_shown = any(p["asset"] == asset for p in positions)
+            if already_shown:
+                continue
+            side = bet.get("side", "yes").upper()
+            entry = bet.get("contract_price", bet.get("fill_price", 0))
+            status = "FILLED" if bet.get("live") else "PENDING"
+            positions.append({
+                "asset": asset,
+                "side": side,
+                "entry": entry,
+                "count": count,
+                "status": status,
                     "strike": bet.get("strike", 0),
                     "ticker": "",
                     "current_yes": 0,
