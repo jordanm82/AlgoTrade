@@ -779,9 +779,12 @@ class RichDashboard:
                             self.daemon._check_dryrun_settlements()
 
                         # Force-cancel stale resting orders at minute 10+
-                        # Runs every 15s independent of eval cycle
                         if min_in_refresh >= 10 and hasattr(self.daemon, '_resting_orders'):
                             self._force_cancel_resting()
+
+                        # Stop loss check — every 15s, sell if contract dropped to 50% of entry
+                        if hasattr(self.daemon, '_check_stop_losses'):
+                            self.daemon._check_stop_losses()
 
                         # Position/balance/watches skip during entry window
                         if not in_entry_window:
@@ -802,7 +805,7 @@ class RichDashboard:
                     if tick % 5 == 0:
                         self._fetch_balance()
 
-                    # Run eval — SETUP at min 0, entry at min 1:05, then every 50s
+                    # Eval triggers: entry at min 0, confirmation at min 5, else every 50s
                     now_ts = time.time()
                     now_utc = datetime.now(timezone.utc)
                     min_in = now_utc.minute % 15
@@ -811,10 +814,10 @@ class RichDashboard:
                     if self.arb_mode:
                         should_eval = time_since_eval >= 50
                     else:
-                        setup_trigger = (min_in == 0 and time_since_eval >= 10)
-                        entry_trigger = (min_in == 1 and sec_in >= 5 and time_since_eval >= 10)
-                        normal_trigger = (min_in >= 2 and time_since_eval >= 50)
-                        should_eval = setup_trigger or entry_trigger or normal_trigger
+                        entry_trigger = (min_in == 0 and sec_in >= 3 and time_since_eval >= 10)
+                        confirm_trigger = (min_in == 5 and sec_in >= 5 and time_since_eval >= 10)
+                        normal_trigger = (min_in >= 1 and time_since_eval >= 50)
+                        should_eval = entry_trigger or confirm_trigger or normal_trigger
 
                     if should_eval:
                         try:

@@ -15,7 +15,7 @@ DISTANCE_BINS = [-3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.5, 
 TIME_BINS = [14, 12, 10, 8, 6, 4, 2]
 
 EDGE_MARGIN = 0.02    # require 2% edge over implied contract price
-MAX_BET_PRICE = 57    # hard cap — orderbook data shows winning side avg 53-56c at min 3
+MAX_BET_PRICE = 60    # max entry — stop loss at 50% caps downside to 30c
 
 
 @dataclass

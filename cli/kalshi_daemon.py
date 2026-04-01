@@ -404,6 +404,241 @@ class KalshiDaemon:
         return None
 
     # ------------------------------------------------------------------
+    # Stop loss + minute-5 confirmation
+    # ------------------------------------------------------------------
+
+    STOP_LOSS_PCT = 0.50  # sell if contract drops to 50% of entry
+
+    def _check_stop_losses(self):
+        """Check pending bets for stop loss — sell if contract at 50% of entry."""
+        if not self._pending_bets:
+            return
+
+        self._init_kalshi_client()
+        if not self.kalshi_client:
+            return
+
+        for bet in list(self._pending_bets):
+            if bet.get("result") or bet.get("count", 0) <= 0:
+                continue
+            if not bet.get("live") and not self.dry_run:
+                continue
+
+            asset = bet.get("asset", "?")
+            side = bet.get("side", "yes")
+            entry = bet.get("contract_price", bet.get("fill_price", 0))
+            ticker = bet.get("ticker", "")
+            count = bet.get("count", 0)
+
+            if not entry or not ticker:
+                continue
+
+            stop_price = int(entry * self.STOP_LOSS_PCT)
+
+            # Get current contract price from WebSocket or API
+            current_price = None
+            if self.kalshi_ws:
+                ws_data = self.kalshi_ws.get_ticker(ticker)
+                if ws_data and time.time() - ws_data.get("ts", 0) < 30:
+                    current_price = ws_data.get("yes_bid") if side == "yes" else ws_data.get("no_bid")
+
+            if current_price is None:
+                # Fallback to REST API
+                try:
+                    mkt = self.kalshi_client.get_market(ticker)
+                    mkt_data = mkt.get("market", mkt)
+                    if side == "yes":
+                        current_price = int(float(mkt_data.get("yes_bid_dollars", 0)) * 100)
+                    else:
+                        current_price = int(float(mkt_data.get("no_bid_dollars", 0)) * 100)
+                except Exception:
+                    continue
+
+            if current_price and current_price <= stop_price:
+                # STOP LOSS HIT — sell
+                self._exit_position(bet, current_price, "STOP LOSS")
+
+    def _confirm_at_minute5(self):
+        """At minute 5, recheck with distance data. Exit if market is against us."""
+        if not self._pending_bets:
+            return
+
+        now_utc = datetime.now(timezone.utc)
+
+        for bet in list(self._pending_bets):
+            if bet.get("result") or bet.get("count", 0) <= 0:
+                continue
+
+            asset = bet.get("asset", "?")
+            side = bet.get("side", "yes")
+            symbol = bet.get("symbol", "")
+            strike = bet.get("strike", 0)
+            ticker = bet.get("ticker", "")
+            entry = bet.get("contract_price", bet.get("fill_price", 0))
+
+            if not strike or not symbol:
+                continue
+
+            # Get current price from multi-exchange
+            if self._brti_proxy is None:
+                from data.brti_proxy import BRTIProxy
+                self._brti_proxy = BRTIProxy()
+            usd_sym = symbol.replace("/USDT", "/USD")
+            current_crypto = self._brti_proxy.get_price(usd_sym)
+            if not current_crypto:
+                continue
+
+            # Compute distance from strike
+            df_15m = self._kalshi_cached_dataframes.get(symbol)
+            if df_15m is None or len(df_15m) < 5:
+                continue
+            atr = float(df_15m.iloc[-1].get("atr", 0))
+            if pd.isna(atr) or atr <= 0:
+                continue
+
+            distance = (current_crypto - strike) / atr
+
+            # Check: is the market going AGAINST our bet?
+            against = False
+            if side == "yes" and distance < -0.1:
+                against = True  # we bet YES but price dropped well below strike
+            elif side == "no" and distance > 0.1:
+                against = True  # we bet NO but price rose well above strike
+
+            if against:
+                # Get current contract bid to decide sell price
+                current_bid = None
+                if self.kalshi_ws:
+                    ws_data = self.kalshi_ws.get_ticker(ticker)
+                    if ws_data and time.time() - ws_data.get("ts", 0) < 30:
+                        current_bid = ws_data.get("yes_bid") if side == "yes" else ws_data.get("no_bid")
+
+                if current_bid is None:
+                    try:
+                        mkt = self.kalshi_client.get_market(ticker)
+                        mkt_data = mkt.get("market", mkt)
+                        if side == "yes":
+                            current_bid = int(float(mkt_data.get("yes_bid_dollars", 0)) * 100)
+                        else:
+                            current_bid = int(float(mkt_data.get("no_bid_dollars", 0)) * 100)
+                    except Exception:
+                        continue
+
+                if current_bid and current_bid > 0:
+                    self._exit_position(bet, current_bid, f"MIN5 EXIT (dist={distance:+.2f})")
+
+            else:
+                dir_label = "YES" if side == "yes" else "NO"
+                print(colored(
+                    f"  [MIN5 CONFIRM] {asset} {dir_label} dist={distance:+.2f} — holding to settlement",
+                    "green",
+                ))
+
+        # Also cancel any resting orders if minute-5 shows against
+        for order in list(self._resting_orders):
+            asset = order.get("asset", "?")
+            symbol = order.get("symbol", "")
+            side = order.get("side", "yes")
+            strike = order.get("strike", 0)
+            order_id = order.get("order_id", "")
+
+            if not symbol or not strike or not order_id:
+                continue
+
+            usd_sym = symbol.replace("/USDT", "/USD")
+            current_crypto = self._brti_proxy.get_price(usd_sym) if self._brti_proxy else None
+            if not current_crypto:
+                continue
+
+            df_15m = self._kalshi_cached_dataframes.get(symbol)
+            if df_15m is None or len(df_15m) < 5:
+                continue
+            atr = float(df_15m.iloc[-1].get("atr", 0))
+            if pd.isna(atr) or atr <= 0:
+                continue
+
+            distance = (current_crypto - strike) / atr
+            against = (side == "yes" and distance < -0.1) or (side == "no" and distance > 0.1)
+
+            if against:
+                try:
+                    self.kalshi_client.cancel_order_safe(order_id)
+                    dir_label = "YES" if side == "yes" else "NO"
+                    print(colored(
+                        f"  [MIN5 CANCEL] {asset} {dir_label} resting — market against (dist={distance:+.2f})",
+                        "yellow",
+                    ))
+                    self._pending_bets = [
+                        b for b in self._pending_bets if b.get("order_id") != order_id
+                    ]
+                except Exception:
+                    pass
+
+        # Remove cancelled orders from resting list
+        self._resting_orders = [
+            o for o in self._resting_orders
+            if o.get("order_id") and o.get("order_id") not in
+            [b.get("order_id") for b in self._pending_bets if b.get("result")]
+        ]
+
+    def _exit_position(self, bet: dict, sell_price: int, reason: str):
+        """Sell a position — either stop loss or minute-5 exit."""
+        asset = bet.get("asset", "?")
+        side = bet.get("side", "yes")
+        ticker = bet.get("ticker", "")
+        count = bet.get("count", 0)
+        entry = bet.get("contract_price", bet.get("fill_price", 0))
+        dir_label = "YES" if side == "yes" else "NO"
+
+        pnl_cents = count * (sell_price - entry)
+        pnl_dollars = pnl_cents / 100
+
+        if self.dry_run and not self.demo:
+            # Dry-run: simulate the exit
+            print(colored(
+                f"  [{reason}] {asset} {dir_label} sell x{count} @ {sell_price}c "
+                f"(entry {entry}c) P&L ${pnl_dollars:+.2f}",
+                "red" if pnl_cents < 0 else "green",
+            ))
+            bet["result"] = "WIN" if pnl_cents > 0 else "LOSS"
+            bet["pnl_cents"] = pnl_cents
+            bet["pnl_dollars"] = pnl_dollars
+            bet["settle_price"] = sell_price
+            self._completed_bets.append(bet)
+            if pnl_cents > 0:
+                self._session_wins += 1
+            else:
+                self._session_losses += 1
+            self._dry_balance_cents += pnl_cents
+        else:
+            # Live: place sell order
+            try:
+                result = self.kalshi_client.place_order(
+                    ticker=ticker, side=side, count=count,
+                    price_cents=sell_price, order_type="limit",
+                    action="sell",
+                )
+                order = result.get("order", {})
+                fill_count = float(order.get("fill_count_fp", 0))
+                print(colored(
+                    f"  [{reason}] {asset} {dir_label} sell x{count} @ {sell_price}c "
+                    f"(entry {entry}c) filled={fill_count:.0f} P&L ${pnl_dollars:+.2f}",
+                    "red" if pnl_cents < 0 else "green",
+                ))
+                if fill_count > 0:
+                    bet["result"] = "WIN" if pnl_cents > 0 else "LOSS"
+                    bet["pnl_cents"] = pnl_cents
+                    bet["pnl_dollars"] = pnl_dollars
+                    bet["settle_price"] = sell_price
+                    self._completed_bets.append(bet)
+                    if pnl_cents > 0:
+                        self._session_wins += 1
+                    else:
+                        self._session_losses += 1
+            except Exception as e:
+                print(colored(f"  [EXIT ERR] {asset}: {e}", "red"))
+
+    # ------------------------------------------------------------------
     # Trade debug logging
     # ------------------------------------------------------------------
 
@@ -610,11 +845,15 @@ class KalshiDaemon:
         now_utc = datetime.now(timezone.utc)
         minute_in_window = now_utc.minute % 15
 
-        # Check resting orders — monitor during entry window, cancel at minute 10+
-        if self._resting_orders and minute_in_window >= 2:
+        # Check resting orders — monitor fills, cancel at minute 10+
+        if self._resting_orders and minute_in_window >= 1:
             self._check_resting_orders()
 
-        # Settlement check moved to dashboard refresh cycle (every 5s)
+        # Minute 5 confirmation — recheck positions with distance data
+        if minute_in_window == 5:
+            self._confirm_at_minute5()
+
+        # Settlement check moved to dashboard refresh cycle (every 15s)
 
         # Compute current window start (round down to :00/:15/:30/:45)
         window_minute = now_utc.minute - minute_in_window
@@ -723,14 +962,15 @@ class KalshiDaemon:
                 continue
 
             # Lifecycle:
-            # Min 0:   SETUP — cache 15m/1h, query strike from Kalshi
-            # Min 1-8: CONFIRMED — 1m candle closed, compute distance, bet immediately
-            #          (83% WR at min 1 with contracts still ~50c)
-            # Min 9+:  MONITORING — no new bets, cancel resting at min 10
-            if minute_in_window < 1:
-                state = "SETUP"
-            elif minute_in_window <= 8 and not (pending and pending.get("bet_placed")):
+            # Min 0:     CONFIRMED — bet immediately at window open (contracts ~50c)
+            # Min 1-4:   MONITORING — stop loss active, watch for fills
+            # Min 5:     CONFIRMATION — recheck with 5m distance, exit if against us
+            # Min 6-9:   MONITORING — hold or already exited
+            # Min 10+:   SETTLING — cancel unfilled, await settlement
+            if minute_in_window == 0 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
+            elif minute_in_window == 5 and pending and pending.get("bet_placed"):
+                state = "CONFIRMATION"
             else:
                 state = "MONITORING"
 
@@ -1934,19 +2174,19 @@ class KalshiDaemon:
         """Wall-clock Kalshi evaluation trigger (every minute)."""
         # Settlements and resting checks are now inside _kalshi_eval()
 
-        # Eval — SETUP at minute 0, entry at minute 1:05, then every 50s
+        # Eval triggers:
+        # Min 0 sec 3+: entry — bet immediately at window open
+        # Min 5 sec 5+: confirmation — recheck with 5m candle distance
+        # Other: every 50s for monitoring/settlement
         now = time.time()
         now_utc = datetime.now(timezone.utc)
         min_in_window = now_utc.minute % 15
         sec_in = now_utc.second
         time_since = now - self._last_kalshi_eval
-        # Minute 0: run SETUP to cache strike before entry window
-        setup_trigger = (min_in_window == 0 and time_since >= 10)
-        # Minute 1 second 5+: fire immediately (1m candle closed, bet now)
-        entry_trigger = (min_in_window == 1 and sec_in >= 5 and time_since >= 10)
-        # Minutes 2+: normal cadence
-        normal_trigger = (min_in_window >= 2 and time_since >= 50)
-        should_eval = setup_trigger or entry_trigger or normal_trigger
+        entry_trigger = (min_in_window == 0 and sec_in >= 3 and time_since >= 10)
+        confirm_trigger = (min_in_window == 5 and sec_in >= 5 and time_since >= 10)
+        normal_trigger = (min_in_window >= 1 and time_since >= 50)
+        should_eval = entry_trigger or confirm_trigger or normal_trigger
         if should_eval:
             try:
                 self._kalshi_eval()
