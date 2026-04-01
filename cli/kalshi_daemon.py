@@ -619,12 +619,15 @@ class KalshiDaemon:
             bet["pnl_cents"] = pnl_cents
             bet["pnl_dollars"] = pnl_dollars
             bet["settle_price"] = sell_price
+            bet["exited_early"] = True
             self._completed_bets.append(bet)
             if pnl_cents > 0:
                 self._session_wins += 1
             else:
                 self._session_losses += 1
             self._dry_balance_cents += pnl_cents
+            # Remove from pending so settlement doesn't double-count
+            self._pending_bets = [b for b in self._pending_bets if b is not bet]
         else:
             # Live: place sell order
             try:
@@ -645,11 +648,14 @@ class KalshiDaemon:
                     bet["pnl_cents"] = pnl_cents
                     bet["pnl_dollars"] = pnl_dollars
                     bet["settle_price"] = sell_price
+                    bet["exited_early"] = True
                     self._completed_bets.append(bet)
                     if pnl_cents > 0:
                         self._session_wins += 1
                     else:
                         self._session_losses += 1
+                    # Remove from pending so settlement doesn't double-count
+                    self._pending_bets = [b for b in self._pending_bets if b is not bet]
             except Exception as e:
                 print(colored(f"  [EXIT ERR] {asset}: {e}", "red"))
 
