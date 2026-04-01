@@ -2186,8 +2186,8 @@ class KalshiDaemon:
         min_in_window = now_utc.minute % 15
         sec_in = now_utc.second
         time_since = now - self._last_kalshi_eval
-        entry_trigger = (min_in_window == 0 and sec_in >= 3 and time_since >= 10)
-        confirm_trigger = (min_in_window == 5 and sec_in >= 5 and time_since >= 10)
+        entry_trigger = (min_in_window == 0 and sec_in >= 3 and time_since >= 5)
+        confirm_trigger = (min_in_window == 5 and sec_in >= 5 and time_since >= 5)
         normal_trigger = (min_in_window >= 1 and time_since >= 50)
         should_eval = entry_trigger or confirm_trigger or normal_trigger
         if should_eval:

@@ -814,8 +814,8 @@ class RichDashboard:
                     if self.arb_mode:
                         should_eval = time_since_eval >= 50
                     else:
-                        entry_trigger = (min_in == 0 and sec_in >= 3 and time_since_eval >= 10)
-                        confirm_trigger = (min_in == 5 and sec_in >= 5 and time_since_eval >= 10)
+                        entry_trigger = (min_in == 0 and sec_in >= 3 and time_since_eval >= 5)
+                        confirm_trigger = (min_in == 5 and sec_in >= 5 and time_since_eval >= 5)
                         normal_trigger = (min_in >= 1 and time_since_eval >= 50)
                         should_eval = entry_trigger or confirm_trigger or normal_trigger
 
