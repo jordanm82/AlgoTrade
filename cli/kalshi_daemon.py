@@ -1141,35 +1141,23 @@ class KalshiDaemon:
                     except Exception:
                         pass
 
-                # Build snapshot using pre-fetched 1m candles (already batched above)
-                try:
-                    df_sub = _prefetched_1m.get(symbol)
-                    if df_15m is not None and df_sub is not None and len(df_sub) > 0:
-                        snapshot = build_minute3_snapshot(df_15m, df_sub, current_window_start_pd)
-                        if snapshot is not None:
-                            df_15m = snapshot
-                        else:
-                            print(colored(f"  [ERR] {asset}: snapshot failed — skipping", "red"))
-                            predictions.append({
-                                "symbol": symbol, "asset": asset,
-                                "direction": "--", "confidence": 0,
-                                "reason": "snapshot failed", "ob": 0, "flow": 0, "state": state,
-                            })
-                            continue
-                    else:
-                        print(colored(f"  [ERR] {asset}: no 5m data — skipping", "red"))
-                        predictions.append({
-                            "symbol": symbol, "asset": asset,
-                            "direction": "--", "confidence": 0,
-                            "reason": "no 5m data", "ob": 0, "flow": 0, "state": state,
-                        })
-                        continue
-                except Exception as e:
-                    print(colored(f"  [ERR] {asset}: 5m fetch failed: {e} — skipping", "red"))
+                # At minute 0: use cached 15m directly (no sub-candle data yet)
+                # At minute 1+: build snapshot from 1m candles if available
+                if minute_in_window >= 1:
+                    try:
+                        df_sub = _prefetched_1m.get(symbol)
+                        if df_15m is not None and df_sub is not None and len(df_sub) > 0:
+                            snapshot = build_minute3_snapshot(df_15m, df_sub, current_window_start_pd)
+                            if snapshot is not None:
+                                df_15m = snapshot
+                    except Exception:
+                        pass  # fall through to use cached 15m
+                # At minute 0: df_15m is already the cached 15m with indicators — use as-is
+                if df_15m is None or len(df_15m) < 50:
                     predictions.append({
                         "symbol": symbol, "asset": asset,
                         "direction": "--", "confidence": 0,
-                        "reason": f"5m fetch error: {e}", "ob": 0, "flow": 0, "state": state,
+                        "reason": "no cached 15m data", "ob": 0, "flow": 0, "state": state,
                     })
                     continue
                 if df_15m is None or len(df_15m) < 50:
