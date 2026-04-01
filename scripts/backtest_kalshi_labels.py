@@ -200,23 +200,21 @@ def main():
             close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
             window_start = close_dt - timedelta(minutes=15)
             ws_naive = window_start.replace(tzinfo=None)
-            min5_time = ws_naive + timedelta(minutes=5)
-
-            # Multi-exchange price at minute 5
+            # Multi-exchange price at MINUTE 1 (5m candle open = window start price)
             prices = []
             for df_5m in [cb_5m, bs_5m]:
                 if df_5m.empty:
                     continue
-                mask = (df_5m.index >= ws_naive) & (df_5m.index < min5_time)
+                mask = (df_5m.index >= ws_naive) & (df_5m.index < ws_naive + timedelta(minutes=5))
                 if mask.sum() > 0:
-                    prices.append(float(df_5m[mask].iloc[-1]["close"]))
+                    prices.append(float(df_5m[mask].iloc[0]["open"]))
                 else:
-                    before = df_5m[df_5m.index <= min5_time]
-                    if len(before) > 0 and (min5_time - before.index[-1]).total_seconds() < 600:
+                    before = df_5m[df_5m.index <= ws_naive]
+                    if len(before) > 0 and (ws_naive - before.index[-1]).total_seconds() < 600:
                         prices.append(float(before.iloc[-1]["close"]))
             if not prices:
                 continue
-            price_at_min5 = sum(prices) / len(prices)
+            price_at_min1 = sum(prices) / len(prices)
 
             # Indicators from previous 15m candle
             prev_candles = df_15m[df_15m.index < ws_naive]
@@ -227,7 +225,7 @@ def main():
             if pd.isna(atr) or atr <= 0:
                 continue
 
-            distance = (price_at_min5 - strike) / atr
+            distance = (price_at_min1 - strike) / atr
 
             sma_val = float(prev.get("sma_20", 0))
             adx_val = float(prev.get("adx", 20))

@@ -115,7 +115,7 @@ def main():
     print("=" * 80)
     print("RETRAIN WITH KALSHI SETTLEMENT LABELS")
     print("Labels: Kalshi result (yes/no) — NOT Coinbase candle direction")
-    print("Price: Coinbase + Bitstamp 5m average — BRTI proxy")
+    print("Price: Coinbase + Bitstamp at MINUTE 1 (5m candle open as proxy)")
     print("Strike: Kalshi floor_strike — actual settlement strike")
     print("=" * 80)
 
@@ -213,24 +213,28 @@ def main():
             window_start = close_dt - timedelta(minutes=15)
             ws_naive = window_start.replace(tzinfo=None)
 
-            # Price at minute 5 — average Coinbase + Bitstamp
-            min5_time = ws_naive + timedelta(minutes=5)
-            prices_at_min5 = []
+            # Price at MINUTE 1 — use 5m candle OPEN as proxy
+            # The 5m candle starting at window_start has open = price at minute 0
+            # By minute 1, price has barely moved from open — this matches live entry
+            prices_at_min1 = []
 
             for df_5m in [cb_5m, bs_5m]:
                 if df_5m.empty:
                     continue
-                mask = (df_5m.index >= ws_naive) & (df_5m.index < min5_time)
+                # Find the 5m candle that starts at or near window_start
+                mask = (df_5m.index >= ws_naive) & (df_5m.index < ws_naive + timedelta(minutes=5))
                 if mask.sum() > 0:
-                    prices_at_min5.append(float(df_5m[mask].iloc[-1]["close"]))
+                    # Use OPEN of first 5m candle = price at window start (minute 0)
+                    prices_at_min1.append(float(df_5m[mask].iloc[0]["open"]))
                 else:
-                    before = df_5m[df_5m.index <= min5_time]
-                    if len(before) > 0 and (min5_time - before.index[-1]).total_seconds() < 600:
-                        prices_at_min5.append(float(before.iloc[-1]["close"]))
+                    # Fallback: use close of last candle before window
+                    before = df_5m[df_5m.index <= ws_naive]
+                    if len(before) > 0 and (ws_naive - before.index[-1]).total_seconds() < 600:
+                        prices_at_min1.append(float(before.iloc[-1]["close"]))
 
-            if not prices_at_min5:
+            if not prices_at_min1:
                 continue
-            price_at_min5 = sum(prices_at_min5) / len(prices_at_min5)
+            price_at_min1 = sum(prices_at_min1) / len(prices_at_min1)
 
             # Get indicators from previous completed 15m candle
             prev_candles = df_15m[df_15m.index < ws_naive]
@@ -242,7 +246,7 @@ def main():
             if pd.isna(atr) or atr <= 0:
                 continue
 
-            distance = (price_at_min5 - strike) / atr
+            distance = (price_at_min1 - strike) / atr
 
             sma_val = float(prev.get("sma_20", 0))
             adx_val = float(prev.get("adx", 20))
@@ -290,8 +294,8 @@ def main():
                 "asset": asset,
                 "strike": strike,
                 "settled": settled_value,
-                "price_at_min5": price_at_min5,
-                "n_exchanges": len(prices_at_min5),
+                "price_at_min1": price_at_min1,
+                "n_exchanges": len(prices_at_min1),
             })
             count += 1
 
