@@ -1674,6 +1674,24 @@ class KalshiDaemon:
         if not self.kalshi_client:
             return
 
+        # Check WebSocket fill events first (instant detection)
+        if self.kalshi_ws:
+            ws_fills = self.kalshi_ws.get_pending_fills()
+            for fill in ws_fills:
+                fill_ticker = fill.get("ticker", "")
+                for order in self._resting_orders:
+                    if order.get("ticker") == fill_ticker or order.get("order_id", "") in str(fill):
+                        asset = order.get("asset", "?")
+                        order["count"] = max(fill.get("count", 1), 1)
+                        order["needs_fill_check"] = False
+                        if asset in self._kalshi_pending_signals:
+                            self._kalshi_pending_signals[asset]["bet_placed"] = True
+                        print(colored(
+                            f"  [WS FILL] {asset} {order['side'].upper()} "
+                            f"x{order['count']} @ {order['fill_price']}c — filled via WebSocket!",
+                            "green",
+                        ))
+
         still_resting = []
         for order in self._resting_orders:
             order_id = order.get("order_id", "")
@@ -1681,22 +1699,25 @@ class KalshiDaemon:
             if not order_id or order_id == "?":
                 continue
 
+            # Already filled via WebSocket?
+            if order.get("count", 0) > 0 and not order.get("needs_fill_check", True):
+                continue  # already processed above
+
             try:
                 status = self.kalshi_client.get_order_status(order_id)
                 filled = float(status.get("fill_count_fp", 0))
                 order_status = status.get("status", "")
 
-                # CHECK FILLS FIRST — always accept a fill, even after minute 10
-                # (the order was placed during the valid window, the fill just took time)
-                if filled > 0 or order_status == "executed":
-                    fill_count = max(int(filled), 1)  # at least 1 if executed
+                # CHECK FILLS — accept fills at any time
+                if filled > 0 or order_status in ("executed", "filled"):
+                    fill_count = max(int(filled), 1)
                     order["count"] = fill_count
                     order["needs_fill_check"] = False
                     if asset in self._kalshi_pending_signals:
                         self._kalshi_pending_signals[asset]["bet_placed"] = True
                     print(colored(
                         f"  [RESTING FILL] {asset} {order['side'].upper()} "
-                        f"x{fill_count} @ {order['fill_price']}c — filled!",
+                        f"x{fill_count} @ {order['fill_price']}c — filled! (status={order_status})",
                         "green",
                     ))
                     continue  # don't add back to resting list
