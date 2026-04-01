@@ -1589,6 +1589,7 @@ class KalshiDaemon:
                     "count": count,
                     "cost_cents": cost,
                     "potential_profit_cents": potential_profit,
+                    "ticker": ticker,
                 })
                 self._session_bets_placed += 1
 
