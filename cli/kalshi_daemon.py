@@ -915,13 +915,25 @@ class KalshiDaemon:
         predictions = []
         actionable_signals = []
 
-        # Pre-fetch: Coinbase 1m (for snapshot/indicators) + multi-exchange price (for distance)
+        # Pre-fetch pricing and candle data
         _prefetched_1m = {}
         _prefetched_prices = {}  # Coinbase+Bitstamp average (matches training data)
-        if minute_in_window >= 1:  # only during CONFIRMED, not SETUP
-            from concurrent.futures import ThreadPoolExecutor
 
-            # Fetch Coinbase 1m candles for snapshot building
+        # Multi-exchange price ALWAYS needed (minute 0 AND later)
+        if self._brti_proxy is None:
+            from data.brti_proxy import BRTIProxy
+            self._brti_proxy = BRTIProxy()
+        brti_prices = self._brti_proxy.get_prices_batch(
+            [s.replace("/USDT", "/USD") for s in self.KALSHI_PAIRS]
+        )
+        for sym in self.KALSHI_PAIRS:
+            usd_sym = sym.replace("/USDT", "/USD")
+            if usd_sym in brti_prices:
+                _prefetched_prices[sym] = brti_prices[usd_sym]
+
+        # 1m candles only needed at minute 1+ (for snapshot building)
+        if minute_in_window >= 1:
+            from concurrent.futures import ThreadPoolExecutor
             def _fetch_1m(sym):
                 try:
                     return sym, self.fetcher.ohlcv(sym, "1m", limit=10)
@@ -931,22 +943,9 @@ class KalshiDaemon:
                 for sym, df in pool.map(lambda s: _fetch_1m(s), self.KALSHI_PAIRS):
                     if df is not None and not df.empty:
                         _prefetched_1m[sym] = df
-
-            # Multi-exchange price for distance_from_strike (matches training)
-            # Model was trained on Coinbase+Bitstamp 5m average
-            if self._brti_proxy is None:
-                from data.brti_proxy import BRTIProxy
-                self._brti_proxy = BRTIProxy()
-            brti_prices = self._brti_proxy.get_prices_batch(
-                [s.replace("/USDT", "/USD") for s in self.KALSHI_PAIRS]
-            )
-            for sym in self.KALSHI_PAIRS:
-                usd_sym = sym.replace("/USDT", "/USD")
-                if usd_sym in brti_prices:
-                    _prefetched_prices[sym] = brti_prices[usd_sym]
-                elif sym in _prefetched_1m:
-                    # Fallback to Coinbase if multi-exchange fails
-                    _prefetched_prices[sym] = float(_prefetched_1m[sym].iloc[-1]["close"])
+                        # Fallback price from 1m if BRTI failed
+                        if sym not in _prefetched_prices:
+                            _prefetched_prices[sym] = float(df.iloc[-1]["close"])
 
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
             asset = symbol.split("/")[0]
