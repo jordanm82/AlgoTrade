@@ -15,7 +15,7 @@ DISTANCE_BINS = [-3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.5, 
 TIME_BINS = [14, 12, 10, 8, 6, 4, 2]
 
 EDGE_MARGIN = 0.02    # require 2% edge over implied contract price
-MAX_BET_PRICE = 60    # max entry — stop loss at 50% caps downside to 30c
+MAX_BET_PRICE = 50    # max entry — place at 50c and wait for market to come to us
 
 
 @dataclass
