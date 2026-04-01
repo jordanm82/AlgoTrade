@@ -982,12 +982,11 @@ class KalshiDaemon:
                 continue
 
             # Lifecycle:
-            # Min 0:     CONFIRMED — bet immediately at window open (contracts ~50c)
-            # Min 1-4:   MONITORING — stop loss active, watch for fills
+            # Min 0-4:   CONFIRMED — bet at window open, retry if missed
             # Min 5:     CONFIRMATION — recheck with 5m distance, exit if against us
             # Min 6-9:   MONITORING — hold or already exited
             # Min 10+:   SETTLING — cancel unfilled, await settlement
-            if minute_in_window == 0 and not (pending and pending.get("bet_placed")):
+            if minute_in_window <= 4 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
             elif minute_in_window == 5 and pending and pending.get("bet_placed"):
                 state = "CONFIRMATION"
