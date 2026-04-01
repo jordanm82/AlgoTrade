@@ -813,9 +813,12 @@ class RichDashboard:
                     if self.arb_mode:
                         should_eval = time_since_eval >= 50
                     else:
-                        entry_trigger = (min_in == 0 and sec_in >= 3 and time_since_eval >= 5)
-                        confirm_trigger = (min_in == 5 and sec_in >= 5 and time_since_eval >= 5)
-                        normal_trigger = (min_in >= 1 and time_since_eval >= 50)
+                        # Entry: every 5s during min 0-4 until bet placed
+                        # Confirm: every 5s at min 5
+                        # Normal: every 50s for monitoring
+                        entry_trigger = (min_in <= 4 and time_since_eval >= 5)
+                        confirm_trigger = (min_in == 5 and time_since_eval >= 5)
+                        normal_trigger = (min_in >= 6 and time_since_eval >= 50)
                         should_eval = entry_trigger or confirm_trigger or normal_trigger
 
                     if should_eval:

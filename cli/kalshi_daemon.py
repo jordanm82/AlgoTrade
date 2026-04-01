@@ -2191,9 +2191,17 @@ class KalshiDaemon:
         min_in_window = now_utc.minute % 15
         sec_in = now_utc.second
         time_since = now - self._last_kalshi_eval
-        entry_trigger = (min_in_window == 0 and sec_in >= 3 and time_since >= 5)
-        confirm_trigger = (min_in_window == 5 and sec_in >= 5 and time_since >= 5)
-        normal_trigger = (min_in_window >= 1 and time_since >= 50)
+        # Entry: retry every 5s during min 0-4 until bet placed
+        # Confirm: retry every 5s at min 5 until confirmed
+        # Normal: every 50s for monitoring
+        has_pending = any(
+            p.get("bet_placed") and p.get("window_start") == datetime.now(timezone.utc).replace(
+                minute=now_utc.minute - min_in_window, second=0, microsecond=0, tzinfo=timezone.utc)
+            for p in self._kalshi_pending_signals.values()
+        ) if self._kalshi_pending_signals else False
+        entry_trigger = (min_in_window <= 4 and not has_pending and time_since >= 5)
+        confirm_trigger = (min_in_window == 5 and time_since >= 5)
+        normal_trigger = (min_in_window >= 6 and time_since >= 50)
         should_eval = entry_trigger or confirm_trigger or normal_trigger
         if should_eval:
             try:
