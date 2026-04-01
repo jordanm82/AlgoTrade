@@ -179,7 +179,22 @@ class KalshiDaemon:
             if not markets:
                 return None, None, None
 
-            m = markets[0]
+            # Only consider markets whose close_time is in the future
+            # (prevents using a just-settled market that Kalshi hasn't transitioned yet)
+            now_utc = datetime.now(timezone.utc)
+            future_markets = []
+            for mk in markets:
+                ct = mk.get("close_time", "")
+                if ct and "T" in ct:
+                    close_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                    if close_dt > now_utc:
+                        future_markets.append(mk)
+            if not future_markets:
+                return None, None, None
+
+            # Pick the soonest future market
+            future_markets.sort(key=lambda x: x.get("close_time", "9999"))
+            m = future_markets[0]
             strike = m.get("floor_strike")
             ticker = m.get("ticker", "")
             ct = m.get("close_time") or m.get("expiration_time", "")
