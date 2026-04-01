@@ -11,306 +11,140 @@ Read this file completely before every trading session. It is your operational c
 - Never write `if X is None: use Y` where Y is a different data source
 - The only acceptable fallback is "do nothing" (skip), NEVER "do the wrong thing"
 
+**TRAINING/LIVE PARITY IS SACRED.** Every data path in live must exactly match training:
+- Same price source (Coinbase+Bitstamp average for distance, NOT Coinbase-only)
+- Same timing (minute 0 in both training and live, NOT minute 5 for training and minute 0 for live)
+- Same labels (Kalshi settlement results, NOT Coinbase candle direction)
+- Same strike source (Kalshi floor_strike, NOT Coinbase candle open)
+- If you change ANY data path in live, you MUST retrain the model to match
+
 ## System Overview
 
-You are the AI decision engine for an automated crypto trading system. You interact with it via **MCP tools** (`algotrade_*`) — no bash commands needed. The system trades on two exchanges: **Coinbase** (spot crypto) and **Kalshi** (15-minute prediction markets). Each exchange is its own source of truth for orders, positions, and balances.
-
-**Your role:** Monitor via MCP tools, understand what the strategies are doing, intervene when context demands it, and make judgment calls the mechanical system cannot.
-
-## MCP Tools (Primary Interface)
-
-You have 24 tools registered via `.claude/mcp.json`. Use these instead of bash commands:
-
-**Session Management:**
-- `algotrade_start` — start live or dry-run (mode, cycles)
-- `algotrade_stop` — graceful stop
-- `algotrade_force_kill` — SIGKILL when stop doesn't work
-- `algotrade_status` — full dashboard state + daemon process status
-
-**Account & Positions:**
-- `algotrade_balances` — Coinbase + Kalshi balances with USD token valuations
-- `algotrade_positions` — open positions with live P&L
-- `algotrade_performance` — session stats (win rate, P&L, trades)
-- `algotrade_trade_history` — recent trade records
-
-**Trading:**
-- `algotrade_buy` — spot buy on Coinbase (symbol, usd_amount)
-- `algotrade_sell` — spot sell on Coinbase (symbol, amount or sell_all)
-- `algotrade_close_all` — exit everything on both platforms
-- `algotrade_kalshi_bet` — place a 15-min prediction bet (asset, side, amount_usd)
-- `algotrade_kalshi_markets` — list available 15-min contracts with prices
-
-**Market Data:**
-- `algotrade_ticker` — current price for any pair
-- `algotrade_indicators` — RSI, BB, MACD, ATR for any pair + timeframe
-- `algotrade_orderbook` — order book imbalance, spread, wall detection
-- `algotrade_tradeflow` — net flow, buy ratio, large trade bias
-- `algotrade_funding_rates` — perp funding rates
-- `algotrade_signals` — all signals firing RIGHT NOW with confidence scores
-
-**Analysis & Config:**
-- `algotrade_backtest` — run a quick backtest (pair, strategy, timeframe, days)
-- `algotrade_logs` — view recent daemon stdout
-- `algotrade_errors` — scan logs for errors/warnings/failures/blocks
-- `algotrade_config_get` — all current settings
-- `algotrade_config_set` — adjust thresholds, toggle pairs live
+Automated crypto trading system. Two exchanges: **Coinbase** (spot crypto) and **Kalshi** (15-minute prediction markets). Interact via **MCP tools** (`algotrade_*`).
 
 ## Architecture
 
 ```
-mcp_server.py             — MCP server (24 tools, stdio transport)
-.claude/mcp.json          — MCP server registration
-dashboard.py              — runs the daemon + prints status every 1 min
-cli/live_daemon.py        — production daemon (BB Grid + RSI MR on 15m + Kalshi)
-exchange/coinbase.py      — Coinbase Advanced Trade execution (source of truth for spot)
-exchange/kalshi.py        — Kalshi REST client (source of truth for predictions)
-exchange/positions.py     — position tracker with persistence + profit taking
-data/fetcher.py           — BinanceUS (market data via CCXT)
-data/market_data.py       — order book imbalance + trade flow (leading indicators)
-data/indicators.py        — RSI, BB, MACD, ATR, EMA (lagging indicators)
-data/store.py             — parquet OHLCV, CSV trades, JSON snapshots
-strategy/strategies/      — BB Grid, RSI MR, SMA Crossover, Funding Arb, Kalshi Predictor
-strategy/compound_backtest.py — backtester with compounding, long/short, leverage
-config/pair_config.py     — per-pair optimized thresholds (from 6-month parameter sweep)
-config/settings.py        — risk limits
-config/production.py      — production settings
+dashboard_rich.py         — Rich terminal dashboard (primary UI)
+cli/kalshi_daemon.py      — Kalshi K15 prediction daemon (minute-0 entry + active management)
+exchange/kalshi.py        — Kalshi REST client
+exchange/kalshi_ws.py     — Kalshi WebSocket (real-time contract prices + fill detection)
+data/fetcher.py           — Coinbase via CCXT (market data)
+data/brti_proxy.py        — Coinbase+Bitstamp averaged price (BRTI proxy)
+data/brti_display.py      — CF Benchmarks scrape (dashboard display only, NOT for trading)
+data/indicators.py        — RSI, BB, MACD, ATR, EMA
+strategy/strategies/kalshi_predictor_v3.py — Strike-relative LogReg model
+strategy/snapshot.py      — Minute-3 snapshot builder
+config/settings.py        — API keys, risk limits
+config/production.py      — Production settings
+models/knn_kalshi.pkl     — Trained model (LogReg, strike-relative)
 ```
 
-## Exchange Source of Truth
+## Kalshi K15 UpDown Strategy (V3)
 
-**Coinbase is source of truth for all spot orders:**
-- Before selling: query `get_token_balance()` for actual amount, sell that
-- After buying: verify `get_token_balance()` that tokens arrived
-- Stop-loss/TP sell: query real balance, not tracker estimate
-- Position reconciliation: every signal cycle, compare tracker vs exchange
+### Model — Strike-Relative LogReg
 
-**Kalshi is source of truth for all prediction bets:**
-- Before betting: verify `get_balance()` for available funds
-- After betting: check `get_order_status()` and `get_positions()` for fills
-- Balance checks: always from `get_balance()`, never internal tracking
+Predicts the actual Kalshi question: "Will price close above strike?"
 
-## Strategies
+**Training data sources (must match live exactly):**
+- **Labels:** Kalshi settled market result (yes/no) — ground truth
+- **Strike:** Kalshi floor_strike — actual settlement strike
+- **Price at minute 0:** Coinbase + Bitstamp 5m candle OPEN averaged
+- **Indicators:** Coinbase 15m/1h/4h candles
+- **Training script:** `./venv/bin/python scripts/retrain_kalshi_labels.py`
+- **Backtest script:** `./venv/bin/python scripts/backtest_kalshi_labels.py --days 30`
+- Auto-triggered on daemon startup when model > 7 days old
 
-### Strategy 1: BB Grid Long+Short (per-pair optimized)
+**13 features:**
+- `rsi_1h` (#1, +0.66) — hourly momentum direction
+- `price_vs_ema` (#2, -0.39) — trend position
+- `distance_from_strike` (#3, +0.29) — price vs strike at decision time
+- Plus: macd_15m, norm_return, ema_slope, roc_5, macd_1h, hourly_return, trend_direction, vol_ratio, adx, rsi_4h
 
-Buys when price < BB lower AND RSI < threshold. Exits when price > BB middle. Each pair has individually tuned thresholds from 6-month parameter sweep.
+**Walk-forward validated:** 64% WR at minute 0, 0 losing days over 30 days on Kalshi ground truth.
 
-**Tiered leverage (data-driven from 6-month backtest):**
+### Execution Lifecycle — Minute-0 Entry + Active Management
 
-| Pair | Leverage | BB Buy < | BB Short > | 6mo WR | 6mo Return |
-|------|----------|----------|------------|--------|------------|
-| ATOM | **3x** | 38 | 62 | 88.4% | +1812% |
-| DOT | **3x** | 38 | 62 | 76.4% | +200% |
-| LTC | **3x** | 38 | 62 | 76.1% | +156% |
-| FIL | 2x | 38 | 62 | 71.5% | +325% |
-| UNI | 2x | 38 | 62 | 67.6% | +76% |
-| SHIB | 2x | 38 | 62 | 74.4% | +54% |
+| Time | State | Action |
+|------|-------|--------|
+| :00:03 | CONFIRMED | Bet immediately at window open (contracts ~50c) |
+| :00-:04 | MONITORING | Stop loss active (50% of entry, checked every 15s) |
+| :05:05 | CONFIRMATION | Recheck with 5m distance — hold or exit |
+| :06-:09 | MONITORING | Holding confirmed position or already exited |
+| :10+ | SETTLING | Cancel unfilled orders, await settlement |
 
-### Strategy 2: RSI Mean Reversion Long+Short
+**Stop loss:** 50% of entry price. Entry at 60c → stop at 30c. Checked every 15 seconds via WebSocket contract prices.
 
-| Pair | Leverage | Oversold | Overbought | 6mo WR | 6mo Return |
-|------|----------|----------|------------|--------|------------|
-| SOL | 2x | 32 | 73 | 67.6% | +2.2% |
-| AVAX | 2x | 28 | 70 | 69.1% | +6.2% |
+**Minute-5 confirmation:** Recompute model with actual distance_from_strike (price has moved by now). If market turned against us (> 0.1 ATR wrong direction) → sell position and cancel resting orders. If confirms → hold to settlement.
 
-### Strategy 3: Kalshi 15-Minute Predictions
+### Price Feeds (CRITICAL — must match training)
 
-Three predictor versions available via `--predictor v1|v2|v3`:
+| Purpose | Source | Notes |
+|---------|--------|-------|
+| **Model input** | Coinbase+Bitstamp avg via CCXT | MUST match training. ~$5 from BRTI |
+| **Dashboard PRICE column** | CF BRTI scrape | Display only, NOT for trading decisions. May be 30-60s stale |
+| **Contract prices** | Kalshi WebSocket | Real-time YES/NO bid/ask. Used for stop loss + fill detection |
+| **Strike** | Kalshi REST API (floor_strike) | Filtered to future markets only (prevents stale window match) |
 
-**V3 (recommended) — Strike-Relative + KNN Hybrid Model:**
+**WARNING:** CF Benchmarks SSR scrape is NOT real-time. Never use for model input — caused 25% WR in live when used for distance calculation.
 
-Two-factor prediction: **LR (LogReg)** for direction + **TEK (probability table)** for confirmation.
+### Betting Rules
 
-**Strike-Relative Model — predicts the actual Kalshi question:**
-- Single LogReg model answering: "Will price close above strike?"
-- **Key feature**: `distance_from_strike` (price at minute 5 vs strike, in ATR units) — coefficient +1.41
-- This is a CONTINUATION predictor: price above strike → stays above, below → stays below
-- NOT mean-reversion — doesn't rely on RSI for direction
-- 13 features: MACD, norm_return, ema_slope, roc_5, macd_1h, price_vs_ema, hourly_return, trend_direction, vol_ratio, adx, rsi_1h, rsi_4h, distance_from_strike
-- Walk-forward validated: **74.8% WR** on 30-day out-of-sample, **0 losing days**
-- Balanced YES:NO ratio of 0.9:1 — predicts BOTH sides in any market
-- Retrained via `scripts/retrain_strike_relative.py`
+- Max entry price: **60c** (stop loss caps downside to 30c)
+- Position sizing: **flat 5% of balance** per bet (CLI: `--maxsize=N`)
+- Max concurrent bets: **configurable** (CLI: `--maxbets=N`, default 3)
+- Highest confidence signals get priority when slots limited
+- **No Kelly sizing, no tiered sizing** — consistent risk every bet
 
-**TEK — Probability Table Confluence (filter):**
-- Pre-computed 2D probability table (distance_ATR × time_remaining)
-- Built from historical 1m data: `./venv/bin/python scripts/build_prob_table.py --days 90`
-- At minute 5: uses actual Coinbase price vs Kalshi strike to compute distance
-- Called with `force_table=True` to ensure table lookup (not another LR prediction)
-- Adds +17pp WR by filtering bets where price hasn't moved to confirm LR direction
-- Technical adjustments: OB (±5%), trade flow (±5%), 1h trend (±5%), MACD (+3%), RSI extreme (-8%), RSI divergence (-8%), momentum gate (-15%)
+### Key Files
 
-**Bet decision (2-factor gate):**
-- LR predicts direction: YES when prob >= 55%, NO when prob <= 45%
-- TEK confirms: probability table score >= 30% for predicted side
-- Both must agree for bet execution
-- **Bets BOTH sides** — YES and NO
-- Edge margin: 2c minimum edge over implied contract price
-- Max contract price: 85c hard cap
-- Price source: Coinbase (closest to CF Benchmarks BRTI settlement)
+| File | Purpose |
+|------|---------|
+| `scripts/retrain_kalshi_labels.py` | Retrain model (Kalshi labels + multi-exchange price) |
+| `scripts/backtest_kalshi_labels.py` | Backtest with same data sources as training |
+| `data/store/trade_debug.jsonl` | Order lifecycle debug log (market select, fills, settlements) |
+| `data/store/feature_log.jsonl` | Model prediction feature audit log |
+| `models/knn_kalshi.pkl` | Trained model (auto-retrains when > 7 days old) |
 
-**Position sizing:** Flat 5% of Kalshi balance per bet, every bet. No Kelly, no tiered sizing. Consistent risk regardless of confidence level.
+### Running
 
-**Evaluation lifecycle (wall-clock aligned at :01, :06, :11, :12):**
-- **SETUP (min 0-4):** Score direction. No betting.
-- **OBSERVING (min 5-9):** Re-score with fresh data. No betting.
-- **CONFIRMED (min 10-11):** Place bets if signal is strong.
-- **LAST_LOOK (min 12):** Final chance, elevated threshold.
-- **SETTLING (min 13+):** Bets awaiting settlement.
+```bash
+# Dry-run (simulated bets, real market data)
+python dashboard_rich.py --dry-run
 
-**Settlement tracking:** Queries Kalshi API for authoritative settlement results (not approximated from price data). Tracks W/L/WR and P&L for both dry-run and live modes.
+# Live (real money)
+python dashboard_rich.py --live --maxbets=1 --maxsize=2.5
 
-**Model refresh:**
-- Strike-relative model: `./venv/bin/python scripts/retrain_strike_relative.py --days 179`
-  - Trains on 120 days oldest data, validates on 59 days newest
-  - Key feature: distance_from_strike (continuation predictor)
-  - Auto-triggered on daemon startup when model > 7 days old
-- Probability table: `./venv/bin/python scripts/build_prob_table.py --days 90`
-- Refresh weekly/monthly to stay current with market regime
+# Demo (Kalshi demo exchange — tests order plumbing only, NOT model)
+python dashboard_rich.py --demo
+```
 
-**Series tickers:** `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`, `KXBNB15M`
+**WARNING:** Demo exchange has no real liquidity and prices don't track live. Only useful for testing order lifecycle, NOT for validating predictions.
 
-**V1 — Mean-Reversion (legacy, 63% WR):** Original predictor. 14 scoring components + 3 filters. Still functional via `--predictor v1`.
+### Series Tickers
+`KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`
 
-**V2 — Continuation (shelved, 46% WR):** Trend-following approach. Proved that continuation signals don't predict 15m direction. Available via `--predictor v2` but not recommended.
-
-**Betting rules:**
-- Per-asset thresholds (above) — not a single global threshold
-- **Hard 50c entry cap** — never pay above 50c (R:R would be < 1:1)
-- Hold to settlement — entry price IS total risk per contract
-- Sizing: risk budget = 5% of Kalshi balance, count = budget / entry_price
-- Pricing: query orderbook, bid between bid and ask based on spread width
-- **Max 3 concurrent Kalshi bets** (separate from spot position limit)
-- Priority: highest confidence signals first when slots are limited
-
-**Payout structure (hold to settlement):**
-
-| Entry | Risk per contract | Profit if win | R:R |
-|-------|-------------------|---------------|-----|
-| 30c | $0.30 | $0.70 | 2.3:1 |
-| 40c | $0.40 | $0.60 | 1.5:1 |
-| 50c | $0.50 | $0.50 | 1:1 |
-| >50c | SKIP | — | <1:1 |
-
-**API:** `https://api.elections.kalshi.com` (RSA-PSS auth, no newlines in signature, DIGEST_LENGTH salt)
-
-### Disabled Pairs (net negative in 6-month backtest)
-BTC, ETH, XRP, DOGE, ADA, LINK — disabled from Coinbase trading but BTC/ETH/SOL/XRP/BNB data still fetched for Kalshi predictions.
-
-## Risk Controls (Hardcoded)
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Position size | 10% of current equity | Compounds as equity grows |
-| Max leverage | 3x on ATOM/DOT/LTC, 2x on rest | Per-pair from backtest |
-| Max concurrent positions | 3 | Highest confidence takes priority |
-| Max concurrent Kalshi bets | 3 | Separate from spot limit, confidence-ranked |
-| Stop-loss | 3% from entry | Enforced every 1 minute |
-| Daily drawdown halt | 5% | All trading stops |
-| Min balance | $10 | Lowered from $100 for small accounts |
-| Kalshi max entry | 50c | Never pay above 50c (R:R < 1:1) |
-| Kalshi risk per bet | 5% of balance | ~$4-5 per bet |
-
-## Leading Indicator Gate
-
-Every BUY and SHORT signal is validated against real-time order book and trade flow before execution:
-
-- **BLOCKED** if order book imbalance AND trade flow strongly contradict the signal direction
-- **CONFIRMED** if both align with the signal
-- **NEUTRAL** otherwise (proceed)
-- Close signals are NEVER blocked — always let exits execute
-- If data fetch fails, trade proceeds (fail-open)
-
-This prevented us from buying ATOM during active selling (flow=-0.53) — the position would have been underwater.
-
-## Profit Taking & Trailing Stops
-
-Positions have automatic profit-taking built into the PositionTracker:
-- **+10% gain** → sell 25% of position
-- **+20% gain** → sell another 25%
-- **Remaining 50%** → trailing stop at 5% below peak price, OR RSI exit signal
-- Trailing stop activates after first TP level hit
-
-## Position Persistence
-
-Positions survive daemon restarts:
-- Saved to `data/store/positions.json` on every open/close/reduce
-- Loaded on startup
-- Exchange sync on startup: queries Coinbase balances and Kalshi positions for any untracked holdings
-- Reconciliation every signal cycle: warns if tracker and exchange disagree
+### Settlement
+- Settles on **CF Benchmarks BRTI** — 60-second VWAP across Coinbase, Kraken, Bitstamp, Gemini, etc.
+- Settlement check runs every 15 seconds with 15-second buffer after close_time
+- Queries Kalshi `get_markets(status="settled")` for authoritative result
+- Unfilled orders removed without W/L count
 
 ## Accounts
 
 | Account | Purpose | Auth |
 |---------|---------|------|
-| **Coinbase** | Spot crypto trading | CDP API key (`cdp_api_key.json`) |
-| **Kalshi** | 15-min prediction markets | RSA key (`KalshiPrimaryKey.txt`, API key ID in settings.py) |
+| **Coinbase** | Spot crypto + market data via CCXT | CDP API key (`cdp_api_key.json`) |
+| **Kalshi** | K15 prediction markets | RSA key (`KalshiPrimaryKey.txt`, key ID in settings.py) |
+| **Kalshi Demo** | Order lifecycle testing | RSA key (`KalshiDemoKeys.txt`, first line = API key ID) |
 
-**Note:** Coinbase perp trading returns 403 (Permission Denied) — account doesn't have perp access enabled. Short signals on Coinbase will fail. Only long (spot buy) trades execute on Coinbase. Kalshi is where we take directional short bets.
+## Lessons Learned (from this session)
 
-## Monitoring
-
-Use MCP tools for monitoring — no bash commands or sleep needed:
-- `algotrade_status` — read dashboard state instantly
-- `algotrade_balances` — both account balances
-- `algotrade_positions` — open positions with P&L
-- `algotrade_errors` — scan for issues
-- `algotrade_logs` — raw daemon output
-
-**Monitoring cadence:**
-- Active management: check `algotrade_status` every few minutes
-- Passive: let daemon run, check `algotrade_performance` periodically
-- After issues: check `algotrade_errors` then `algotrade_logs`
-
-## When to Intervene
-
-### Let the system trade when:
-- RSI is in normal signal zones (25-38 for buys, 62-75 for shorts, per pair)
-- Market is RANGING (regime indicator)
-- Win rate above 60%
-- Leading indicators not contradicting
-
-### Override or pause when:
-- **BTC dumps >5% in 1 hour** — all alts follow, skip buy signals
-- **Win rate below 50%** — regime shift from ranging to trending
-- **Multiple positions all losing** — correlation risk, close weakest
-- **RSI stays below 20 or above 80 for multiple candles** — trending, not reverting
-- **Leading indicators show heavy selling on ALL pairs** — market-wide selloff
-
-### How to intervene:
-1. `algotrade_stop` or `algotrade_force_kill`
-2. `algotrade_sell` or `algotrade_close_all`
-3. `algotrade_start` to restart
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `data/store/dashboard.log` | Latest dashboard frame |
-| `data/store/trades.csv` | All trade history |
-| `data/store/positions.json` | Persisted open positions |
-| `data/store/snapshots/` | JSON snapshots every 15 min |
-| `/tmp/dashboard_stdout.log` | Daemon stdout/stderr |
-| `/tmp/dashboard_pid.txt` | Running daemon PID |
-| `config/pair_config.py` | Per-pair thresholds (editable) |
-
-## Known Limitations
-
-1. **Mean reversion fails in strong trends.** Designed for ranging/choppy markets.
-2. **Coinbase perps return 403** — no short execution via Coinbase. Use Kalshi for directional down bets.
-3. **Synced positions use current price as entry** — P&L may be under-reported for positions opened before a restart.
-4. **BinanceUS data, Coinbase execution** — minor price differences possible.
-5. **15m timeframe** — signals happen every few hours, not minutes. Be patient.
-6. **Kalshi 15-min contracts** — thin liquidity on some assets. Wide spreads mean our smart pricing helps but fills aren't guaranteed.
-
-## Session Checklist
-
-Before every trading session:
-- [ ] Read this file
-- [ ] `algotrade_balances` — check both accounts
-- [ ] `algotrade_errors` — any issues from last session?
-- [ ] `algotrade_trade_history` — review recent trades
-- [ ] `algotrade_signals` — what's firing right now?
-- [ ] `algotrade_start` with dry-run for 1 cycle to confirm
-- [ ] Switch to live when confident
-- [ ] Monitor with `algotrade_status` periodically
-- [ ] After session: `algotrade_performance` for review
+- **Train/live parity is everything.** If training uses 5m data at minute 5 but live decides at minute 1, WR drops from 75% to 54%. ALWAYS verify the exact same data path.
+- **Price source matters.** Coinbase-only vs Coinbase+Bitstamp shifts distances enough to change predictions. The model MUST use the same price source as training.
+- **Stale data kills WR.** CF Benchmarks SSR scrape was minutes stale — caused 25% WR in live. Use live API calls, never cached page data for trading decisions.
+- **Fill timing is critical.** By minute 3-5, K15 contracts are already 70-90c. Minute 0 entry gets fills at ~50c.
+- **Stop loss requires ticker field.** Dry-run bets must include `ticker` in the bet dict or stop loss silently skips them.
+- **Kalshi market transitions take seconds.** At window boundary, query for future markets only (close_time > now) to avoid betting on the just-settled window.
+- **Resting order cancel needs backstop.** Eval cycle is 50s — can miss minute 10. Dashboard 15s cycle is the guaranteed cancel path.
+- **Demo exchange can't validate predictions.** Same strikes/settlements as production, but no real liquidity. Only tests order plumbing.
