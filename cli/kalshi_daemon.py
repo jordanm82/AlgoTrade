@@ -1009,9 +1009,12 @@ class KalshiDaemon:
         # Pandas-compatible timestamp for DataFrame index comparisons
         current_window_start_pd = pd.Timestamp(current_window_start.replace(tzinfo=None))
 
-        # Re-subscribe WebSocket to new markets at window boundary
-        if minute_in_window == 0 and self.kalshi_ws:
-            self._ws_subscribe_current_markets()
+        # At window boundary: refresh 15m/1h/4h data + re-subscribe WebSocket
+        if minute_in_window <= 1 and not self._kalshi_cached_dataframes.get("_refreshed_" + str(current_window_start)):
+            self._fetch_all()
+            self._kalshi_cached_dataframes["_refreshed_" + str(current_window_start)] = True
+            if self.kalshi_ws:
+                self._ws_subscribe_current_markets()
 
         # Prune active bets — clear at window boundary so new window can bet immediately
         now_ts = time.time()
