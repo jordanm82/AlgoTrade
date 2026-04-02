@@ -701,10 +701,11 @@ class KalshiDaemon:
                 pass
 
             try:
-                # Market sell — we want OUT immediately, not another resting order
+                # Sell at the current bid — fills immediately at best available price
                 result = self.kalshi_client.place_order(
                     ticker=ticker, side=side, count=count,
-                    order_type="market",
+                    price_cents=max(1, sell_price),
+                    order_type="limit",
                     action="sell",
                 )
                 order = result.get("order", {})
