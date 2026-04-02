@@ -1276,8 +1276,15 @@ class KalshiDaemon:
                     close_time_dt = pending.get("close_time") if pending else None
 
                     if not strike:
-                        # No SETUP ran — query Kalshi for strike (late start)
+                        # No SETUP ran — query Kalshi for strike
                         strike, close_time_dt, _ = self._get_kalshi_strike(series_ticker)
+
+                    if not strike and state == "CONFIRMED":
+                        # Log when we can't find a market — helps debug missed windows
+                        if minute_in_window <= 1:
+                            print(colored(
+                                f"  [WAIT] {asset}: no Kalshi market yet (min {minute_in_window})",
+                                "dark_grey"))
 
                     if strike and close_time_dt:
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
