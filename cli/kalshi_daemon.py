@@ -940,8 +940,9 @@ class KalshiDaemon:
         if self._resting_orders and minute_in_window >= 1:
             self._check_resting_orders()
 
-        # Minute 5 and 10 confirmation — recheck positions with 5m candle closes
-        if minute_in_window in (5, 10):
+        # Minute 10 confirmation — recheck positions with 5m candle close
+        # (minute 5 disabled for A/B testing — may re-enable later)
+        if minute_in_window == 10:
             self._confirm_with_distance(minute_in_window)
 
         # Settlement check moved to dashboard refresh cycle (every 15s)
@@ -1053,14 +1054,14 @@ class KalshiDaemon:
 
             # Lifecycle:
             # Min 0-4:   CONFIRMED — bet at window open, retry if missed
-            # Min 5:     CONFIRMATION — recheck with 5m candle close, exit if model flipped
-            # Min 6-9:   MONITORING — hold position
+            # Min 0-4:   CONFIRMED — bet at window open
+            # Min 5-9:   MONITORING — hold position (min 5 exit disabled for testing)
             # Min 10:    CONFIRMATION — recheck with 10m candle close, exit if model flipped
             # Min 11+:   SETTLING — cancel unfilled, await settlement
             if minute_in_window <= 4 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
-            elif minute_in_window == 5 and pending and pending.get("bet_placed") and not pending.get("confirmed_5m"):
-                state = "CONFIRMATION"
+            # elif minute_in_window == 5 and pending and pending.get("bet_placed") and not pending.get("confirmed_5m"):
+            #     state = "CONFIRMATION"  # disabled — A/B testing 10m only
             elif minute_in_window == 10 and pending and pending.get("bet_placed") and not pending.get("confirmed_10m"):
                 state = "CONFIRMATION"
             else:
@@ -2276,8 +2277,8 @@ class KalshiDaemon:
             for p in self._kalshi_pending_signals.values()
         ) if self._kalshi_pending_signals else False
         entry_trigger = (min_in_window <= 4 and not has_pending and time_since >= 5)
-        confirm_trigger = (min_in_window in (5, 10) and time_since >= 5)
-        normal_trigger = (min_in_window >= 6 and min_in_window != 10 and time_since >= 50)
+        confirm_trigger = (min_in_window == 10 and time_since >= 5)  # min 5 disabled for testing
+        normal_trigger = (min_in_window >= 5 and min_in_window != 10 and time_since >= 50)
         should_eval = entry_trigger or confirm_trigger or normal_trigger
         if should_eval:
             try:
