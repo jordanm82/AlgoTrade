@@ -566,9 +566,9 @@ class KalshiDaemon:
                 self.kalshi_predictor._knn_scaler.transform(X))[0][1])
             pct = int(prob * 100)
 
-            # Did the model flip? (we bet YES but model now says NO, or vice versa)
+            # Did the model change? Exit if it flipped OR lost confidence (went to SKIP)
             model_side = "yes" if pct >= 55 else "no" if pct <= 45 else "skip"
-            flipped = (side == "yes" and model_side == "no") or (side == "no" and model_side == "yes")
+            flipped = (side != model_side)  # exit if model no longer agrees with our bet
 
             dir_label = "YES" if side == "yes" else "NO"
 
