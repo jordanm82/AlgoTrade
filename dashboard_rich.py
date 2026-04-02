@@ -817,8 +817,8 @@ class RichDashboard:
                         # Confirm: every 5s at min 5
                         # Normal: every 50s for monitoring
                         entry_trigger = (min_in <= 4 and time_since_eval >= 5)
-                        confirm_trigger = (min_in == 5 and time_since_eval >= 5)
-                        normal_trigger = (min_in >= 6 and time_since_eval >= 50)
+                        confirm_trigger = (min_in in (5, 10) and time_since_eval >= 5)
+                        normal_trigger = (min_in >= 6 and min_in != 10 and time_since_eval >= 50)
                         should_eval = entry_trigger or confirm_trigger or normal_trigger
 
                     if should_eval:

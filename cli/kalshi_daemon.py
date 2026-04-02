@@ -473,37 +473,39 @@ class KalshiDaemon:
                 # STOP LOSS HIT — sell
                 self._exit_position(bet, current_price, "STOP LOSS")
 
-    def _confirm_at_minute5(self):
-        """At minute 5, recheck with distance data. Exit if market is against us."""
+    def _confirm_with_distance(self, minute: int):
+        """At minute 5 and 10, recheck with distance data. Exit if model flipped."""
         if not self._pending_bets:
             return
 
-        now_utc = datetime.now(timezone.utc)
+        checkpoint = f"{minute}m"
+        flag_key = f"confirmed_{checkpoint}"
+
+        # Get fresh multi-exchange prices
+        if self._brti_proxy is None:
+            from data.brti_proxy import BRTIProxy
+            self._brti_proxy = BRTIProxy()
 
         for bet in list(self._pending_bets):
             if bet.get("result") or bet.get("count", 0) <= 0:
                 continue
+            if bet.get(flag_key):
+                continue  # already checked at this checkpoint
 
             asset = bet.get("asset", "?")
             side = bet.get("side", "yes")
             symbol = bet.get("symbol", "")
             strike = bet.get("strike", 0)
             ticker = bet.get("ticker", "")
-            entry = bet.get("contract_price", bet.get("fill_price", 0))
 
             if not strike or not symbol:
                 continue
 
-            # Get current price from multi-exchange
-            if self._brti_proxy is None:
-                from data.brti_proxy import BRTIProxy
-                self._brti_proxy = BRTIProxy()
             usd_sym = symbol.replace("/USDT", "/USD")
             current_crypto = self._brti_proxy.get_price(usd_sym)
             if not current_crypto:
                 continue
 
-            # Compute distance from strike
             df_15m = self._kalshi_cached_dataframes.get(symbol)
             if df_15m is None or len(df_15m) < 5:
                 continue
@@ -513,21 +515,70 @@ class KalshiDaemon:
 
             distance = (current_crypto - strike) / atr
 
-            # Check: is the market going AGAINST our bet?
-            against = False
-            if side == "yes" and distance < -0.1:
-                against = True  # we bet YES but price dropped well below strike
-            elif side == "no" and distance > 0.1:
-                against = True  # we bet NO but price rose well above strike
+            # Re-run the model with actual distance to see if prediction changed
+            # Build features from cached indicators + real distance
+            prev = df_15m.iloc[-1]
+            sma_val = float(prev.get("sma_20", 0))
+            adx_val = float(prev.get("adx", 20))
+            close_val = float(prev.get("close", 0))
+            ts_sign = (1 if close_val >= sma_val else -1) if sma_val > 0 else 0
+            pve = float(prev.get("price_vs_ema", 0)) if pd.notna(prev.get("price_vs_ema")) else 0
+            hr = float(prev.get("hourly_return", 0)) if pd.notna(prev.get("hourly_return")) else 0
 
-            if against:
-                # Get current contract bid to decide sell price
+            import numpy as np
+            feat = {
+                "macd_15m": float(prev.get("macd_hist", 0)),
+                "norm_return": float(prev.get("norm_return", 0)) if pd.notna(prev.get("norm_return")) else 0,
+                "ema_slope": float(prev.get("ema_slope", 0)) if pd.notna(prev.get("ema_slope")) else 0,
+                "roc_5": float(prev.get("roc_5", 0)),
+                "macd_1h": 0.0, "price_vs_ema": pve, "hourly_return": hr,
+                "trend_direction": adx_val * ts_sign,
+                "vol_ratio": float(prev.get("vol_ratio", 1)) if pd.notna(prev.get("vol_ratio")) else 1,
+                "adx": adx_val, "rsi_1h": 50.0, "rsi_4h": 50.0,
+                "distance_from_strike": distance,
+            }
+
+            # Get 1h/4h context
+            df_1h = self._kalshi_cached_dataframes.get(f"{symbol}_1h")
+            df_4h = self._kalshi_cached_dataframes.get(f"{symbol}_4h")
+            ws_naive = pd.Timestamp.now()
+            if df_1h is not None:
+                m1h = df_1h.index <= ws_naive
+                if m1h.sum() >= 20:
+                    feat["rsi_1h"] = float(df_1h.loc[m1h].iloc[-1].get("rsi", 50))
+                    feat["macd_1h"] = float(df_1h.loc[m1h].iloc[-1].get("macd_hist", 0))
+            if df_4h is not None:
+                m4h = df_4h.index <= ws_naive
+                if m4h.sum() >= 10:
+                    feat["rsi_4h"] = float(df_4h.loc[m4h].iloc[-1].get("rsi", 50))
+
+            if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
+                continue
+
+            # Run model with real distance
+            feature_names = self.kalshi_predictor._knn_scaler.feature_names_in_ if hasattr(self.kalshi_predictor._knn_scaler, 'feature_names_in_') else [
+                "macd_15m", "norm_return", "ema_slope", "roc_5",
+                "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
+                "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
+            ]
+            X = np.array([feat[f] for f in feature_names]).reshape(1, -1)
+            prob = float(self.kalshi_predictor._knn.predict_proba(
+                self.kalshi_predictor._knn_scaler.transform(X))[0][1])
+            pct = int(prob * 100)
+
+            # Did the model flip? (we bet YES but model now says NO, or vice versa)
+            model_side = "yes" if pct >= 55 else "no" if pct <= 45 else "skip"
+            flipped = (side == "yes" and model_side == "no") or (side == "no" and model_side == "yes")
+
+            dir_label = "YES" if side == "yes" else "NO"
+
+            if flipped:
+                # Model changed its mind — exit
                 current_bid = None
                 if self.kalshi_ws:
                     ws_data = self.kalshi_ws.get_ticker(ticker)
                     if ws_data and time.time() - ws_data.get("ts", 0) < 30:
                         current_bid = ws_data.get("yes_bid") if side == "yes" else ws_data.get("no_bid")
-
                 if current_bid is None:
                     try:
                         mkt = self.kalshi_client.get_market(ticker)
@@ -537,19 +588,24 @@ class KalshiDaemon:
                         else:
                             current_bid = int(float(mkt_data.get("no_bid_dollars", 0)) * 100)
                     except Exception:
-                        continue
+                        current_bid = None
 
                 if current_bid and current_bid > 0:
-                    self._exit_position(bet, current_bid, f"MIN5 EXIT (dist={distance:+.2f})")
-
+                    self._exit_position(bet, current_bid,
+                        f"MIN{minute} EXIT (model flipped to {model_side.upper()}, dist={distance:+.2f})")
+                else:
+                    print(colored(
+                        f"  [MIN{minute} EXIT] {asset} {dir_label} model flipped but no bid — holding",
+                        "yellow"))
             else:
-                dir_label = "YES" if side == "yes" else "NO"
+                bet[flag_key] = True
                 print(colored(
-                    f"  [MIN5 CONFIRM] {asset} {dir_label} dist={distance:+.2f} — holding to settlement",
+                    f"  [MIN{minute} CONFIRM] {asset} {dir_label} dist={distance:+.2f} "
+                    f"model={pct}% — holding",
                     "green",
                 ))
 
-        # Also cancel any resting orders if minute-5 shows against
+        # Cancel resting orders if model flipped
         for order in list(self._resting_orders):
             asset = order.get("asset", "?")
             symbol = order.get("symbol", "")
@@ -580,7 +636,7 @@ class KalshiDaemon:
                     self.kalshi_client.cancel_order_safe(order_id)
                     dir_label = "YES" if side == "yes" else "NO"
                     print(colored(
-                        f"  [MIN5 CANCEL] {asset} {dir_label} resting — market against (dist={distance:+.2f})",
+                        f"  [MIN{minute} CANCEL] {asset} {dir_label} resting — model against (dist={distance:+.2f})",
                         "yellow",
                     ))
                     self._pending_bets = [
@@ -589,7 +645,6 @@ class KalshiDaemon:
                 except Exception:
                     pass
 
-        # Remove cancelled orders from resting list
         self._resting_orders = [
             o for o in self._resting_orders
             if o.get("order_id") and o.get("order_id") not in
@@ -870,9 +925,9 @@ class KalshiDaemon:
         if self._resting_orders and minute_in_window >= 1:
             self._check_resting_orders()
 
-        # Minute 5 confirmation — recheck positions with distance data
-        if minute_in_window == 5:
-            self._confirm_at_minute5()
+        # Minute 5 and 10 confirmation — recheck positions with 5m candle closes
+        if minute_in_window in (5, 10):
+            self._confirm_with_distance(minute_in_window)
 
         # Settlement check moved to dashboard refresh cycle (every 15s)
 
@@ -983,12 +1038,15 @@ class KalshiDaemon:
 
             # Lifecycle:
             # Min 0-4:   CONFIRMED — bet at window open, retry if missed
-            # Min 5:     CONFIRMATION — recheck with 5m distance, exit if against us
-            # Min 6-9:   MONITORING — hold or already exited
-            # Min 10+:   SETTLING — cancel unfilled, await settlement
+            # Min 5:     CONFIRMATION — recheck with 5m candle close, exit if model flipped
+            # Min 6-9:   MONITORING — hold position
+            # Min 10:    CONFIRMATION — recheck with 10m candle close, exit if model flipped
+            # Min 11+:   SETTLING — cancel unfilled, await settlement
             if minute_in_window <= 4 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
-            elif minute_in_window == 5 and pending and pending.get("bet_placed"):
+            elif minute_in_window == 5 and pending and pending.get("bet_placed") and not pending.get("confirmed_5m"):
+                state = "CONFIRMATION"
+            elif minute_in_window == 10 and pending and pending.get("bet_placed") and not pending.get("confirmed_10m"):
                 state = "CONFIRMATION"
             else:
                 state = "MONITORING"
@@ -2200,8 +2258,8 @@ class KalshiDaemon:
             for p in self._kalshi_pending_signals.values()
         ) if self._kalshi_pending_signals else False
         entry_trigger = (min_in_window <= 4 and not has_pending and time_since >= 5)
-        confirm_trigger = (min_in_window == 5 and time_since >= 5)
-        normal_trigger = (min_in_window >= 6 and time_since >= 50)
+        confirm_trigger = (min_in_window in (5, 10) and time_since >= 5)
+        normal_trigger = (min_in_window >= 6 and min_in_window != 10 and time_since >= 50)
         should_eval = entry_trigger or confirm_trigger or normal_trigger
         if should_eval:
             try:
