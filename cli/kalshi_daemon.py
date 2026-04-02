@@ -684,7 +684,21 @@ class KalshiDaemon:
             # Remove from pending so settlement doesn't double-count
             self._pending_bets = [b for b in self._pending_bets if b is not bet]
         else:
-            # Live: place sell order
+            # Live: query actual position size from Kalshi before selling
+            try:
+                positions = self.kalshi_client.get_positions()
+                for p in positions:
+                    if p.get("ticker") == ticker:
+                        actual = int(float(p.get("position_fp", 0)))
+                        if actual > count:
+                            count = actual  # sell everything we hold
+                            bet["count"] = count
+                            pnl_cents = count * (sell_price - entry)
+                            pnl_dollars = pnl_cents / 100
+                        break
+            except Exception:
+                pass
+
             try:
                 result = self.kalshi_client.place_order(
                     ticker=ticker, side=side, count=count,
@@ -1985,16 +1999,19 @@ class KalshiDaemon:
             ws_fills = self.kalshi_ws.get_pending_fills()
             for fill in ws_fills:
                 fill_ticker = fill.get("ticker", "")
+                fill_count = max(int(fill.get("count", 1)), 1)
                 for order in self._resting_orders:
                     if order.get("ticker") == fill_ticker or order.get("order_id", "") in str(fill):
                         asset = order.get("asset", "?")
-                        order["count"] = max(fill.get("count", 1), 1)
+                        # Accumulate fills — don't overwrite
+                        prev_count = order.get("count", 0)
+                        order["count"] = prev_count + fill_count
                         order["needs_fill_check"] = False
                         if asset in self._kalshi_pending_signals:
                             self._kalshi_pending_signals[asset]["bet_placed"] = True
                         print(colored(
                             f"  [WS FILL] {asset} {order['side'].upper()} "
-                            f"x{order['count']} @ {order['fill_price']}c — filled via WebSocket!",
+                            f"x{fill_count} (total x{order['count']}) @ {order['fill_price']}c — filled!",
                             "green",
                         ))
 
