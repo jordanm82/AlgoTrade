@@ -701,15 +701,18 @@ class KalshiDaemon:
                 pass
 
             try:
+                # Market sell — we want OUT, not another resting order
                 result = self.kalshi_client.place_order(
                     ticker=ticker, side=side, count=count,
-                    price_cents=sell_price, order_type="limit",
+                    price_cents=1,  # sell at any price (market sell)
+                    order_type="limit",
                     action="sell",
                 )
                 order = result.get("order", {})
                 fill_count = float(order.get("fill_count_fp", 0))
+                actual_price = sell_price  # approximate if instant fill
                 print(colored(
-                    f"  [{reason}] {asset} {dir_label} sell x{count} @ {sell_price}c "
+                    f"  [{reason}] {asset} {dir_label} sell x{count} @ market "
                     f"(entry {entry}c) filled={fill_count:.0f} P&L ${pnl_dollars:+.2f}",
                     "red" if pnl_cents < 0 else "green",
                 ))
