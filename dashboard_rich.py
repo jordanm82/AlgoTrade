@@ -403,6 +403,13 @@ class RichDashboard:
         if dpl > 0:
             header.append(" PL:", style="dim")
             header.append(f"{dpl}", style="yellow")
+            gpl = getattr(self.daemon, '_session_good_exits', 0)
+            bpl = getattr(self.daemon, '_session_bad_exits', 0)
+            if gpl + bpl > 0:
+                header.append(f" (", style="dim")
+                header.append(f"{gpl}G", style="green")
+                header.append(f"/{bpl}B", style="red")
+                header.append(f")", style="dim")
         header.append(f" WR:{dwr:.0f}%", style="dim")
         header.append("  |  P&L: ", style="dim")
         header.append(f"${pnl:+.2f}", style=pnl_color)

@@ -107,6 +107,8 @@ class KalshiDaemon:
         self._session_wins = 0
         self._session_losses = 0       # full losses (held to settlement and lost)
         self._session_partial_losses = 0  # early exits (model changed, exited at a loss)
+        self._session_good_exits = 0     # early exits that saved money (would have lost more)
+        self._session_bad_exits = 0      # early exits that cost money (would have won)
         self._session_bets_placed = 0
 
         # Dry-run simulated balance — starts from actual Kalshi balance or $100
@@ -1039,6 +1041,10 @@ class KalshiDaemon:
                                         saved = exit_pnl > would_pnl  # early exit saved us money
                                         label = "GOOD EXIT" if saved else "BAD EXIT"
                                         color = "green" if saved else "red"
+                                        if saved:
+                                            self._session_good_exits += 1
+                                        else:
+                                            self._session_bad_exits += 1
 
                                         print(colored(
                                             f"  [{label}] {ex['asset']} {ex['direction']} — "
