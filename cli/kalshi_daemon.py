@@ -592,6 +592,41 @@ class KalshiDaemon:
                         current_bid = None
 
                 if current_bid and current_bid > 0:
+                    # Log early exit to debug file
+                    self._log_trade_debug(
+                        asset=asset, action="EARLY_EXIT",
+                        details={
+                            "reason": f"MIN{minute}",
+                            "bet_side": side,
+                            "bet_direction": dir_label,
+                            "model_new_side": model_side,
+                            "model_prob": prob,
+                            "distance": distance,
+                            "entry_price": bet.get("contract_price", bet.get("fill_price", 0)),
+                            "exit_price": current_bid,
+                            "count": bet.get("count", 0),
+                            "strike": bet.get("strike", 0),
+                            "ticker": ticker,
+                            "settle_time": str(bet.get("settle_time", "")),
+                        }
+                    )
+                    # Track for post-settlement comparison
+                    if not hasattr(self, '_early_exits'):
+                        self._early_exits = []
+                    self._early_exits.append({
+                        "asset": asset,
+                        "side": side,
+                        "direction": dir_label,
+                        "strike": bet.get("strike", 0),
+                        "entry_price": bet.get("contract_price", bet.get("fill_price", 0)),
+                        "exit_price": current_bid,
+                        "exit_pnl_cents": bet.get("count", 0) * (current_bid - bet.get("contract_price", bet.get("fill_price", 0))),
+                        "settle_time": bet.get("settle_time"),
+                        "ticker": ticker,
+                        "symbol": bet.get("symbol", ""),
+                        "exit_time": datetime.now(timezone.utc),
+                    })
+
                     self._exit_position(bet, current_bid,
                         f"MIN{minute} EXIT (model flipped to {model_side.upper()}, dist={distance:+.2f})")
                 else:
@@ -974,6 +1009,65 @@ class KalshiDaemon:
         # Remove settled bets from pending
         if settled:
             self._pending_bets = [b for b in self._pending_bets if b not in settled]
+
+        # Check early exits against actual settlement — would we have won if we held?
+        if hasattr(self, '_early_exits') and self._early_exits:
+            still_pending = []
+            for ex in self._early_exits:
+                settle_time = ex.get("settle_time")
+                if settle_time and now > settle_time + pd.Timedelta(minutes=1):
+                    # Find the settlement result for this window
+                    series = self.KALSHI_PAIRS.get(ex.get("symbol", ""), "")
+                    if series and self.kalshi_client:
+                        try:
+                            mkts = self.kalshi_client.get_markets(series_ticker=series, status="settled")
+                            for m in mkts:
+                                ct = m.get("close_time", "")
+                                if ct:
+                                    mkt_close = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                                    if abs((mkt_close - settle_time).total_seconds()) < 60:
+                                        result = m.get("result", "")
+                                        would_win = (ex["side"] == result)
+                                        entry = ex["entry_price"]
+                                        count = ex.get("count", 1) or 1
+                                        if would_win:
+                                            would_pnl = count * (100 - entry)
+                                        else:
+                                            would_pnl = -(count * entry)
+                                        exit_pnl = ex["exit_pnl_cents"]
+
+                                        saved = exit_pnl > would_pnl  # early exit saved us money
+                                        label = "GOOD EXIT" if saved else "BAD EXIT"
+                                        color = "green" if saved else "red"
+
+                                        print(colored(
+                                            f"  [{label}] {ex['asset']} {ex['direction']} — "
+                                            f"exited at {ex['exit_price']}c (PL {exit_pnl:+d}c) | "
+                                            f"would have {'WON' if would_win else 'LOST'} "
+                                            f"({would_pnl:+d}c) if held",
+                                            color,
+                                        ))
+
+                                        self._log_trade_debug(
+                                            asset=ex["asset"], action="EXIT_REVIEW",
+                                            details={
+                                                "label": label,
+                                                "bet_side": ex["side"],
+                                                "exit_pnl_cents": exit_pnl,
+                                                "would_win": would_win,
+                                                "would_pnl_cents": would_pnl,
+                                                "kalshi_result": result,
+                                                "strike": ex["strike"],
+                                                "entry_price": entry,
+                                                "exit_price": ex["exit_price"],
+                                            }
+                                        )
+                                        break
+                        except Exception:
+                            pass
+                else:
+                    still_pending.append(ex)
+            self._early_exits = still_pending
 
     # ------------------------------------------------------------------
     # Kalshi evaluation lifecycle
