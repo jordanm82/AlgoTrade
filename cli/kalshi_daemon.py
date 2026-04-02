@@ -2062,26 +2062,41 @@ class KalshiDaemon:
         if not self.kalshi_client:
             return
 
-        # Check WebSocket fill events first (instant detection)
+        # Check WebSocket fill events (instant detection trigger)
+        # WS can send duplicate events — use as a TRIGGER, then verify actual count via API
         if self.kalshi_ws:
             ws_fills = self.kalshi_ws.get_pending_fills()
             for fill in ws_fills:
                 fill_ticker = fill.get("ticker", "")
-                fill_count = max(int(fill.get("count", 1)), 1)
                 for order in self._resting_orders:
                     if order.get("ticker") == fill_ticker or order.get("order_id", "") in str(fill):
+                        if order.get("_ws_detected"):
+                            continue  # already processed this order's fill
                         asset = order.get("asset", "?")
-                        # Accumulate fills — don't overwrite
-                        prev_count = order.get("count", 0)
-                        order["count"] = prev_count + fill_count
-                        order["needs_fill_check"] = False
-                        if asset in self._kalshi_pending_signals:
-                            self._kalshi_pending_signals[asset]["bet_placed"] = True
-                        print(colored(
-                            f"  [WS FILL] {asset} {order['side'].upper()} "
-                            f"x{fill_count} (total x{order['count']}) @ {order['fill_price']}c — filled!",
-                            "green",
-                        ))
+                        order_id = order.get("order_id", "")
+
+                        # Query actual fill count from API (source of truth)
+                        actual_count = 0
+                        if order_id and self.kalshi_client:
+                            try:
+                                status = self.kalshi_client.get_order_status(order_id)
+                                actual_count = int(float(status.get("fill_count_fp", 0)))
+                            except Exception:
+                                actual_count = max(int(fill.get("count", 1)), 1)
+                        else:
+                            actual_count = max(int(fill.get("count", 1)), 1)
+
+                        if actual_count > 0:
+                            order["count"] = actual_count
+                            order["needs_fill_check"] = False
+                            order["_ws_detected"] = True
+                            if asset in self._kalshi_pending_signals:
+                                self._kalshi_pending_signals[asset]["bet_placed"] = True
+                            print(colored(
+                                f"  [WS FILL] {asset} {order['side'].upper()} "
+                                f"x{actual_count} @ {order['fill_price']}c — filled!",
+                                "green",
+                            ))
 
         still_resting = []
         for order in self._resting_orders:
