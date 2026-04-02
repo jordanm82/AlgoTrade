@@ -1524,7 +1524,7 @@ class KalshiDaemon:
             if self._cli_max_bets > 0:
                 max_bets = self._cli_max_bets
             else:
-                max_bets = 4 if self.dry_run else MAX_CONCURRENT_KALSHI_BETS
+                max_bets = MAX_CONCURRENT_KALSHI_BETS
             if len(self._active_kalshi_bets) + actual_fills_this_eval >= max_bets:
                 break
             result = self._kalshi_execute_bet(
@@ -1934,7 +1934,7 @@ class KalshiDaemon:
                     if self._cli_max_bets > 0:
                         max_bets = self._cli_max_bets
                     else:
-                        max_bets = 4 if self.dry_run else MAX_CONCURRENT_KALSHI_BETS
+                        max_bets = MAX_CONCURRENT_KALSHI_BETS
                     active_count = sum(1 for p in self._kalshi_pending_signals.values()
                                        if p.get("bet_placed") and not p.get("result"))
                     if active_count >= max_bets:
