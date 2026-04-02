@@ -377,7 +377,8 @@ class RichDashboard:
 
         dw = self.daemon._session_wins
         dl = self.daemon._session_losses
-        dt = dw + dl
+        dpl = getattr(self.daemon, '_session_partial_losses', 0)
+        dt = dw + dl + dpl
         dwr = dw / dt * 100 if dt > 0 else 0
         pnl = sum(b.get("pnl_dollars", 0) for b in self.daemon._completed_bets)
         pnl_color = "green" if pnl >= 0 else "red"
@@ -399,6 +400,9 @@ class RichDashboard:
         header.append(f"{dw}", style="green")
         header.append(" L:", style="dim")
         header.append(f"{dl}", style="red")
+        if dpl > 0:
+            header.append(" PL:", style="dim")
+            header.append(f"{dpl}", style="yellow")
         header.append(f" WR:{dwr:.0f}%", style="dim")
         header.append("  |  P&L: ", style="dim")
         header.append(f"${pnl:+.2f}", style=pnl_color)
@@ -839,12 +843,13 @@ class RichDashboard:
         completed = self.daemon._completed_bets
         dw = self.daemon._session_wins
         dl = self.daemon._session_losses
-        dt = dw + dl
+        dpl = getattr(self.daemon, '_session_partial_losses', 0)
+        dt = dw + dl + dpl
         dwr = dw / dt * 100 if dt > 0 else 0
         total_pnl = sum(b.get("pnl_dollars", 0) for b in completed)
-        total_risked = sum(abs(b.get("pnl_cents", 0)) for b in completed if b.get("result") == "LOSS") / 100
         total_won = sum(b.get("pnl_dollars", 0) for b in completed if b.get("result") == "WIN")
         total_lost = sum(abs(b.get("pnl_dollars", 0)) for b in completed if b.get("result") == "LOSS")
+        total_pl = sum(abs(b.get("pnl_dollars", 0)) for b in completed if b.get("result") == "PL")
 
         now = datetime.now(timezone.utc)
         uptime = now - self._start_time
@@ -860,9 +865,13 @@ class RichDashboard:
         summary.add_row("Bets Placed", str(len(completed)))
         summary.add_row("Wins", Text(str(dw), style="green"))
         summary.add_row("Losses", Text(str(dl), style="red"))
+        if dpl > 0:
+            summary.add_row("Partial Losses (early exit)", Text(str(dpl), style="yellow"))
         summary.add_row("Win Rate", f"{dwr:.1f}%")
         summary.add_row("Gross Won", Text(f"${total_won:+.2f}", style="green"))
         summary.add_row("Gross Lost", Text(f"${total_lost:.2f}", style="red"))
+        if total_pl > 0:
+            summary.add_row("Early Exit Losses", Text(f"${total_pl:.2f}", style="yellow"))
         summary.add_row("Net P&L", Text(f"${total_pnl:+.2f}", style="green" if total_pnl >= 0 else "red"))
         pending = len(self.daemon._pending_bets)
         if pending > 0:

@@ -105,7 +105,8 @@ class KalshiDaemon:
         self._pending_bets: list[dict] = []
         self._completed_bets: list[dict] = []
         self._session_wins = 0
-        self._session_losses = 0
+        self._session_losses = 0       # full losses (held to settlement and lost)
+        self._session_partial_losses = 0  # early exits (model changed, exited at a loss)
         self._session_bets_placed = 0
 
         # Dry-run simulated balance — starts from actual Kalshi balance or $100
@@ -670,7 +671,7 @@ class KalshiDaemon:
                 f"(entry {entry}c) P&L ${pnl_dollars:+.2f}",
                 "red" if pnl_cents < 0 else "green",
             ))
-            bet["result"] = "WIN" if pnl_cents > 0 else "LOSS"
+            bet["result"] = "WIN" if pnl_cents > 0 else "PL"
             bet["pnl_cents"] = pnl_cents
             bet["pnl_dollars"] = pnl_dollars
             bet["settle_price"] = sell_price
@@ -679,7 +680,7 @@ class KalshiDaemon:
             if pnl_cents > 0:
                 self._session_wins += 1
             else:
-                self._session_losses += 1
+                self._session_partial_losses += 1
             self._dry_balance_cents += pnl_cents
             # Remove from pending so settlement doesn't double-count
             self._pending_bets = [b for b in self._pending_bets if b is not bet]
@@ -713,7 +714,7 @@ class KalshiDaemon:
                     "red" if pnl_cents < 0 else "green",
                 ))
                 if fill_count > 0:
-                    bet["result"] = "WIN" if pnl_cents > 0 else "LOSS"
+                    bet["result"] = "WIN" if pnl_cents > 0 else "PL"
                     bet["pnl_cents"] = pnl_cents
                     bet["pnl_dollars"] = pnl_dollars
                     bet["settle_price"] = sell_price
@@ -722,7 +723,7 @@ class KalshiDaemon:
                     if pnl_cents > 0:
                         self._session_wins += 1
                     else:
-                        self._session_losses += 1
+                        self._session_partial_losses += 1
                     # Remove from pending so settlement doesn't double-count
                     self._pending_bets = [b for b in self._pending_bets if b is not bet]
             except Exception as e:
@@ -2298,7 +2299,7 @@ class KalshiDaemon:
         else:
             mode_tag = colored("[LIVE]", "green")
 
-        total = self._session_wins + self._session_losses
+        total = self._session_wins + self._session_losses + self._session_partial_losses
         wr = f"{self._session_wins}/{total} ({100*self._session_wins/total:.0f}%)" if total > 0 else "0/0"
         pnl = sum(b.get("pnl_dollars", 0) for b in self._completed_bets)
         pnl_str = f"${pnl:+.2f}"
@@ -2359,12 +2360,12 @@ class KalshiDaemon:
                 time.sleep(TICK_INTERVAL)
 
         # Shutdown summary
-        total = self._session_wins + self._session_losses
+        total = self._session_wins + self._session_losses + self._session_partial_losses
         pnl = sum(b.get("pnl_dollars", 0) for b in self._completed_bets)
         print(colored(f"\n{'='*70}", "cyan"))
         print(colored("  KALSHI DAEMON STOPPED", "cyan"))
         print(f"  Bets placed: {self._session_bets_placed}")
-        print(f"  Wins: {self._session_wins} | Losses: {self._session_losses} | Total: {total}")
+        print(f"  W:{self._session_wins} L:{self._session_losses} PL:{self._session_partial_losses} | Total: {total}")
         if total > 0:
             print(f"  Win rate: {100*self._session_wins/total:.1f}%")
         print(f"  P&L: ${pnl:+.2f}")
