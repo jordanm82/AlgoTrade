@@ -701,22 +701,67 @@ class KalshiDaemon:
                 pass
 
             try:
-                # Sell at the current bid — fills immediately at best available price
-                result = self.kalshi_client.place_order(
-                    ticker=ticker, side=side, count=count,
-                    price_cents=max(1, sell_price),
-                    order_type="limit",
-                    action="sell",
-                )
-                order = result.get("order", {})
-                fill_count = float(order.get("fill_count_fp", 0))
-                actual_price = sell_price  # approximate if instant fill
-                print(colored(
-                    f"  [{reason}] {asset} {dir_label} sell x{count} @ market "
-                    f"(entry {entry}c) filled={fill_count:.0f} P&L ${pnl_dollars:+.2f}",
-                    "red" if pnl_cents < 0 else "green",
-                ))
-                if fill_count > 0:
+                # Sell loop — reprice and retry until filled
+                remaining = count
+                total_filled = 0
+                order_id = None
+
+                for attempt in range(5):
+                    # Get fresh bid price each attempt
+                    if attempt > 0:
+                        time.sleep(1)
+                        # Cancel previous unfilled order
+                        if order_id:
+                            try:
+                                self.kalshi_client.cancel_order_safe(order_id)
+                            except Exception:
+                                pass
+
+                        # Refresh bid price
+                        sell_price = None
+                        if self.kalshi_ws:
+                            ws_data = self.kalshi_ws.get_ticker(ticker)
+                            if ws_data and time.time() - ws_data.get("ts", 0) < 30:
+                                sell_price = ws_data.get("yes_bid") if side == "yes" else ws_data.get("no_bid")
+                        if not sell_price:
+                            try:
+                                mkt = self.kalshi_client.get_market(ticker)
+                                mkt_data = mkt.get("market", mkt)
+                                if side == "yes":
+                                    sell_price = int(float(mkt_data.get("yes_bid_dollars", 0)) * 100)
+                                else:
+                                    sell_price = int(float(mkt_data.get("no_bid_dollars", 0)) * 100)
+                            except Exception:
+                                sell_price = 1
+
+                        # Recalc P&L with actual sell price
+                        pnl_cents = count * (sell_price - entry)
+                        pnl_dollars = pnl_cents / 100
+
+                    result = self.kalshi_client.place_order(
+                        ticker=ticker, side=side, count=remaining,
+                        price_cents=max(1, sell_price),
+                        order_type="limit",
+                        action="sell",
+                    )
+                    order = result.get("order", {})
+                    order_id = order.get("order_id")
+                    fill_count = int(float(order.get("fill_count_fp", 0)))
+                    total_filled += fill_count
+                    remaining -= fill_count
+
+                    print(colored(
+                        f"  [{reason}] {asset} {dir_label} sell x{fill_count}/{count} @ {sell_price}c "
+                        f"(entry {entry}c) attempt {attempt+1}",
+                        "yellow" if remaining > 0 else ("red" if pnl_cents < 0 else "green"),
+                    ))
+
+                    if remaining <= 0:
+                        break
+
+                if total_filled > 0:
+                    pnl_cents = total_filled * (sell_price - entry)
+                    pnl_dollars = pnl_cents / 100
                     bet["result"] = "WIN" if pnl_cents > 0 else "PL"
                     bet["pnl_cents"] = pnl_cents
                     bet["pnl_dollars"] = pnl_dollars
@@ -727,8 +772,16 @@ class KalshiDaemon:
                         self._session_wins += 1
                     else:
                         self._session_partial_losses += 1
-                    # Remove from pending so settlement doesn't double-count
                     self._pending_bets = [b for b in self._pending_bets if b is not bet]
+                    print(colored(
+                        f"  [{reason}] {asset} {dir_label} EXITED x{total_filled} P&L ${pnl_dollars:+.2f}",
+                        "red" if pnl_cents < 0 else "green",
+                    ))
+                else:
+                    print(colored(
+                        f"  [{reason}] {asset} {dir_label} EXIT FAILED — 0 fills after 5 attempts",
+                        "red",
+                    ))
             except Exception as e:
                 print(colored(f"  [EXIT ERR] {asset}: {e}", "red"))
 
