@@ -548,9 +548,12 @@ class KalshiDaemon:
             dir_label = "YES" if side == "yes" else "NO"
             bet["_m10_checked"] = True
 
-            # Mark in pending for display
+            # Store M10 score for dashboard display
+            m10_display = pct if m10_side == "yes" else (100 - pct) if m10_side == "no" else pct
             if asset in self._kalshi_pending_signals:
                 self._kalshi_pending_signals[asset]["confirmed_m10"] = True
+                self._kalshi_pending_signals[asset]["m10_score"] = m10_display
+                self._kalshi_pending_signals[asset]["m10_side"] = m10_side
 
             # Does M10 agree with our bet?
             if side == m10_side:

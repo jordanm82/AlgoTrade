@@ -475,7 +475,7 @@ class RichDashboard:
             table.add_column("ASSET", style="bold white", width=5)
             table.add_column("SIDE", width=4)
             table.add_column("LR", justify="right", width=6)
-            table.add_column("TEK", justify="right", width=6)
+            table.add_column("M10", justify="right", width=6)
             table.add_column("PRICE", justify="right", width=12)
             table.add_column("TARGET", justify="right", width=12)
             table.add_column("DIST", justify="right", width=8)
@@ -487,20 +487,23 @@ class RichDashboard:
                 state = p.get("state", "")
 
                 knn_s = p.get("knn_score", 0)
-                tbl_s = p.get("tbl_score", 0)
+
+                # M10 score: from pending signal after minute-10 check
+                m10_s = 0
+                m10_dir = None
+                if hasattr(self.daemon, '_kalshi_pending_signals'):
+                    ps = self.daemon._kalshi_pending_signals.get(asset, {})
+                    m10_s = ps.get("m10_score", 0)
+                    m10_side = ps.get("m10_side", "")
+                    if m10_side:
+                        m10_dir = "Y" if m10_side == "yes" else "N" if m10_side == "no" else None
 
                 if side in ("YES", "NO"):
                     knn_dir = "Y" if side == "YES" else "N"
-                    if tbl_s >= 50:
-                        tbl_dir = "Y" if side == "YES" else "N"
-                    else:
-                        tbl_dir = "Y" if side == "NO" else "N"
-                        tbl_s = 100 - tbl_s
                 elif knn_s > 0:
                     knn_dir = "Y" if knn_s >= 50 else "N"
-                    tbl_dir = "Y" if tbl_s >= 50 else "N"
                 else:
-                    knn_dir = tbl_dir = None
+                    knn_dir = None
 
                 def _ft(score, direction):
                     if direction is None or score == 0:
@@ -539,7 +542,7 @@ class RichDashboard:
                 table.add_row(
                     asset, side_text,
                     _ft(knn_s, knn_dir),
-                    _ft(tbl_s, tbl_dir),
+                    _ft(m10_s, m10_dir),
                     current_str, target_str, dist_str,
                     Text(state, style=state_style),
                 )
