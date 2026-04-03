@@ -1104,10 +1104,10 @@ class KalshiDaemon:
         if self._resting_orders and minute_in_window >= 1:
             self._check_resting_orders()
 
-        # Minute 10 confirmation — recheck positions with 5m candle close
-        # (minute 5 disabled for A/B testing — may re-enable later)
-        if minute_in_window == 10:
-            self._confirm_with_distance(minute_in_window)
+        # Minute 10 confirmation DISABLED — 2G/24B exits, 92% were bad calls.
+        # Holding to settlement produces 86% WR vs 56% with exits.
+        # if minute_in_window == 10:
+        #     self._confirm_with_distance(minute_in_window)
 
         # Settlement check moved to dashboard refresh cycle (every 15s)
 
@@ -1222,15 +1222,9 @@ class KalshiDaemon:
             # Lifecycle:
             # Min 0-4:   CONFIRMED — bet at window open, retry if missed
             # Min 0-4:   CONFIRMED — bet at window open
-            # Min 5-9:   MONITORING — hold position (min 5 exit disabled for testing)
-            # Min 10:    CONFIRMATION — recheck with 10m candle close, exit if model flipped
-            # Min 11+:   SETTLING — cancel unfilled, await settlement
+            # Min 5+:    MONITORING — hold to settlement (early exits disabled, 2G/24B)
             if minute_in_window <= 4 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
-            # elif minute_in_window == 5 and pending and pending.get("bet_placed") and not pending.get("confirmed_5m"):
-            #     state = "CONFIRMATION"  # disabled — A/B testing 10m only
-            elif minute_in_window == 10 and pending and pending.get("bet_placed") and not pending.get("confirmed_10m"):
-                state = "CONFIRMATION"
             else:
                 state = "MONITORING"
 
