@@ -93,6 +93,8 @@ class KalshiDaemon:
         self.kalshi_client = None  # lazy init
         self.kalshi_ws = None      # WebSocket for real-time prices
         self._brti_proxy = None    # multi-exchange BRTI approximation
+        self._m10_model = None     # M10 confirmation model (loaded lazily)
+        self._m10_scaler = None
         self.kalshi_threshold = 30  # minimum confidence to bet
         self.kalshi_predictions: list[dict] = []  # latest predictions for dashboard
         self._active_kalshi_bets = {}  # {ticker: placement_time}
@@ -430,7 +432,212 @@ class KalshiDaemon:
         return None
 
     # ------------------------------------------------------------------
-    # Stop loss + minute-5 confirmation
+    # M10 confirmation — separate model trained on minute-10 data
+    # ------------------------------------------------------------------
+
+    MIN_SELL_PRICE = 10  # floor: won't sell below 10c, place resting sell instead
+
+    def _load_m10_model(self):
+        """Lazy-load the M10 confirmation model."""
+        if self._m10_model is not None:
+            return
+        try:
+            import pickle
+            with open("models/m10_kalshi.pkl", "rb") as f:
+                data = pickle.load(f)
+                self._m10_model = data["model"]
+                self._m10_scaler = data["scaler"]
+        except Exception as e:
+            print(colored(f"  [M10] Model load failed: {e}", "yellow"))
+
+    def _m10_confirm(self):
+        """At minute 10, run M10 model to decide: hold or exit."""
+        if not self._pending_bets:
+            return
+
+        self._load_m10_model()
+        if self._m10_model is None:
+            return
+
+        if self._brti_proxy is None:
+            from data.brti_proxy import BRTIProxy
+            self._brti_proxy = BRTIProxy()
+
+        for bet in list(self._pending_bets):
+            if bet.get("result") or bet.get("count", 0) <= 0:
+                continue
+            if bet.get("_m10_checked"):
+                continue
+
+            asset = bet.get("asset", "?")
+            side = bet.get("side", "yes")
+            symbol = bet.get("symbol", "")
+            strike = bet.get("strike", 0)
+            ticker = bet.get("ticker", "")
+            entry = bet.get("contract_price", bet.get("fill_price", 0))
+
+            if not strike or not symbol:
+                continue
+
+            # Get current multi-exchange price
+            usd_sym = symbol.replace("/USDT", "/USD")
+            current_price = self._brti_proxy.get_price(usd_sym)
+            if not current_price:
+                continue
+
+            # Get ATR from cached 15m data
+            df_15m = self._kalshi_cached_dataframes.get(symbol)
+            if df_15m is None or len(df_15m) < 5:
+                continue
+            pr = df_15m.iloc[-1]
+            atr = float(pr.get("atr", 0))
+            if pd.isna(atr) or atr <= 0:
+                continue
+
+            distance = (current_price - strike) / atr
+
+            # Build M10 feature vector
+            sma_val = float(pr.get("sma_20", 0))
+            adx_val = float(pr.get("adx", 20))
+            close_val = float(pr.get("close", 0))
+            if sma_val > 0:
+                ts_sign = 1 if close_val >= sma_val else -1
+            else:
+                ts_sign = 0
+            pve = float(pr.get("price_vs_ema", 0)) if pd.notna(pr.get("price_vs_ema")) else 0
+            hr = float(pr.get("hourly_return", 0)) if pd.notna(pr.get("hourly_return")) else 0
+
+            feat = {
+                "macd_15m": float(pr.get("macd_hist", 0)),
+                "norm_return": float(pr.get("norm_return", 0)) if pd.notna(pr.get("norm_return")) else 0,
+                "ema_slope": float(pr.get("ema_slope", 0)) if pd.notna(pr.get("ema_slope")) else 0,
+                "roc_5": float(pr.get("roc_5", 0)),
+                "macd_1h": 0.0,
+                "price_vs_ema": pve,
+                "hourly_return": hr,
+                "trend_direction": adx_val * ts_sign,
+                "vol_ratio": float(pr.get("vol_ratio", 1)) if pd.notna(pr.get("vol_ratio")) else 1,
+                "adx": adx_val,
+                "rsi_1h": 50.0,
+                "rsi_4h": 50.0,
+                "distance_from_strike": distance,
+            }
+            # 1h/4h context
+            df_1h = self._kalshi_cached_dataframes.get(f"{symbol}_1h")
+            df_4h = self._kalshi_cached_dataframes.get(f"{symbol}_4h")
+            if df_1h is not None and len(df_1h) >= 21:
+                feat["rsi_1h"] = float(df_1h.iloc[-2].get("rsi", 50))
+                feat["macd_1h"] = float(df_1h.iloc[-2].get("macd_hist", 0))
+            if df_4h is not None and len(df_4h) >= 11:
+                feat["rsi_4h"] = float(df_4h.iloc[-2].get("rsi", 50))
+
+            if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
+                continue
+
+            # Run M10 model
+            feature_names = [
+                "macd_15m", "norm_return", "ema_slope", "roc_5",
+                "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
+                "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
+            ]
+            X = np.array([feat[f] for f in feature_names]).reshape(1, -1)
+            prob = float(self._m10_model.predict_proba(self._m10_scaler.transform(X))[0][1])
+            pct = int(prob * 100)
+
+            m10_side = "yes" if pct >= 55 else "no" if pct <= 45 else "skip"
+            dir_label = "YES" if side == "yes" else "NO"
+            bet["_m10_checked"] = True
+
+            # Mark in pending for display
+            if asset in self._kalshi_pending_signals:
+                self._kalshi_pending_signals[asset]["confirmed_m10"] = True
+
+            # Does M10 agree with our bet?
+            if side == m10_side:
+                # M10 confirms — hold
+                print(colored(
+                    f"  [M10 CONFIRM] {asset} {dir_label} dist={distance:+.2f} M10={pct}% — holding",
+                    "green",
+                ))
+                continue
+
+            # M10 disagrees — exit
+            # Get current bid for sell price
+            current_bid = None
+            if self.kalshi_ws:
+                ws_data = self.kalshi_ws.get_ticker(ticker)
+                if ws_data and time.time() - ws_data.get("ts", 0) < 30:
+                    current_bid = ws_data.get("yes_bid") if side == "yes" else ws_data.get("no_bid")
+            if current_bid is None:
+                self._init_kalshi_client()
+                if self.kalshi_client:
+                    try:
+                        mkt = self.kalshi_client.get_market(ticker)
+                        mkt_data = mkt.get("market", mkt)
+                        if side == "yes":
+                            current_bid = int(float(mkt_data.get("yes_bid_dollars", 0)) * 100)
+                        else:
+                            current_bid = int(float(mkt_data.get("no_bid_dollars", 0)) * 100)
+                    except Exception:
+                        pass
+
+            if not current_bid or current_bid <= 0:
+                print(colored(
+                    f"  [M10 EXIT] {asset} {dir_label} M10={pct}% — no bid, holding",
+                    "yellow"))
+                continue
+
+            # 10c floor: if bid < 10c, place resting sell at 10c instead of market sell
+            if current_bid < self.MIN_SELL_PRICE:
+                print(colored(
+                    f"  [M10 EXIT] {asset} {dir_label} M10={pct}% bid={current_bid}c < {self.MIN_SELL_PRICE}c — "
+                    f"resting sell @ {self.MIN_SELL_PRICE}c",
+                    "yellow",
+                ))
+                # Log the resting sell
+                self._log_trade_debug(
+                    asset=asset, action="M10_RESTING_SELL",
+                    details={
+                        "side": side, "direction": dir_label,
+                        "m10_prob": prob, "distance": distance,
+                        "bid": current_bid, "sell_price": self.MIN_SELL_PRICE,
+                        "entry": entry, "count": bet.get("count", 0),
+                        "ticker": ticker,
+                    }
+                )
+
+                if not (self.dry_run and not self.demo):
+                    # Live: place resting sell at 10c
+                    try:
+                        self.kalshi_client.place_order(
+                            ticker=ticker, side=side, count=bet.get("count", 0),
+                            price_cents=self.MIN_SELL_PRICE,
+                            order_type="limit", action="sell",
+                        )
+                    except Exception as e:
+                        print(colored(f"  [M10 SELL ERR] {asset}: {e}", "red"))
+                else:
+                    # Dry-run: simulate — don't exit yet, let settlement handle
+                    # The resting sell at 10c might or might not fill before settlement
+                    pass
+                continue
+
+            # Bid >= 10c: exit at market
+            self._log_trade_debug(
+                asset=asset, action="M10_EXIT",
+                details={
+                    "side": side, "direction": dir_label,
+                    "m10_prob": prob, "m10_side": m10_side,
+                    "distance": distance, "bid": current_bid,
+                    "entry": entry, "count": bet.get("count", 0),
+                    "ticker": ticker,
+                }
+            )
+            self._exit_position(bet, current_bid,
+                f"M10 EXIT (M10={pct}% {m10_side.upper()}, dist={distance:+.2f})")
+
+    # ------------------------------------------------------------------
+    # Stop loss + minute-5 confirmation (legacy, disabled)
     # ------------------------------------------------------------------
 
     STOP_LOSS_PCT = 0.50  # sell if contract drops to 50% of entry
@@ -1104,10 +1311,11 @@ class KalshiDaemon:
         if self._resting_orders and minute_in_window >= 1:
             self._check_resting_orders()
 
-        # Minute 10 confirmation DISABLED — 2G/24B exits, 92% were bad calls.
-        # Holding to settlement produces 86% WR vs 56% with exits.
-        # if minute_in_window == 10:
-        #     self._confirm_with_distance(minute_in_window)
+        # Minute 10 confirmation — uses M10 model (trained on minute-10 distances)
+        # Previous exits used M0 model which was 92% wrong at minute 10.
+        # M10 model: 85.6% WR out-of-sample, distance coeff +3.71
+        if minute_in_window == 10:
+            self._m10_confirm()
 
         # Settlement check moved to dashboard refresh cycle (every 15s)
 
@@ -1222,9 +1430,13 @@ class KalshiDaemon:
             # Lifecycle:
             # Min 0-4:   CONFIRMED — bet at window open, retry if missed
             # Min 0-4:   CONFIRMED — bet at window open
-            # Min 5+:    MONITORING — hold to settlement (early exits disabled, 2G/24B)
+            # Min 5-9:   MONITORING — hold position
+            # Min 10:    M10 CONFIRM — M10 model decides hold or exit
+            # Min 11+:   SETTLING — await settlement
             if minute_in_window <= 4 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
+            elif minute_in_window == 10 and pending and pending.get("bet_placed") and not pending.get("confirmed_m10"):
+                state = "M10_CONFIRM"
             else:
                 state = "MONITORING"
 
