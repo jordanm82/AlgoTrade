@@ -17,7 +17,7 @@ import ccxt
 class BRTIProxy:
     """Multi-exchange real-time price averaging (BRTI constituent exchanges)."""
 
-    CACHE_TTL = 10  # seconds
+    CACHE_TTL = 5  # seconds — refresh every 5s for dashboard + model
 
     def __init__(self):
         self._exchanges = {}

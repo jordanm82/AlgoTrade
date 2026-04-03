@@ -519,12 +519,16 @@ class RichDashboard:
                         symbol = f"{asset}/USDT"
                         decimals = 4 if asset == "XRP" else 2
                         target_str = f"${target:,.{decimals}f}"
-                        # Show multi-exchange price (same source as model input)
+                        # Show live multi-exchange price (same source as model)
                         brti = None
                         if hasattr(self.daemon, '_brti_proxy') and self.daemon._brti_proxy:
                             brti = self.daemon._brti_proxy.get_price(symbol)
-                        if not brti and hasattr(self.daemon, '_get_coinbase_price'):
-                            brti = self.daemon._get_coinbase_price(symbol)
+                        if not brti:
+                            # Init proxy if daemon hasn't yet
+                            if not hasattr(self, '_dashboard_brti'):
+                                from data.brti_proxy import BRTIProxy
+                                self._dashboard_brti = BRTIProxy()
+                            brti = self._dashboard_brti.get_price(symbol)
                         if brti:
                             current_str = f"${brti:,.{decimals}f}"
                             diff = brti - target
