@@ -2018,18 +2018,21 @@ class KalshiDaemon:
                 except Exception:
                     pass
 
-            # If ask > max, place resting order at our max price
+            # If ask > max, DON'T fill — match live behavior exactly
+            # Live would place a resting order that may never fill
             if contract_price > MAX_ENTRY_CENTS:
-                contract_price = MAX_ENTRY_CENTS
                 print(colored(
-                    f"  [KALSHI REST] {asset} {side.upper()} ask too high — resting order @ {MAX_ENTRY_CENTS}c",
+                    f"  [KALSHI REST] {asset} {side.upper()} ask {contract_price}c > {MAX_ENTRY_CENTS}c — skipping (no fill)",
                     "yellow"))
-                # Mark as resting for price watch monitoring
+                # Mark as price-watched (same as live resting order behavior)
                 if asset in self._kalshi_pending_signals:
                     self._kalshi_pending_signals[asset]["price_watch"] = True
                     self._kalshi_pending_signals[asset]["watch_side"] = direction_label
                     self._kalshi_pending_signals[asset]["watch_series"] = self.KALSHI_PAIRS.get(symbol, "")
+                pred["reason"] = f"price too high ({contract_price}c > {MAX_ENTRY_CENTS}c)"
+                return pred
 
+            # Ask <= MAX_ENTRY_CENTS — fill at the ask price (same as live fill)
             # Position sizing — CLI override or default 5%
             size_pct = self._cli_max_size_pct if self._cli_max_size_pct > 0 else 0.05
             risk_budget = int(self._dry_balance_cents * size_pct)
