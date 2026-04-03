@@ -221,7 +221,11 @@ class KalshiPredictorV3:
             vol_sma = float(indicator_row.get("vol_sma_20", 0))
             bb_range = float(indicator_row.get("bb_upper", 0)) - float(indicator_row.get("bb_lower", 0))
 
-            pct = df["close"].iloc[:-1].pct_change()
+            # norm_return: exclude synthetic row if present, otherwise use full series
+            if has_synthetic:
+                pct = df["close"].iloc[:-1].pct_change()
+            else:
+                pct = df["close"].pct_change()
             norm_ret_series = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
 
             sma_val = float(indicator_row.get("sma_20", prev_close))
@@ -229,14 +233,49 @@ class KalshiPredictorV3:
             adx_val = float(indicator_row.get("adx", 20))
 
             price_vs_ema = (prev_close - sma_val) / atr_val if atr_val > 0 else 0
+
             # hourly_return: 4-candle return matching training's pct_change(4)
-            hr_offset = 5 if has_synthetic else 4  # skip synthetic row in the span
-            if len(df) >= hr_offset + 1:
-                hr = (prev_close - float(df.iloc[-(hr_offset+1)]["close"])) / float(df.iloc[-(hr_offset+1)]["close"]) * 100
+            # indicator_row is the anchor — go 4 candles back from its position
+            ir_pos = -2 if has_synthetic else -1  # position of indicator_row in df
+            hr_back = ir_pos - 4  # 4 candles before indicator_row
+            if len(df) >= abs(hr_back):
+                hr = (prev_close - float(df.iloc[hr_back]["close"])) / float(df.iloc[hr_back]["close"]) * 100
             else:
                 hr = 0
-            trend_sign = 1 if prev_close >= sma_val else -1
+
+            # trend_direction: match training's zero-case for sma_val
+            if sma_val > 0:
+                trend_sign = 1 if prev_close >= sma_val else -1
+            else:
+                trend_sign = 0
             trend_dir = adx_val * trend_sign
+
+            # ema_slope: pct_change(3) at indicator_row position
+            if has_synthetic:
+                ema_series = df["ema_12"].iloc[:-1]  # exclude synthetic
+            else:
+                ema_series = df["ema_12"]
+            ema_slope_val = float(ema_series.pct_change(3).iloc[-1] * 100) if len(ema_series) >= 4 and pd.notna(ema_series.pct_change(3).iloc[-1]) else 0
+
+            # 1h/4h: use iloc[-2] to guarantee a completed candle (not in-progress)
+            if df_1h is not None and len(df_1h) >= 21:
+                r1h = df_1h.iloc[-2]
+                rsi_1h = float(r1h.get("rsi", 50))
+                macd_1h = float(r1h.get("macd_hist", 0))
+            elif df_1h is not None and len(df_1h) >= 20:
+                r1h = df_1h.iloc[-1]
+                rsi_1h = float(r1h.get("rsi", 50))
+                macd_1h = float(r1h.get("macd_hist", 0))
+            else:
+                rsi_1h = 50.0
+                macd_1h = 0.0
+
+            if df_4h is not None and len(df_4h) >= 11:
+                rsi_4h = float(df_4h.iloc[-2].get("rsi", 50))
+            elif df_4h is not None and len(df_4h) >= 10:
+                rsi_4h = float(df_4h.iloc[-1].get("rsi", 50))
+            else:
+                rsi_4h = 50.0
 
             # All 15 features in canonical order
             all_features = {
@@ -246,12 +285,12 @@ class KalshiPredictorV3:
                 "norm_return": float(norm_ret_series.iloc[-1]) if len(norm_ret_series) > 0 and pd.notna(norm_ret_series.iloc[-1]) else 0,
                 "vol_ratio": float(indicator_row.get("volume", 0)) / vol_sma if vol_sma > 0 else 1.0,
                 "bb_position": (prev_close - float(indicator_row.get("bb_lower", 0))) / bb_range if bb_range > 0 else 0.5,
-                "ema_slope": float(df["ema_12"].iloc[:-1].pct_change(3).iloc[-1] * 100) if len(df) >= 5 and pd.notna(df["ema_12"].iloc[:-1].pct_change(3).iloc[-1]) else 0,
+                "ema_slope": ema_slope_val,
                 "adx": adx_val,
                 "roc_5": float(indicator_row.get("roc_5", 0)),
-                "rsi_1h": float(df_1h.iloc[-1].get("rsi", 50)) if df_1h is not None and len(df_1h) >= 20 else 50.0,
-                "macd_1h": float(df_1h.iloc[-1].get("macd_hist", 0)) if df_1h is not None and len(df_1h) >= 20 else 0.0,
-                "rsi_4h": float(df_4h.iloc[-1].get("rsi", 50)) if df_4h is not None and len(df_4h) >= 10 else 50.0,
+                "rsi_1h": rsi_1h,
+                "macd_1h": macd_1h,
+                "rsi_4h": rsi_4h,
                 "price_vs_ema": price_vs_ema,
                 "hourly_return": hr,
                 "trend_direction": trend_dir,
