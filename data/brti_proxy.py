@@ -26,9 +26,10 @@ class BRTIProxy:
 
     def _get_exchange(self, name: str):
         if name not in self._exchanges:
+            # Only Coinbase + Bitstamp — matches training data exactly
+            # DO NOT add Kraken — model was trained on 2-exchange average
             constructors = {
                 "coinbase": lambda: ccxt.coinbase({"enableRateLimit": True}),
-                "kraken": lambda: ccxt.kraken({"enableRateLimit": True}),
                 "bitstamp": lambda: ccxt.bitstamp({"enableRateLimit": True}),
             }
             if name in constructors:
@@ -59,8 +60,8 @@ class BRTIProxy:
             except Exception:
                 return None
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            results = list(pool.map(_fetch, ["coinbase", "kraken", "bitstamp"]))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(_fetch, ["coinbase", "bitstamp"]))
 
         prices = [p for p in results if p is not None]
         if not prices:
@@ -114,7 +115,7 @@ class BRTIProxy:
             except Exception:
                 return (sym, None)
 
-        tasks = [(n, s) for s in to_fetch for n in ["coinbase", "kraken", "bitstamp"]]
+        tasks = [(n, s) for s in to_fetch for n in ["coinbase", "bitstamp"]]
         with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
             fetch_results = list(pool.map(_fetch, tasks))
 

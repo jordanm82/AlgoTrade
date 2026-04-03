@@ -202,12 +202,17 @@ class KalshiPredictorV3:
         if df is None or len(df) < 20:
             return None
 
-        # Use the SECOND-TO-LAST row for indicator features (last completed 15m candle)
-        if len(df) >= 2:
-            indicator_row = df.iloc[-2]
+        # Indicator row selection:
+        # - With snapshot (synthetic last row): use df.iloc[-2] (last real candle)
+        # - Without snapshot (raw 15m data): use df.iloc[-1] (last completed candle)
+        # Check: if last row's index matches a 15m boundary, it's likely real data
+        last_idx = df.index[-1]
+        has_synthetic = (last_idx.minute % 15 != 0) if hasattr(last_idx, 'minute') else False
+        if has_synthetic and len(df) >= 2:
+            indicator_row = df.iloc[-2]  # skip synthetic row
             current_close = float(df.iloc[-1]["close"])
         else:
-            indicator_row = df.iloc[-1]
+            indicator_row = df.iloc[-1]  # last row IS the completed candle
             current_close = float(df.iloc[-1]["close"])
 
         try:
@@ -224,8 +229,10 @@ class KalshiPredictorV3:
             adx_val = float(indicator_row.get("adx", 20))
 
             price_vs_ema = (prev_close - sma_val) / atr_val if atr_val > 0 else 0
-            if len(df) >= 6:
-                hr = (prev_close - float(df.iloc[-6]["close"])) / float(df.iloc[-6]["close"]) * 100
+            # hourly_return: 4-candle return matching training's pct_change(4)
+            hr_offset = 5 if has_synthetic else 4  # skip synthetic row in the span
+            if len(df) >= hr_offset + 1:
+                hr = (prev_close - float(df.iloc[-(hr_offset+1)]["close"])) / float(df.iloc[-(hr_offset+1)]["close"]) * 100
             else:
                 hr = 0
             trend_sign = 1 if prev_close >= sma_val else -1
