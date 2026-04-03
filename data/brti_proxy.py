@@ -39,7 +39,7 @@ class BRTIProxy:
     def get_price(self, symbol: str) -> float | None:
         """Get real-time averaged price for a symbol (e.g., 'BTC/USD').
 
-        Averages Coinbase + Kraken + Bitstamp last trade prices.
+        Averages Coinbase + Bitstamp last trade prices (matches training).
         Cached for 10 seconds. Each underlying call is a live API fetch.
         """
         # Normalize symbol

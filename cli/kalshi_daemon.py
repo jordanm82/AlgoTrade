@@ -11,6 +11,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 from termcolor import colored
 
@@ -139,11 +140,18 @@ class KalshiDaemon:
     # ------------------------------------------------------------------
 
     def _fetch_all(self):
-        """Fetch and cache 15m + 1h + 4h candles for all pairs. Called once at startup."""
+        """Fetch and cache 15m + 1h + 4h candles for all pairs."""
         for symbol in self.KALSHI_PAIRS:
             try:
                 df = self.fetcher.ohlcv(symbol, timeframe="15m", limit=200)
                 df = add_indicators(df)
+                # Add derived features used by _confirm_with_distance
+                pct = df["close"].pct_change()
+                df["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
+                df["vol_ratio"] = df["volume"] / df["vol_sma_20"]
+                df["ema_slope"] = df["ema_12"].pct_change(3) * 100
+                df["price_vs_ema"] = (df["close"] - df["sma_20"]) / df["atr"].replace(0, np.nan)
+                df["hourly_return"] = df["close"].pct_change(4) * 100
                 self._dataframes[symbol] = df
                 self._kalshi_cached_dataframes[symbol] = df
             except Exception as e:
