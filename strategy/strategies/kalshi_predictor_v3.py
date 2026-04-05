@@ -50,27 +50,48 @@ class KalshiPredictorV3:
             pass
 
         # Load prediction model(s)
-        # Supports dual (trend + conviction) or single (legacy) model
-        self._knn = None           # trend model (or single model for legacy)
-        self._knn_scaler = None    # trend scaler
-        self._conv_model = None    # conviction model (dual mode only)
-        self._conv_scaler = None   # conviction scaler
+        self._knn = None           # unified model (fallback)
+        self._knn_scaler = None
+        self._conv_model = None
+        self._conv_scaler = None
         self._model_type = None
+        self._per_asset_models = {}  # {asset: (model, scaler, feature_names)}
         try:
             import pickle
-            with open(knn_model_path, "rb") as f:
-                model_data = pickle.load(f)
-                self._model_type = model_data.get("model_type", "single")
-                if self._model_type == "dual_trend_conviction":
-                    self._knn = model_data["trend_model"]
-                    self._knn_scaler = model_data["trend_scaler"]
-                    self._conv_model = model_data["conv_model"]
-                    self._conv_scaler = model_data["conv_scaler"]
-                    self._trend_features = model_data.get("trend_features", [])
-                    self._conv_features = model_data.get("conv_features", [])
-                else:
-                    self._knn = model_data["knn"]
-                    self._knn_scaler = model_data["scaler"]
+            # Load per-asset models if they exist
+            from pathlib import Path
+            for asset_code in ["btc", "eth", "sol", "xrp"]:
+                pa_path = Path(f"models/m0_{asset_code}.pkl")
+                if pa_path.exists():
+                    with open(pa_path, "rb") as f:
+                        pa_data = pickle.load(f)
+                        self._per_asset_models[asset_code.upper()] = (
+                            pa_data["knn"], pa_data["scaler"], pa_data["feature_names"]
+                        )
+            if self._per_asset_models:
+                self._model_type = "per_asset_confluence"
+                # Also load unified as fallback
+                try:
+                    with open(knn_model_path, "rb") as f:
+                        model_data = pickle.load(f)
+                        self._knn = model_data["knn"]
+                        self._knn_scaler = model_data["scaler"]
+                except Exception:
+                    pass
+            else:
+                with open(knn_model_path, "rb") as f:
+                    model_data = pickle.load(f)
+                    self._model_type = model_data.get("model_type", "single")
+                    if self._model_type == "dual_trend_conviction":
+                        self._knn = model_data["trend_model"]
+                        self._knn_scaler = model_data["trend_scaler"]
+                        self._conv_model = model_data["conv_model"]
+                        self._conv_scaler = model_data["conv_scaler"]
+                        self._trend_features = model_data.get("trend_features", [])
+                        self._conv_features = model_data.get("conv_features", [])
+                    else:
+                        self._knn = model_data["knn"]
+                        self._knn_scaler = model_data["scaler"]
         except (FileNotFoundError, Exception):
             pass  # no model — early entry disabled
 
@@ -302,14 +323,14 @@ class KalshiPredictorV3:
             if any(pd.isna(v) or np.isinf(v) for v in all_features.values()):
                 return None
 
-            # === Strike-relative mode ===
-            if self._model_type == "strike_relative":
+            # === Strike-relative / per-asset confluence mode ===
+            if self._model_type in ("strike_relative", "per_asset_confluence"):
                 if distance_from_strike is None:
-                    return None  # need distance — called without strike context
+                    return None
 
                 all_features["distance_from_strike"] = distance_from_strike
 
-                # Kalshi-specific + time + technical features (V2 model, 23 features)
+                # Kalshi-specific + time + technical features
                 kx = kalshi_extra or {}
                 all_features["prev_result"] = kx.get("prev_result", 0.5)
                 all_features["prev_3_yes_pct"] = kx.get("prev_3_yes_pct", 0.5)
@@ -328,23 +349,38 @@ class KalshiPredictorV3:
                 all_features["atr_percentile"] = kx.get("atr_percentile", 0.5)
                 all_features["rsi_15m"] = float(indicator_row.get("rsi", 50))
 
-                # Bollinger Band Width — regime detection
+                # Bollinger Band Width
                 bb_up = float(indicator_row.get("bb_upper", 0))
                 bb_lo = float(indicator_row.get("bb_lower", 0))
                 bb_m = float(indicator_row.get("sma_20", 0))
                 all_features["bbw"] = ((bb_up - bb_lo) / bb_m * 100) if bb_m > 0 else 0
 
-                # Get features in model's expected order
-                model_features = self._knn_scaler.feature_names_in_ if hasattr(self._knn_scaler, 'feature_names_in_') else None
-                feature_names = model_features if model_features is not None else [
-                    "macd_15m", "norm_return", "ema_slope", "roc_5",
-                    "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
-                    "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
-                ]
-                vals = [all_features[f] for f in feature_names]
-                X = np.array(vals).reshape(1, -1)
-                prob_up = float(self._knn.predict_proba(
-                    self._knn_scaler.transform(X))[0][1])
+                # Cross-asset confluence features
+                all_features["alt_rsi_avg"] = kx.get("alt_rsi_avg", 50)
+                all_features["alt_rsi_1h_avg"] = kx.get("alt_rsi_1h_avg", 50)
+                all_features["alt_momentum_align"] = kx.get("alt_momentum_align", 0)
+                all_features["prev_result_consensus"] = kx.get("prev_result_consensus", 0.5)
+                all_features["alt_distance_avg"] = kx.get("alt_distance_avg", 0)
+
+                # Select per-asset model or fall back to unified
+                asset = kx.get("asset", "")
+                if asset in self._per_asset_models:
+                    pa_model, pa_scaler, pa_features = self._per_asset_models[asset]
+                    vals = [all_features.get(f, 0) for f in pa_features]
+                    X = np.array(vals).reshape(1, -1)
+                    prob_up = float(pa_model.predict_proba(pa_scaler.transform(X))[0][1])
+                elif self._knn is not None:
+                    model_features = self._knn_scaler.feature_names_in_ if hasattr(self._knn_scaler, 'feature_names_in_') else None
+                    feature_names = model_features if model_features is not None else [
+                        "macd_15m", "norm_return", "ema_slope", "roc_5",
+                        "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
+                        "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
+                    ]
+                    vals = [all_features[f] for f in feature_names]
+                    X = np.array(vals).reshape(1, -1)
+                    prob_up = float(self._knn.predict_proba(self._knn_scaler.transform(X))[0][1])
+                else:
+                    return None
 
                 self._log_prediction(prev_close, sma_val, prob_up, all_features)
                 return prob_up

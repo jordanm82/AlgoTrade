@@ -42,12 +42,21 @@ class KalshiDaemon:
         "XRP/USDT": "KXXRP15M",
     }
 
-    # Per-asset LR thresholds (dual trend+conviction model, walk-forward validated)
+    # Per-asset M0 entry thresholds (per-asset confluence models)
+    # With confluence, models are much more confident — can use tighter thresholds
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 60,
-        "ETH/USDT": 60,
-        "SOL/USDT": 60,
-        "XRP/USDT": 60,
+        "BTC/USDT": 67,  # 89.5% WR, $716 P&L
+        "ETH/USDT": 60,  # 87.7% WR, $716 P&L
+        "SOL/USDT": 63,  # 86.4% WR, $595 P&L
+        "XRP/USDT": 67,  # 84.2% WR, $309 P&L
+    }
+
+    # Per-asset M10 exit thresholds (per-asset confluence M10 models)
+    KALSHI_M10_THRESHOLDS = {
+        "BTC/USDT": 65,  # 92.2% WR, $810 P&L
+        "ETH/USDT": 60,  # 92.3% WR, $840 P&L
+        "SOL/USDT": 65,  # 92.3% WR, $730 P&L
+        "XRP/USDT": 60,  # 91.6% WR, $447 P&L
     }
 
     # Per-asset TEK (technical/probability table) thresholds
@@ -142,46 +151,86 @@ class KalshiDaemon:
     # ------------------------------------------------------------------
 
     def _fetch_all(self):
-        """Fetch and cache 15m + 1h + 4h candles for all pairs."""
-        for symbol in self.KALSHI_PAIRS:
+        """Fetch and cache 15m + 1h + 4h candles for all pairs (parallel)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _fetch_symbol(symbol):
+            """Fetch all timeframes for one symbol."""
+            results = {}
             try:
                 df = self.fetcher.ohlcv(symbol, timeframe="15m", limit=200)
                 df = add_indicators(df)
-                # Add derived features used by _confirm_with_distance
                 pct = df["close"].pct_change()
                 df["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
                 df["vol_ratio"] = df["volume"] / df["vol_sma_20"]
                 df["ema_slope"] = df["ema_12"].pct_change(3) * 100
                 df["price_vs_ema"] = (df["close"] - df["sma_20"]) / df["atr"].replace(0, np.nan)
                 df["hourly_return"] = df["close"].pct_change(4) * 100
-                self._dataframes[symbol] = df
-                self._kalshi_cached_dataframes[symbol] = df
+                results["15m"] = df
             except Exception as e:
                 print(colored(f"  [WARN] 15m fetch failed for {symbol}: {e}", "yellow"))
             try:
                 df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
                 if df_1h is not None and not df_1h.empty:
-                    self._kalshi_cached_dataframes[f"{symbol}_1h"] = add_indicators(df_1h)
+                    results["1h"] = add_indicators(df_1h)
             except Exception:
                 pass
             try:
                 df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
                 if df_4h is not None and not df_4h.empty:
-                    self._kalshi_cached_dataframes[f"{symbol}_4h"] = add_indicators(df_4h)
+                    results["4h"] = add_indicators(df_4h)
             except Exception:
                 pass
+            return symbol, results
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = list(pool.map(_fetch_symbol, self.KALSHI_PAIRS.keys()))
+
+        for symbol, results in futures:
+            if "15m" in results:
+                self._dataframes[symbol] = results["15m"]
+                self._kalshi_cached_dataframes[symbol] = results["15m"]
+            if "1h" in results:
+                self._kalshi_cached_dataframes[f"{symbol}_1h"] = results["1h"]
+            if "4h" in results:
+                self._kalshi_cached_dataframes[f"{symbol}_4h"] = results["4h"]
+
+    def _prefetch_kalshi_markets(self):
+        """Batch-fetch all K15 open + settled markets in 2 API calls.
+
+        Caches results so per-asset strike/extra queries don't need individual API calls.
+        """
+        self._init_kalshi_client()
+        if not self.kalshi_client:
+            return
+
+        self._kalshi_open_markets_cache = {}  # {series_ticker: [markets]}
+        self._kalshi_settled_markets_cache = {}  # {series_ticker: [markets]}
+
+        try:
+            # One call for ALL open K15 markets
+            all_open = []
+            for series in self.KALSHI_PAIRS.values():
+                # Can't batch across series, but can reuse connection
+                markets = self.kalshi_client.get_markets(series_ticker=series, status="open")
+                self._kalshi_open_markets_cache[series] = markets
+            # One call for ALL settled K15 markets (recent only)
+            for series in self.KALSHI_PAIRS.values():
+                markets = self.kalshi_client.get_markets(series_ticker=series, status="settled")
+                self._kalshi_settled_markets_cache[series] = markets
+        except Exception as e:
+            print(colored(f"  [WARN] Kalshi market prefetch failed: {e}", "yellow"))
 
     # ------------------------------------------------------------------
     # Coinbase price
     # ------------------------------------------------------------------
 
     def _get_kalshi_extra(self, asset: str, symbol: str, strike: float) -> dict:
-        """Compute Kalshi-specific + time + technical features for the new 23-feature model."""
-        import math
-
+        """Compute Kalshi-specific + time + technical + confluence features."""
         now_utc = datetime.now(timezone.utc)
         hour = now_utc.hour
         extra = {
+            "asset": asset,  # used by predictor to select per-asset model
             "prev_result": 0.5,
             "prev_3_yes_pct": 0.5,
             "streak_length": 0,
@@ -191,13 +240,19 @@ class KalshiDaemon:
             "atr_percentile": 0.5,
         }
 
-        # Get recent settled markets for lookback
+        # Get recent settled markets for lookback (use cache if available)
         series = self.KALSHI_PAIRS.get(symbol, "")
-        if not series or not self.kalshi_client:
+        if not series:
             return extra
 
         try:
-            settled = self.kalshi_client.get_markets(series_ticker=series, status="settled")
+            # Use prefetched cache if available, otherwise query API
+            if hasattr(self, '_kalshi_settled_markets_cache') and series in self._kalshi_settled_markets_cache:
+                settled = self._kalshi_settled_markets_cache[series]
+            elif self.kalshi_client:
+                settled = self.kalshi_client.get_markets(series_ticker=series, status="settled")
+            else:
+                return extra
             if not settled:
                 return extra
             # Sort by close_time descending (most recent first)
@@ -255,6 +310,64 @@ class KalshiDaemon:
         except Exception:
             pass
 
+        # === Cross-asset confluence features ===
+        all_assets = list(self.KALSHI_PAIRS.keys())  # symbols like "BTC/USDT"
+        alt_symbols = [s for s in all_assets if s.split("/")[0] != asset]
+
+        alt_rsi_15m, alt_rsi_1h, alt_momentum = [], [], []
+        alt_prev_results, alt_distances = [], []
+
+        for alt_sym in alt_symbols:
+            alt_asset = alt_sym.split("/")[0]
+            # Alt RSI from cached 15m data
+            alt_15m = self._kalshi_cached_dataframes.get(alt_sym)
+            if alt_15m is not None and len(alt_15m) >= 2:
+                rsi_val = float(alt_15m.iloc[-1].get("rsi", 50))
+                alt_rsi_15m.append(rsi_val)
+                alt_momentum.append(1 if rsi_val >= 50 else -1)
+
+            # Alt RSI 1h
+            alt_1h = self._kalshi_cached_dataframes.get(f"{alt_sym}_1h")
+            if alt_1h is not None and len(alt_1h) >= 2:
+                alt_rsi_1h.append(float(alt_1h.iloc[-2].get("rsi", 50)))
+
+            # Alt previous settlement result
+            alt_series = self.KALSHI_PAIRS.get(alt_sym, "")
+            if hasattr(self, '_kalshi_settled_markets_cache') and alt_series in self._kalshi_settled_markets_cache:
+                alt_settled = self._kalshi_settled_markets_cache[alt_series]
+                if alt_settled:
+                    sorted_s = sorted(alt_settled, key=lambda m: m.get("close_time", ""), reverse=True)
+                    r = sorted_s[0].get("result", "")
+                    if r:
+                        alt_prev_results.append(1 if r == "yes" else 0)
+
+            # Alt distance from strike
+            if self._brti_proxy is not None:
+                usd_sym = alt_sym.replace("/USDT", "/USD")
+                alt_price = self._brti_proxy.get_price(usd_sym)
+                if alt_price and hasattr(self, '_kalshi_open_markets_cache'):
+                    if alt_series in self._kalshi_open_markets_cache:
+                        for mk in self._kalshi_open_markets_cache[alt_series]:
+                            alt_strike = float(mk.get("floor_strike") or 0)
+                            if alt_strike and alt_15m is not None and len(alt_15m) >= 2:
+                                alt_atr = float(alt_15m.iloc[-1].get("atr", 0))
+                                if alt_atr > 0:
+                                    alt_distances.append((alt_price - alt_strike) / alt_atr)
+                                break
+
+        extra["alt_rsi_avg"] = sum(alt_rsi_15m) / len(alt_rsi_15m) if alt_rsi_15m else 50
+        extra["alt_rsi_1h_avg"] = sum(alt_rsi_1h) / len(alt_rsi_1h) if alt_rsi_1h else 50
+        extra["alt_momentum_align"] = sum(alt_momentum) if alt_momentum else 0
+
+        # Consensus: this asset's prev_result + alt prev_results
+        all_prev = []
+        if extra["prev_result"] != 0.5:
+            all_prev.append(extra["prev_result"])
+        all_prev.extend(alt_prev_results)
+        extra["prev_result_consensus"] = sum(1 for r in all_prev if r == 1) / len(all_prev) if len(all_prev) >= 2 else 0.5
+
+        extra["alt_distance_avg"] = sum(alt_distances) / len(alt_distances) if alt_distances else 0
+
         return extra
 
     def _get_kalshi_strike(self, series_ticker: str) -> tuple:
@@ -270,7 +383,16 @@ class KalshiDaemon:
             return None, None, None
 
         try:
-            markets = self.kalshi_client.get_markets(series_ticker=series_ticker, status="open")
+            # Use prefetched cache if available AND non-empty, otherwise query API live
+            if (hasattr(self, '_kalshi_open_markets_cache')
+                    and series_ticker in self._kalshi_open_markets_cache
+                    and self._kalshi_open_markets_cache[series_ticker]):
+                markets = self._kalshi_open_markets_cache[series_ticker]
+            else:
+                markets = self.kalshi_client.get_markets(series_ticker=series_ticker, status="open")
+                # Update cache with fresh results
+                if hasattr(self, '_kalshi_open_markets_cache') and markets:
+                    self._kalshi_open_markets_cache[series_ticker] = markets
             if not markets:
                 return None, None, None
 
@@ -285,6 +407,9 @@ class KalshiDaemon:
                     if close_dt > now_utc:
                         future_markets.append(mk)
             if not future_markets:
+                # Cache had stale data — clear it so next call queries live
+                if hasattr(self, '_kalshi_open_markets_cache') and series_ticker in self._kalshi_open_markets_cache:
+                    del self._kalshi_open_markets_cache[series_ticker]
                 return None, None, None
 
             # Pick the soonest future market
@@ -520,15 +645,31 @@ class KalshiDaemon:
     MIN_SELL_PRICE = 10  # floor: won't sell below 10c, place resting sell instead
 
     def _load_m10_model(self):
-        """Lazy-load the M10 confirmation model."""
+        """Lazy-load M10 models (per-asset if available, unified fallback)."""
         if self._m10_model is not None:
             return
         try:
             import pickle
+            from pathlib import Path
+            # Load per-asset M10 models
+            self._m10_per_asset = {}
+            for asset_code in ["btc", "eth", "sol", "xrp"]:
+                pa_path = Path(f"models/m10_{asset_code}.pkl")
+                if pa_path.exists():
+                    with open(pa_path, "rb") as f:
+                        pa_data = pickle.load(f)
+                        self._m10_per_asset[asset_code.upper()] = (
+                            pa_data.get("model") or pa_data.get("knn"),
+                            pa_data["scaler"],
+                            pa_data["feature_names"],
+                        )
+            # Load unified as fallback
             with open("models/m10_kalshi.pkl", "rb") as f:
                 data = pickle.load(f)
-                self._m10_model = data["model"]
+                self._m10_model = data.get("model") or data.get("knn")
                 self._m10_scaler = data["scaler"]
+            if self._m10_per_asset:
+                print(colored(f"  [M10] Loaded {len(self._m10_per_asset)} per-asset models", "green"))
         except Exception as e:
             print(colored(f"  [M10] Model load failed: {e}", "yellow"))
 
@@ -613,13 +754,14 @@ class KalshiDaemon:
             if df_4h is not None and len(df_4h) >= 11:
                 feat["rsi_4h"] = float(df_4h.iloc[-2].get("rsi", 50))
 
-            # Kalshi-specific + time + technical features
+            # Kalshi-specific + time + technical + confluence features
             kx = self._get_kalshi_extra(asset, symbol, strike)
-            feat["prev_result"] = kx.get("prev_result", 0.5)
-            feat["prev_3_yes_pct"] = kx.get("prev_3_yes_pct", 0.5)
-            feat["streak_length"] = kx.get("streak_length", 0)
-            feat["strike_delta"] = kx.get("strike_delta", 0.0)
-            feat["strike_trend_3"] = kx.get("strike_trend_3", 0.0)
+            for k in ["prev_result", "prev_3_yes_pct", "streak_length",
+                       "strike_delta", "strike_trend_3",
+                       "alt_rsi_avg", "alt_rsi_1h_avg", "alt_momentum_align",
+                       "prev_result_consensus", "alt_distance_avg"]:
+                feat[k] = kx.get(k, 0)
+            feat["atr_percentile"] = kx.get("atr_percentile", 0.5)
             hour = datetime.now(timezone.utc).hour
             feat["hour_sin"] = float(np.sin(2 * np.pi * hour / 24))
             feat["hour_cos"] = float(np.cos(2 * np.pi * hour / 24))
@@ -627,10 +769,9 @@ class KalshiDaemon:
                 (1 if feat["rsi_1h"] >= 50 else -1) *
                 (1 if feat["rsi_4h"] >= 50 else -1)
             )
-            feat["atr_percentile"] = kx.get("atr_percentile", 0.5)
             feat["rsi_15m"] = float(pr.get("rsi", 50))
 
-            # Bollinger Band Width — regime detection
+            # Bollinger Band Width
             bb_upper = float(pr.get("bb_upper", 0))
             bb_lower = float(pr.get("bb_lower", 0))
             bb_mid = float(pr.get("sma_20", 0))
@@ -639,21 +780,23 @@ class KalshiDaemon:
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
 
-            # Run M10 model — use feature names from saved model
-            feature_names = self._m10_scaler.feature_names_in_ if hasattr(self._m10_scaler, 'feature_names_in_') else [
-                "macd_15m", "norm_return", "ema_slope", "roc_5",
-                "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
-                "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
-                "prev_result", "prev_3_yes_pct", "streak_length",
-                "strike_delta", "strike_trend_3",
-                "hour_sin", "hour_cos",
-                "rsi_alignment", "atr_percentile", "rsi_15m", "bbw",
-            ]
-            X = np.array([feat[f] for f in feature_names]).reshape(1, -1)
-            prob = float(self._m10_model.predict_proba(self._m10_scaler.transform(X))[0][1])
+            # Select per-asset M10 model or fall back to unified
+            if hasattr(self, '_m10_per_asset') and asset in self._m10_per_asset:
+                pa_model, pa_scaler, pa_features = self._m10_per_asset[asset]
+                X = np.array([feat.get(f, 0) for f in pa_features]).reshape(1, -1)
+                prob = float(pa_model.predict_proba(pa_scaler.transform(X))[0][1])
+            else:
+                feature_names = self._m10_scaler.feature_names_in_ if hasattr(self._m10_scaler, 'feature_names_in_') else [
+                    "macd_15m", "norm_return", "ema_slope", "roc_5",
+                    "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
+                    "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
+                ]
+                X = np.array([feat[f] for f in feature_names]).reshape(1, -1)
+                prob = float(self._m10_model.predict_proba(self._m10_scaler.transform(X))[0][1])
             pct = int(prob * 100)
 
-            m10_side = "yes" if pct >= 70 else "no" if pct <= 30 else "skip"
+            m10_thresh = self.KALSHI_M10_THRESHOLDS.get(symbol, 70)
+            m10_side = "yes" if pct >= m10_thresh else "no" if pct <= (100 - m10_thresh) else "skip"
             dir_label = "YES" if side == "yes" else "NO"
             bet["_m10_checked"] = True
 
@@ -1438,6 +1581,7 @@ class KalshiDaemon:
             if self._resting_orders and (not self.dry_run or self.demo):
                 self._cancel_all_resting_orders("window boundary")
             self._fetch_all()
+            self._prefetch_kalshi_markets()  # batch Kalshi queries for this window
             self._kalshi_cached_dataframes["_refreshed_" + str(current_window_start)] = True
             if self.kalshi_ws:
                 self._ws_subscribe_current_markets()
@@ -2321,9 +2465,9 @@ class KalshiDaemon:
             # Aggressive fill loop — if resting, reprice every 2s until filled or ask > MAX
             if float(fill_count) < count and order_status == "resting":
                 import time as _t
-                MAX_REPRICE_ATTEMPTS = 4  # 4 retries × 2s = ~8s total
+                MAX_REPRICE_ATTEMPTS = 2  # 2 retries × 1s = ~2s total
                 for reprice_attempt in range(MAX_REPRICE_ATTEMPTS):
-                    _t.sleep(2)
+                    _t.sleep(1)
 
                     # Check if filled since last attempt
                     try:
