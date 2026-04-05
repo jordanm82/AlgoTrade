@@ -49,7 +49,7 @@ class TestGetOrderStatus:
         with patch.object(client, "_get", return_value={"order": {"status": "resting"}}) as mock:
             result = client.get_order_status("order-123")
             mock.assert_called_once_with("/trade-api/v2/portfolio/orders/order-123")
-            assert result["order"]["status"] == "resting"
+            assert result["status"] == "resting"
 
 
 class TestCancelOrderSafe:

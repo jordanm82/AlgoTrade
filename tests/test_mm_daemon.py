@@ -29,7 +29,7 @@ def _mock_client():
     ]
     client.place_order.return_value = {"order": {"order_id": "ord-123", "status": "resting"}}
     client.cancel_order_safe.return_value = {"status": "cancelled"}
-    client.get_order_status.return_value = {"order": {"status": "resting"}}
+    client.get_order_status.return_value = {"status": "resting"}
     return client
 
 
@@ -392,7 +392,7 @@ class TestLiveModeBidFill:
     def test_live_bid_fill_uses_order_status(self):
         client = _mock_client()
         client.get_order_status.return_value = {
-            "order": {"status": "filled", "count": 15}
+            "status": "filled", "count": 15
         }
         runner = _make_runner(client, dry_run=False)
         runner.inv.state = QUOTING_BID

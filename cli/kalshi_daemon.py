@@ -44,10 +44,10 @@ class KalshiDaemon:
 
     # Per-asset LR thresholds (dual trend+conviction model, walk-forward validated)
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 53,
-        "ETH/USDT": 53,
-        "SOL/USDT": 53,
-        "XRP/USDT": 53,
+        "BTC/USDT": 60,
+        "ETH/USDT": 60,
+        "SOL/USDT": 60,
+        "XRP/USDT": 60,
     }
 
     # Per-asset TEK (technical/probability table) thresholds
@@ -174,6 +174,88 @@ class KalshiDaemon:
     # ------------------------------------------------------------------
     # Coinbase price
     # ------------------------------------------------------------------
+
+    def _get_kalshi_extra(self, asset: str, symbol: str, strike: float) -> dict:
+        """Compute Kalshi-specific + time + technical features for the new 23-feature model."""
+        import math
+
+        now_utc = datetime.now(timezone.utc)
+        hour = now_utc.hour
+        extra = {
+            "prev_result": 0.5,
+            "prev_3_yes_pct": 0.5,
+            "streak_length": 0,
+            "strike_delta": 0.0,
+            "strike_trend_3": 0.0,
+            "hour": hour,
+            "atr_percentile": 0.5,
+        }
+
+        # Get recent settled markets for lookback
+        series = self.KALSHI_PAIRS.get(symbol, "")
+        if not series or not self.kalshi_client:
+            return extra
+
+        try:
+            settled = self.kalshi_client.get_markets(series_ticker=series, status="settled")
+            if not settled:
+                return extra
+            # Sort by close_time descending (most recent first)
+            settled.sort(key=lambda m: m.get("close_time", ""), reverse=True)
+
+            # Get ATR for normalization
+            df_15m = self._kalshi_cached_dataframes.get(symbol)
+            atr = 0
+            if df_15m is not None and len(df_15m) >= 20:
+                atr = float(df_15m.iloc[-1].get("atr", 0))
+                if pd.isna(atr):
+                    atr = 0
+                # ATR percentile
+                atr_s = df_15m["atr"].dropna()
+                if len(atr_s) >= 20:
+                    r20 = atr_s.rolling(20)
+                    mn, mx = float(r20.min().iloc[-1]), float(r20.max().iloc[-1])
+                    if mx > mn:
+                        extra["atr_percentile"] = (atr - mn) / (mx - mn)
+
+            # Previous results and strikes
+            prev_results = []
+            prev_strikes = []
+            for mk in settled[:3]:
+                r = mk.get("result", "")
+                s = float(mk.get("floor_strike") or 0)
+                if r:
+                    prev_results.append(1 if r == "yes" else 0)
+                if s:
+                    prev_strikes.append(s)
+
+            if prev_results:
+                extra["prev_result"] = prev_results[0]
+                extra["prev_3_yes_pct"] = sum(prev_results) / len(prev_results)
+                # Streak
+                streak = 0
+                last_r = prev_results[0]
+                for r in prev_results:
+                    if r == last_r:
+                        streak += 1
+                    else:
+                        break
+                extra["streak_length"] = streak if last_r == 1 else -streak
+
+            if prev_strikes and strike and atr > 0:
+                extra["strike_delta"] = (strike - prev_strikes[0]) / atr
+                if len(prev_strikes) >= 2:
+                    deltas = [strike - prev_strikes[0]]
+                    for k in range(len(prev_strikes) - 1):
+                        deltas.append(prev_strikes[k] - prev_strikes[k + 1])
+                    extra["strike_trend_3"] = sum(d / atr for d in deltas) / len(deltas)
+                else:
+                    extra["strike_trend_3"] = extra["strike_delta"]
+
+        except Exception:
+            pass
+
+        return extra
 
     def _get_kalshi_strike(self, series_ticker: str) -> tuple:
         """Get strike price and close time for current open market.
@@ -531,20 +613,47 @@ class KalshiDaemon:
             if df_4h is not None and len(df_4h) >= 11:
                 feat["rsi_4h"] = float(df_4h.iloc[-2].get("rsi", 50))
 
+            # Kalshi-specific + time + technical features
+            kx = self._get_kalshi_extra(asset, symbol, strike)
+            feat["prev_result"] = kx.get("prev_result", 0.5)
+            feat["prev_3_yes_pct"] = kx.get("prev_3_yes_pct", 0.5)
+            feat["streak_length"] = kx.get("streak_length", 0)
+            feat["strike_delta"] = kx.get("strike_delta", 0.0)
+            feat["strike_trend_3"] = kx.get("strike_trend_3", 0.0)
+            hour = datetime.now(timezone.utc).hour
+            feat["hour_sin"] = float(np.sin(2 * np.pi * hour / 24))
+            feat["hour_cos"] = float(np.cos(2 * np.pi * hour / 24))
+            feat["rsi_alignment"] = (
+                (1 if feat["rsi_1h"] >= 50 else -1) *
+                (1 if feat["rsi_4h"] >= 50 else -1)
+            )
+            feat["atr_percentile"] = kx.get("atr_percentile", 0.5)
+            feat["rsi_15m"] = float(pr.get("rsi", 50))
+
+            # Bollinger Band Width — regime detection
+            bb_upper = float(pr.get("bb_upper", 0))
+            bb_lower = float(pr.get("bb_lower", 0))
+            bb_mid = float(pr.get("sma_20", 0))
+            feat["bbw"] = ((bb_upper - bb_lower) / bb_mid * 100) if bb_mid > 0 else 0
+
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
 
-            # Run M10 model
-            feature_names = [
+            # Run M10 model — use feature names from saved model
+            feature_names = self._m10_scaler.feature_names_in_ if hasattr(self._m10_scaler, 'feature_names_in_') else [
                 "macd_15m", "norm_return", "ema_slope", "roc_5",
                 "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
                 "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
+                "prev_result", "prev_3_yes_pct", "streak_length",
+                "strike_delta", "strike_trend_3",
+                "hour_sin", "hour_cos",
+                "rsi_alignment", "atr_percentile", "rsi_15m", "bbw",
             ]
             X = np.array([feat[f] for f in feature_names]).reshape(1, -1)
             prob = float(self._m10_model.predict_proba(self._m10_scaler.transform(X))[0][1])
             pct = int(prob * 100)
 
-            m10_side = "yes" if pct >= 55 else "no" if pct <= 45 else "skip"
+            m10_side = "yes" if pct >= 70 else "no" if pct <= 30 else "skip"
             dir_label = "YES" if side == "yes" else "NO"
             bet["_m10_checked"] = True
 
@@ -555,9 +664,9 @@ class KalshiDaemon:
                 self._kalshi_pending_signals[asset]["m10_score"] = m10_display
                 self._kalshi_pending_signals[asset]["m10_side"] = m10_side
 
-            # Does M10 agree with our bet?
-            if side == m10_side:
-                # M10 confirms — hold
+            # Does M10 agree with our bet? Skip = uncertain = hold.
+            if m10_side == "skip" or side == m10_side:
+                # M10 confirms or is uncertain — hold
                 print(colored(
                     f"  [M10 CONFIRM] {asset} {dir_label} dist={distance:+.2f} M10={pct}% — holding",
                     "green",
@@ -585,12 +694,10 @@ class KalshiDaemon:
                         pass
 
             if not current_bid or current_bid <= 0:
-                print(colored(
-                    f"  [M10 EXIT] {asset} {dir_label} M10={pct}% — no bid, holding",
-                    "yellow"))
-                continue
+                # No bid available — treat as below floor, place resting sell at floor
+                current_bid = 0
 
-            # 10c floor: if bid < 10c, place resting sell at 10c instead of market sell
+            # 10c floor (or no bid): place resting sell at floor price
             if current_bid < self.MIN_SELL_PRICE:
                 print(colored(
                     f"  [M10 EXIT] {asset} {dir_label} M10={pct}% bid={current_bid}c < {self.MIN_SELL_PRICE}c — "
@@ -610,19 +717,40 @@ class KalshiDaemon:
                 )
 
                 if not (self.dry_run and not self.demo):
-                    # Live: place resting sell at 10c
-                    try:
-                        self.kalshi_client.place_order(
-                            ticker=ticker, side=side, count=bet.get("count", 0),
-                            price_cents=self.MIN_SELL_PRICE,
-                            order_type="limit", action="sell",
-                        )
-                    except Exception as e:
-                        print(colored(f"  [M10 SELL ERR] {asset}: {e}", "red"))
-                else:
-                    # Dry-run: simulate — don't exit yet, let settlement handle
-                    # The resting sell at 10c might or might not fill before settlement
-                    pass
+                    # Live: place resting sell at floor price
+                    sell_count = bet.get("count", 0)
+                    if sell_count <= 0:
+                        # Verify actual position from exchange
+                        try:
+                            positions = self.kalshi_client.get_positions()
+                            for p in positions:
+                                if p.get("ticker") == ticker:
+                                    sell_count = abs(int(float(p.get("position_fp", p.get("position", 0)))))
+                                    break
+                        except Exception:
+                            pass
+                    if sell_count > 0:
+                        try:
+                            self.kalshi_client.place_order(
+                                ticker=ticker, side=side, count=sell_count,
+                                price_cents=self.MIN_SELL_PRICE,
+                                order_type="limit", action="sell",
+                            )
+                        except Exception as e:
+                            print(colored(f"  [M10 SELL ERR] {asset}: {e}", "red"))
+                    else:
+                        print(colored(f"  [M10 SELL] {asset} no position to sell", "yellow"))
+
+                # Mark as exited — prevents settlement from double-counting
+                pnl_cents = bet.get("count", 0) * (self.MIN_SELL_PRICE - entry)
+                pnl_dollars = pnl_cents / 100
+                bet["result"] = "PL"
+                bet["pnl_cents"] = pnl_cents
+                bet["pnl_dollars"] = pnl_dollars
+                bet["exited_early"] = True
+                self._completed_bets.append(bet)
+                self._session_partial_losses += 1
+                self._pending_bets = [b for b in self._pending_bets if b is not bet]
                 continue
 
             # Bid >= 10c: exit at market
@@ -1134,44 +1262,19 @@ class KalshiDaemon:
                         if not result:
                             continue
 
-                        entry_price = bet.get("contract_price", 0)
+                        entry_price = bet.get("contract_price", bet.get("fill_price", 0))
                         count = bet.get("count", 1)
                         settled_value = float(m.get("expiration_value", 0))
 
-                        if self.dry_run and not self.demo:
-                            # Dry-run: compute P&L from simulated entry
-                            won = bet["side"] == result
-                            if won:
-                                pnl_cents = count * (100 - entry_price)
-                            else:
-                                pnl_cents = -(count * entry_price)
-                            pnl_dollars = pnl_cents / 100
+                        # Compute P&L from our known entry price + settlement result
+                        # Don't use settlements API costs — they mix buy+sell transactions
+                        # and produce wrong entry prices when M10 early exits happened
+                        won = bet["side"] == result
+                        if won:
+                            pnl_cents = count * (100 - entry_price)
                         else:
-                            # Live: use Kalshi settlements API for real P&L
-                            try:
-                                setts = self.kalshi_client.get_settlements(limit=50)
-                                matched = False
-                                for s in setts:
-                                    if s.get("ticker") == m.get("ticker"):
-                                        revenue = int(s.get("revenue", 0))
-                                        y_cost = float(s.get("yes_total_cost_dollars", 0)) * 100
-                                        n_cost = float(s.get("no_total_cost_dollars", 0)) * 100
-                                        pnl_cents = revenue - int(y_cost + n_cost)
-                                        pnl_dollars = pnl_cents / 100
-                                        won = pnl_cents > 0
-                                        count = int(float(s.get("yes_count_fp", 0))) or int(float(s.get("no_count_fp", 0)))
-                                        if count > 0:
-                                            entry_price = int((y_cost + n_cost) / count)
-                                        matched = True
-                                        break
-                                if not matched:
-                                    won = bet["side"] == result
-                                    pnl_cents = count * (100 - entry_price) if won else -(count * entry_price)
-                                    pnl_dollars = pnl_cents / 100
-                            except Exception:
-                                won = bet["side"] == result
-                                pnl_cents = count * (100 - entry_price) if won else -(count * entry_price)
-                                pnl_dollars = pnl_cents / 100
+                            pnl_cents = -(count * entry_price)
+                        pnl_dollars = pnl_cents / 100
 
                         result_str = "WIN" if won else "LOSS"
                         color = "green" if won else "red"
@@ -1298,12 +1401,12 @@ class KalshiDaemon:
     # ------------------------------------------------------------------
 
     def _kalshi_eval(self):
-        """Kalshi evaluation — continuous entry model.
+        """Kalshi evaluation — minute-0 entry only.
 
         Lifecycle within each 15m window:
-        - SETUP (min 0-1): Fetch 15m candles, compute indicators, cache.
-        - CONFIRMED (min 2-10): 1m updates, evaluate + execute if signal+price align.
-        - DONE (min 11+): Too close to settlement.
+        - ENTRY (min 0-1): Signal + reprice up to 60c, one shot per asset.
+        - MONITORING (min 2-9): Hold position, no new entries.
+        - M10 CONFIRM (min 10+): M10 model decides hold or exit.
         """
         from data.market_data import get_order_book_imbalance, get_trade_flow
 
@@ -1314,10 +1417,12 @@ class KalshiDaemon:
         if self._resting_orders and minute_in_window >= 1:
             self._check_resting_orders()
 
-        # Minute 10 confirmation — uses M10 model (trained on minute-10 distances)
+        # Minute 10+ confirmation — uses M10 model (trained on minute-10 distances)
         # Previous exits used M0 model which was 92% wrong at minute 10.
         # M10 model: 85.6% WR out-of-sample, distance coeff +3.71
-        if minute_in_window == 10:
+        # Use >= 10 instead of == 10 so we don't miss it if eval doesn't land exactly at min 10.
+        # Each bet has _m10_checked flag to prevent double-runs.
+        if minute_in_window >= 10:
             self._m10_confirm()
 
         # Settlement check moved to dashboard refresh cycle (every 15s)
@@ -1328,8 +1433,10 @@ class KalshiDaemon:
         # Pandas-compatible timestamp for DataFrame index comparisons
         current_window_start_pd = pd.Timestamp(current_window_start.replace(tzinfo=None))
 
-        # At window boundary: refresh 15m/1h/4h data + re-subscribe WebSocket
+        # At window boundary: cancel stale resting orders, refresh data, re-subscribe WS
         if minute_in_window <= 1 and not self._kalshi_cached_dataframes.get("_refreshed_" + str(current_window_start)):
+            if self._resting_orders and (not self.dry_run or self.demo):
+                self._cancel_all_resting_orders("window boundary")
             self._fetch_all()
             self._kalshi_cached_dataframes["_refreshed_" + str(current_window_start)] = True
             if self.kalshi_ws:
@@ -1413,6 +1520,24 @@ class KalshiDaemon:
                 self._kalshi_cached_dataframes.pop(symbol, None)
                 pending = None
 
+            # Skip if already holding a position on this asset (any window)
+            has_open_position = any(
+                b.get("asset") == asset and not b.get("result") and b.get("count", 0) > 0
+                for b in self._pending_bets
+            )
+            if has_open_position and not (pending and pending.get("bet_placed")):
+                # Position from a prior window still open — don't double up
+                predictions.append({
+                    "symbol": symbol, "asset": asset,
+                    "direction": "--", "confidence": 0,
+                    "knn_score": 0, "knn_thresh": 0,
+                    "tbl_score": 0, "tbl_thresh": 0,
+                    "btc_score": 0, "btc_thresh": 0,
+                    "reason": "position already open from prior window",
+                    "ob": 0, "flow": 0, "state": "POSITION_HELD",
+                })
+                continue
+
             # Skip if already bet this window — show stored scores
             if pending and pending.get("bet_placed"):
                 predictions.append({
@@ -1431,12 +1556,10 @@ class KalshiDaemon:
                 continue
 
             # Lifecycle:
-            # Min 0-4:   CONFIRMED — bet at window open, retry if missed
-            # Min 0-4:   CONFIRMED — bet at window open
-            # Min 5-9:   MONITORING — hold position
-            # Min 10:    M10 CONFIRM — M10 model decides hold or exit
-            # Min 11+:   SETTLING — await settlement
-            if minute_in_window <= 4 and not (pending and pending.get("bet_placed")):
+            # Min 0-1:   CONFIRMED — bet at window open (one shot + reprice)
+            # Min 2-9:   MONITORING — hold position
+            # Min 10+:   M10 CONFIRM — M10 model decides hold or exit
+            if minute_in_window <= 1 and not (pending and pending.get("bet_placed")):
                 state = "CONFIRMED"
             elif minute_in_window == 10 and pending and pending.get("bet_placed") and not pending.get("confirmed_m10"):
                 state = "M10_CONFIRM"
@@ -1484,6 +1607,9 @@ class KalshiDaemon:
                     # V3: query Kalshi for strike price + time remaining
                     strike, close_time_dt, market_ticker = self._get_kalshi_strike(series_ticker)
 
+                    # Compute Kalshi-specific features for 23-feature model
+                    kx = self._get_kalshi_extra(asset, symbol, float(strike) if strike else 0)
+
                     # Build minute-3 snapshot using shared function (same as backtest)
                     signal = None
                     if strike and close_time_dt:
@@ -1496,6 +1622,7 @@ class KalshiDaemon:
                                     minutes_remaining=12,
                                     market_data=market_data, df_1h=df_1h,
                                     df_4h=self._kalshi_cached_dataframes.get(f"{symbol}_4h"),
+                                    kalshi_extra=kx,
                                 )
                         except Exception:
                             pass
@@ -1664,14 +1791,14 @@ class KalshiDaemon:
 
                     if strike and close_time_dt:
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
-                        # Use BRTI price (already prefetched) — NOT Coinbase
-                        # cb_price flows to predict() → distance_from_strike calculation
+                        kx = self._get_kalshi_extra(asset, symbol, float(strike))
                         signal = self.kalshi_predictor.predict(
                             df_15m, strike_price=float(strike),
                             minutes_remaining=mins_left,
                             market_data=market_data, df_1h=df_1h,
                             current_price=cb_price,
                             df_4h=df_4h,
+                            kalshi_extra=kx,
                         )
                         if signal and pending:
                             pending["probability"] = signal.probability
@@ -1930,11 +2057,9 @@ class KalshiDaemon:
                         self._kalshi_pending_signals[asset]["bet_knn_score"] = p if d == "YES" else (100 - p)
                         self._kalshi_pending_signals[asset]["bet_btc_score"] = self.compute_btc_score(d)
                         self._kalshi_pending_signals[asset]["bet_tbl_score"] = self._kalshi_pending_signals[asset].get("bet_tbl_score", 0)
-            elif was_skipped and asset in self._kalshi_pending_signals:
-                # Price blocked — mark for price monitoring (5s checks until min 10)
-                self._kalshi_pending_signals[asset]["price_watch"] = True
-                self._kalshi_pending_signals[asset]["watch_side"] = vs["signal"].recommended_side
-                self._kalshi_pending_signals[asset]["watch_series"] = vs["series_ticker"]
+            elif was_skipped:
+                # Price too high at entry — skip entirely, no late entries
+                pass
 
         self.kalshi_predictions = predictions
 
@@ -2024,11 +2149,6 @@ class KalshiDaemon:
                 print(colored(
                     f"  [KALSHI REST] {asset} {side.upper()} ask {contract_price}c > {MAX_ENTRY_CENTS}c — skipping (no fill)",
                     "yellow"))
-                # Mark as price-watched (same as live resting order behavior)
-                if asset in self._kalshi_pending_signals:
-                    self._kalshi_pending_signals[asset]["price_watch"] = True
-                    self._kalshi_pending_signals[asset]["watch_side"] = direction_label
-                    self._kalshi_pending_signals[asset]["watch_series"] = self.KALSHI_PAIRS.get(symbol, "")
                 pred["reason"] = f"price too high ({contract_price}c > {MAX_ENTRY_CENTS}c)"
                 return pred
 
@@ -2131,12 +2251,16 @@ class KalshiDaemon:
 
             fill_price = max(1, min(99, fill_price))
 
-            # If ask > max, place resting order at our max price
+            # If ask > max, SKIP — don't place resting order below the ask.
+            # Adverse selection: fills on resting orders below market ask are
+            # systematically losers (price dropped TO our limit = market turned
+            # against us). Dry-run skips these, so must live.
             if fill_price > MAX_ENTRY_CENTS:
-                fill_price = MAX_ENTRY_CENTS
                 print(colored(
-                    f"  [KALSHI REST] {asset} {side.upper()} ask too high — limit order @ {MAX_ENTRY_CENTS}c",
+                    f"  [KALSHI SKIP] {asset} {side.upper()} ask {fill_price}c > {MAX_ENTRY_CENTS}c — skipping",
                     "yellow"))
+                pred["reason"] = f"ask too high ({fill_price}c > {MAX_ENTRY_CENTS}c)"
+                return pred
 
             # Position sizing — CLI override or default 5%
             size_pct = self._cli_max_size_pct if self._cli_max_size_pct > 0 else 0.05
@@ -2194,16 +2318,117 @@ class KalshiDaemon:
                 }
             )
 
-            # Verify fill via Kalshi (exchange is source of truth)
+            # Aggressive fill loop — if resting, reprice every 2s until filled or ask > MAX
             if float(fill_count) < count and order_status == "resting":
                 import time as _t
-                _t.sleep(1)
-                try:
-                    positions = self.kalshi_client.get_positions()
-                    for p in positions:
-                        if p.get("ticker") == ticker and p.get("position", 0) > 0:
-                            fill_count = str(p["position"])
+                MAX_REPRICE_ATTEMPTS = 4  # 4 retries × 2s = ~8s total
+                for reprice_attempt in range(MAX_REPRICE_ATTEMPTS):
+                    _t.sleep(2)
+
+                    # Check if filled since last attempt
+                    try:
+                        cur_status = self.kalshi_client.get_order_status(order_id)
+                        cur_filled = float(cur_status.get("fill_count_fp", 0))
+                        cur_state = cur_status.get("status", "")
+                        if cur_filled >= count or cur_state in ("executed", "filled", "closed"):
+                            fill_count = str(int(cur_filled)) if cur_filled > 0 else str(count)
+                            order_status = cur_state or "executed"
+                            print(colored(
+                                f"  [KALSHI FILL] {asset} {direction_label} filled on check "
+                                f"(attempt {reprice_attempt + 1})",
+                                "green"))
                             break
+                    except Exception:
+                        pass
+
+                    # Get fresh ask price
+                    try:
+                        mkt_resp = self.kalshi_client.get_market(ticker)
+                        mkt_data = mkt_resp.get("market", mkt_resp)
+                        if side == "yes":
+                            new_ask_raw = mkt_data.get("yes_ask_dollars") or mkt_data.get("yes_ask")
+                        else:
+                            new_ask_raw = mkt_data.get("no_ask_dollars") or mkt_data.get("no_ask")
+                        if new_ask_raw:
+                            new_ask = int(float(new_ask_raw) * 100) if float(new_ask_raw) < 1.5 else int(float(new_ask_raw))
+                        else:
+                            continue  # no ask available, wait
+                    except Exception:
+                        continue
+
+                    new_ask = max(1, min(99, new_ask))
+
+                    if new_ask > MAX_ENTRY_CENTS:
+                        # Cancel the resting order — no resting below market
+                        try:
+                            self.kalshi_client.cancel_order_safe(order_id)
+                        except Exception:
+                            pass
+                        order_status = "cancelled"
+                        fill_count = "0"
+                        print(colored(
+                            f"  [KALSHI REPRICE] {asset} {direction_label} ask now {new_ask}c > "
+                            f"{MAX_ENTRY_CENTS}c — cancelled order",
+                            "yellow"))
+                        break
+
+                    if new_ask == fill_price:
+                        continue  # same price, no point repricing
+
+                    # Cancel old order and place at new ask
+                    try:
+                        cancel_result = self.kalshi_client.cancel_order_safe(order_id)
+                        if cancel_result.get("status") == "filled":
+                            # Filled between our check and cancel
+                            fill_count = str(count)
+                            order_status = "executed"
+                            print(colored(
+                                f"  [KALSHI FILL] {asset} {direction_label} filled on cancel "
+                                f"(attempt {reprice_attempt + 1})",
+                                "green"))
+                            break
+                    except Exception as e:
+                        print(colored(f"  [REPRICE] Cancel failed: {e}", "red"))
+                        break
+
+                    # Place new order at current ask
+                    fill_price = new_ask
+                    cost_cents = count * fill_price
+                    potential_profit = count * (100 - fill_price)
+                    rr_ratio = potential_profit / cost_cents if cost_cents > 0 else 0
+                    try:
+                        result = self.kalshi_client.place_order(
+                            ticker=ticker, side=side, count=count,
+                            price_cents=fill_price, order_type="limit",
+                        )
+                        order = result.get("order", {})
+                        order_id = order.get("order_id", order_id)
+                        fill_count = order.get("fill_count_fp", "0")
+                        order_status = order.get("status", "?")
+                        print(colored(
+                            f"  [KALSHI REPRICE] {asset} {direction_label} repriced to {fill_price}c "
+                            f"(attempt {reprice_attempt + 1}) status={order_status}",
+                            "cyan"))
+                        if float(fill_count) >= count or order_status in ("executed", "filled"):
+                            break
+                    except Exception as e:
+                        print(colored(f"  [REPRICE] Re-place failed: {e}", "red"))
+                        break
+
+            # If still unfilled after reprice loop, cancel — no resting orders
+            actual_filled = float(fill_count) if fill_count else 0
+            if actual_filled < count and order_status not in ("executed", "filled", "cancelled"):
+                try:
+                    cancel_result = self.kalshi_client.cancel_order_safe(order_id)
+                    if cancel_result.get("status") == "filled":
+                        fill_count = str(count)
+                        order_status = "executed"
+                    else:
+                        order_status = "cancelled"
+                        fill_count = "0"
+                        print(colored(
+                            f"  [KALSHI CANCEL] {asset} {direction_label} unfilled after reprice — cancelled",
+                            "yellow"))
                 except Exception:
                     pass
 
@@ -2223,7 +2448,7 @@ class KalshiDaemon:
             self._session_bets_placed += 1
 
             # Track for settlement — only if order actually filled
-            actual_filled = float(fill_count) if fill_count else 0
+            actual_filled = float(fill_count) if fill_count else 0  # recompute after cancel logic
             if isinstance(signal, KalshiV3Signal) and actual_filled > 0:
                 pending = self._kalshi_pending_signals.get(asset, {})
                 settle_time = pending.get("close_time")
@@ -2241,32 +2466,10 @@ class KalshiDaemon:
                         "count": int(actual_filled),
                         "contract_price": fill_price,
                         "order_id": order_id,
+                        "ticker": ticker,
                         "live": True,
                     })
-            elif isinstance(signal, KalshiV3Signal) and actual_filled == 0:
-                # Order resting — track for fill check and minute-10 cancellation
-                pending_signal = self._kalshi_pending_signals.get(asset, {})
-                settle_time = pending_signal.get("close_time")
-                resting_entry = {
-                    "asset": asset,
-                    "symbol": symbol,
-                    "side": side,
-                    "direction": direction_label,
-                    "strike": signal.strike_price,
-                    "confidence": conf_display,
-                    "bet_time": datetime.now(timezone.utc),
-                    "settle_time": settle_time,
-                    "fill_price": fill_price,
-                    "count": 0,
-                    "contract_price": fill_price,
-                    "order_id": order_id,
-                    "ticker": ticker,
-                    "live": True,
-                    "needs_fill_check": True,
-                }
-                if settle_time:
-                    self._pending_bets.append(resting_entry)
-                self._resting_orders.append(resting_entry)
+            # No resting order tracking — unfilled orders are always cancelled
 
         except Exception as e:
             pred["reason"] = f"order failed: {e}"
@@ -2299,6 +2502,11 @@ class KalshiDaemon:
             series = pending.get("watch_series", "")
             side = pending.get("watch_side", "")
             if not series or not side:
+                continue
+
+            # Skip if already holding a position on this asset from any window
+            if any(b.get("asset") == asset and not b.get("result") and b.get("count", 0) > 0
+                   for b in self._pending_bets):
                 continue
 
             try:
@@ -2370,6 +2578,58 @@ class KalshiDaemon:
     # Resting order management
     # ------------------------------------------------------------------
 
+    def _cancel_all_resting_orders(self, reason: str = "shutdown"):
+        """Cancel ALL resting orders on Kalshi. Called on shutdown and window boundary."""
+        if not self._resting_orders and not (self.kalshi_client and not self.dry_run):
+            return
+
+        self._init_kalshi_client()
+        if not self.kalshi_client:
+            return
+
+        cancelled = 0
+
+        # Cancel orders we're tracking in memory
+        for order in list(self._resting_orders):
+            order_id = order.get("order_id", "")
+            asset = order.get("asset", "?")
+            if not order_id:
+                continue
+            try:
+                result = self.kalshi_client.cancel_order_safe(order_id)
+                if result.get("status") == "filled":
+                    print(colored(
+                        f"  [CANCEL] {asset} order {order_id} — already filled", "green"))
+                else:
+                    print(colored(
+                        f"  [CANCEL] {asset} order {order_id} — cancelled ({reason})", "yellow"))
+                    cancelled += 1
+            except Exception as e:
+                print(colored(f"  [CANCEL ERR] {asset}: {e}", "red"))
+
+        # Also query exchange for any resting orders we might not be tracking
+        try:
+            exchange_resting = self.kalshi_client.get_orders(status="resting")
+            known_ids = {o.get("order_id") for o in self._resting_orders}
+            for order in exchange_resting:
+                oid = order.get("order_id", "")
+                if oid and oid not in known_ids:
+                    ticker = order.get("ticker", "?")
+                    try:
+                        self.kalshi_client.cancel_order_safe(oid)
+                        print(colored(
+                            f"  [CANCEL] {ticker} order {oid} — cancelled ({reason}, untracked)",
+                            "yellow"))
+                        cancelled += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        self._resting_orders.clear()
+        if cancelled > 0:
+            print(colored(f"  [CANCEL] Cancelled {cancelled} resting orders ({reason})", "yellow"))
+
     def _check_resting_orders(self):
         """Check resting orders for fills, cancel at minute 10."""
         if not self._resting_orders:
@@ -2435,7 +2695,8 @@ class KalshiDaemon:
                 order_status = status.get("status", "")
 
                 # CHECK FILLS — accept fills at any time
-                if filled > 0 or order_status in ("executed", "filled"):
+                # Kalshi statuses: resting, canceled, executed, pending
+                if filled > 0 or order_status in ("executed", "filled", "closed"):
                     fill_count = max(int(filled), 1)
                     order["count"] = fill_count
                     order["needs_fill_check"] = False
@@ -2656,6 +2917,277 @@ class KalshiDaemon:
         # Start Kalshi WebSocket for real-time contract prices
         self._start_kalshi_ws()
 
+        # Recover any open positions/orders from a previous run
+        if not self.dry_run or self.demo:
+            self._recover_positions()
+
+    # ------------------------------------------------------------------
+    # Mid-cycle position recovery
+    # ------------------------------------------------------------------
+
+    # Reverse map: series ticker prefix → (symbol, asset)
+    _SERIES_TO_PAIR = {
+        "KXBTC15M": ("BTC/USDT", "BTC"),
+        "KXETH15M": ("ETH/USDT", "ETH"),
+        "KXSOL15M": ("SOL/USDT", "SOL"),
+        "KXXRP15M": ("XRP/USDT", "XRP"),
+    }
+
+    def _recover_positions(self):
+        """Recover open positions and resting orders from Kalshi API.
+
+        Called on startup so the daemon can manage positions placed in a
+        prior run (or earlier in the same session) that are still live.
+        """
+        self._init_kalshi_client()
+        if not self.kalshi_client:
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        recovered_positions = 0
+        recovered_orders = 0
+
+        # --- 1. Recover filled positions ---
+        try:
+            positions = self.kalshi_client.get_positions()
+        except Exception as e:
+            print(colored(f"  [RECOVERY] Failed to query positions: {e}", "red"))
+            return
+
+        # Track tickers we already have in _pending_bets
+        known_tickers = {b.get("ticker") for b in self._pending_bets}
+
+        for pos in positions:
+            ticker = pos.get("ticker", "")
+            if not ticker or ticker in known_tickers:
+                continue
+
+            # Only recover K15 markets
+            series = None
+            for prefix, (symbol, asset) in self._SERIES_TO_PAIR.items():
+                if ticker.startswith(prefix):
+                    series = prefix
+                    break
+            if not series:
+                continue
+
+            # Determine position side and count
+            # Kalshi positions: market_exposure > 0 = YES, < 0 = NO
+            # Or: position field directly
+            pos_qty = int(float(pos.get("position_fp", pos.get("position", 0))))
+            if pos_qty == 0:
+                continue
+
+            side = "yes" if pos_qty > 0 else "no"
+            count = abs(pos_qty)
+
+            # Get market details for strike and close_time
+            try:
+                mkt_resp = self.kalshi_client.get_market(ticker)
+                mkt = mkt_resp.get("market", mkt_resp)
+            except Exception as e:
+                print(colored(f"  [RECOVERY] Failed to get market {ticker}: {e}", "red"))
+                continue
+
+            strike = mkt.get("floor_strike")
+            if strike:
+                strike = float(strike)
+            ct = mkt.get("close_time") or mkt.get("expiration_time", "")
+            close_time_dt = None
+            if ct and "T" in ct:
+                close_time_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+
+            # Skip already-settled markets
+            if close_time_dt and close_time_dt < now_utc:
+                continue
+
+            # Get entry price from fills API
+            entry_price = 50  # fallback
+            try:
+                fills = self.kalshi_client.get_fills(ticker=ticker, limit=10)
+                if fills:
+                    # Average fill price for this ticker
+                    my_fills = [f for f in fills if f.get("side", "").lower() == side]
+                    if my_fills:
+                        prices = [int(float(f.get("yes_price_fp", f.get("no_price_fp", 50)))) for f in my_fills]
+                        entry_price = sum(prices) // len(prices)
+            except Exception:
+                pass
+
+            direction = "YES" if side == "yes" else "NO"
+            bet_entry = {
+                "asset": asset,
+                "symbol": symbol,
+                "side": side,
+                "direction": direction,
+                "strike": strike or 0,
+                "confidence": 0,  # unknown from prior run
+                "bet_time": now_utc,
+                "settle_time": close_time_dt or now_utc,
+                "fill_price": entry_price,
+                "contract_price": entry_price,
+                "count": count,
+                "order_id": "",  # original order_id is unknown
+                "ticker": ticker,
+                "live": True,
+                "needs_fill_check": False,
+                "_recovered": True,
+            }
+            self._pending_bets.append(bet_entry)
+            self._active_kalshi_bets[ticker] = time.time()
+            known_tickers.add(ticker)
+            recovered_positions += 1
+
+            # Mark asset as bet_placed so eval loop won't place a duplicate
+            self._kalshi_pending_signals[asset] = {
+                "direction": direction,
+                "base_conf": 0,
+                "last_5m_conf": 0,
+                "bet_placed": True,
+                "window_start": now_utc.replace(
+                    minute=now_utc.minute - (now_utc.minute % 15),
+                    second=0, microsecond=0,
+                ),
+                "strike_price": strike or 0,
+                "close_time": close_time_dt,
+                "probability": 0,
+                "recommended_side": direction,
+                "max_price_cents": 60,
+                "distance_atr": 0,
+                "setup_time": now_utc,
+                "confirmed": True,
+            }
+
+            print(colored(
+                f"  [RECOVERY] Position: {asset} {direction} x{count} @ {entry_price}c "
+                f"strike={strike} ticker={ticker}",
+                "cyan",
+            ))
+
+            # Subscribe WebSocket to this ticker
+            if self.kalshi_ws:
+                self.kalshi_ws.subscribe_ticker(ticker)
+
+        # --- 2. Recover resting (unfilled) orders ---
+        try:
+            resting = self.kalshi_client.get_orders(status="resting")
+        except Exception as e:
+            print(colored(f"  [RECOVERY] Failed to query resting orders: {e}", "red"))
+            resting = []
+
+        known_order_ids = {o.get("order_id") for o in self._resting_orders}
+
+        for order in resting:
+            order_id = order.get("order_id", "")
+            ticker = order.get("ticker", "")
+            if not ticker or not order_id or order_id in known_order_ids:
+                continue
+
+            # Only recover K15 markets
+            series = None
+            for prefix, (symbol, asset) in self._SERIES_TO_PAIR.items():
+                if ticker.startswith(prefix):
+                    series = prefix
+                    break
+            if not series:
+                continue
+
+            side = order.get("side", "yes")
+            price = int(float(order.get("yes_price_fp", order.get("no_price_fp", 50))))
+            remaining = int(float(order.get("remaining_count_fp", order.get("remaining_count", 1))))
+
+            # Get market details
+            try:
+                mkt_resp = self.kalshi_client.get_market(ticker)
+                mkt = mkt_resp.get("market", mkt_resp)
+            except Exception:
+                continue
+
+            strike = mkt.get("floor_strike")
+            if strike:
+                strike = float(strike)
+            ct = mkt.get("close_time") or mkt.get("expiration_time", "")
+            close_time_dt = None
+            if ct and "T" in ct:
+                close_time_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+
+            if close_time_dt and close_time_dt < now_utc:
+                continue
+
+            direction = "YES" if side == "yes" else "NO"
+            resting_entry = {
+                "asset": asset,
+                "symbol": symbol,
+                "side": side,
+                "direction": direction,
+                "strike": strike or 0,
+                "confidence": 0,
+                "bet_time": now_utc,
+                "settle_time": close_time_dt or now_utc,
+                "fill_price": price,
+                "contract_price": price,
+                "count": 0,  # unfilled
+                "order_id": order_id,
+                "ticker": ticker,
+                "live": True,
+                "needs_fill_check": True,
+                "_ws_detected": False,
+                "_recovered": True,
+            }
+            self._resting_orders.append(resting_entry)
+            self._active_kalshi_bets[ticker] = time.time()
+            known_order_ids.add(order_id)
+            recovered_orders += 1
+
+            # Mark asset as bet_placed so eval loop won't place a duplicate
+            if asset not in self._kalshi_pending_signals:
+                self._kalshi_pending_signals[asset] = {
+                    "direction": direction,
+                    "base_conf": 0,
+                    "last_5m_conf": 0,
+                    "bet_placed": True,
+                    "window_start": now_utc.replace(
+                        minute=now_utc.minute - (now_utc.minute % 15),
+                        second=0, microsecond=0,
+                    ),
+                    "strike_price": strike or 0,
+                    "close_time": close_time_dt,
+                    "probability": 0,
+                    "recommended_side": direction,
+                    "max_price_cents": 60,
+                    "distance_atr": 0,
+                    "setup_time": now_utc,
+                    "confirmed": True,
+                }
+
+            print(colored(
+                f"  [RECOVERY] Resting order: {asset} {direction} x{remaining} @ {price}c "
+                f"order_id={order_id}",
+                "cyan",
+            ))
+
+            if self.kalshi_ws:
+                self.kalshi_ws.subscribe_ticker(ticker)
+
+        if recovered_positions or recovered_orders:
+            print(colored(
+                f"  [RECOVERY] Recovered {recovered_positions} positions, "
+                f"{recovered_orders} resting orders — will manage through settlement",
+                "green",
+            ))
+
+            # If we loaded after minute 10, run M10 confirmation immediately
+            # on recovered positions (they missed the normal minute-10 check)
+            minute_in_window = now_utc.minute % 15
+            if minute_in_window >= 10 and recovered_positions > 0:
+                print(colored(
+                    f"  [RECOVERY] Minute {minute_in_window} — running M10 confirmation on recovered positions",
+                    "yellow",
+                ))
+                self._m10_confirm()
+        else:
+            print("  [RECOVERY] No existing positions or orders found")
+
     def tick(self):
         """Wall-clock Kalshi evaluation trigger (every minute)."""
         # Settlements and resting checks are now inside _kalshi_eval()
@@ -2726,6 +3258,8 @@ class KalshiDaemon:
 
         signal.signal(signal.SIGINT, _handle_shutdown)
         signal.signal(signal.SIGTERM, _handle_shutdown)
+        import atexit
+        atexit.register(lambda: self._cancel_all_resting_orders("process exit"))
 
         self.startup()
 
@@ -2755,6 +3289,10 @@ class KalshiDaemon:
             except Exception as e:
                 print(colored(f"[ERROR] {e}", "red"))
                 time.sleep(TICK_INTERVAL)
+
+        # Cancel all resting orders before exit
+        if not self.dry_run or self.demo:
+            self._cancel_all_resting_orders("shutdown")
 
         # Shutdown summary
         total = self._session_wins + self._session_losses + self._session_partial_losses

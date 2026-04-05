@@ -84,6 +84,16 @@ class KalshiClient:
             if resp.status_code == 500 and attempt < 2:
                 time.sleep(0.5)
                 continue
+            if resp.status_code in (400, 409):
+                # Include response body in error for debugging
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = resp.text
+                raise requests.HTTPError(
+                    f"{resp.status_code} {resp.reason}: {body} (data={data})",
+                    response=resp,
+                )
             resp.raise_for_status()
             return resp.json()
 
@@ -196,8 +206,9 @@ class KalshiClient:
         return self._delete(f"/trade-api/v2/portfolio/orders/{order_id}")
 
     def get_order_status(self, order_id: str) -> dict:
-        """Get status of a specific order."""
-        return self._get(f"/trade-api/v2/portfolio/orders/{order_id}")
+        """Get status of a specific order (unwraps 'order' envelope)."""
+        resp = self._get(f"/trade-api/v2/portfolio/orders/{order_id}")
+        return resp.get("order", resp)
 
     def cancel_order_safe(self, order_id: str) -> dict:
         """Cancel an order. Returns filled status on 404 (order already filled)."""

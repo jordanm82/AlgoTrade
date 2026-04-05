@@ -79,7 +79,8 @@ class KalshiPredictorV3:
                 df_1h: pd.DataFrame | None = None,
                 current_price: float | None = None,
                 df_4h: pd.DataFrame | None = None,
-                force_table: bool = False) -> KalshiV3Signal | None:
+                force_table: bool = False,
+                kalshi_extra: dict | None = None) -> KalshiV3Signal | None:
         """Compute strike-relative probability and bet recommendation.
 
         Args:
@@ -113,7 +114,8 @@ class KalshiPredictorV3:
 
         if use_knn:
             # Model predicts probability — strike-relative model needs distance_atr
-            knn_prob = self.predict_knn(df, df_1h, df_4h, distance_from_strike=distance_atr)
+            knn_prob = self.predict_knn(df, df_1h, df_4h, distance_from_strike=distance_atr,
+                                       kalshi_extra=kalshi_extra)
             if knn_prob is not None:
                 # Use raw KNN probability directly — no adjustments, no gates
                 recommended_side, max_price = self._decide_bet(knn_prob)
@@ -188,7 +190,8 @@ class KalshiPredictorV3:
 
     def predict_knn(self, df: pd.DataFrame, df_1h: pd.DataFrame | None = None,
                     df_4h: pd.DataFrame | None = None,
-                    distance_from_strike: float | None = None) -> float | None:
+                    distance_from_strike: float | None = None,
+                    kalshi_extra: dict | None = None) -> float | None:
         """Predict probability that price closes above strike.
 
         Strike-relative mode: uses distance_from_strike as primary feature.
@@ -305,6 +308,31 @@ class KalshiPredictorV3:
                     return None  # need distance — called without strike context
 
                 all_features["distance_from_strike"] = distance_from_strike
+
+                # Kalshi-specific + time + technical features (V2 model, 23 features)
+                kx = kalshi_extra or {}
+                all_features["prev_result"] = kx.get("prev_result", 0.5)
+                all_features["prev_3_yes_pct"] = kx.get("prev_3_yes_pct", 0.5)
+                all_features["streak_length"] = kx.get("streak_length", 0)
+                all_features["strike_delta"] = kx.get("strike_delta", 0.0)
+                all_features["strike_trend_3"] = kx.get("strike_trend_3", 0.0)
+
+                hour = kx.get("hour", 12)
+                all_features["hour_sin"] = float(np.sin(2 * np.pi * hour / 24))
+                all_features["hour_cos"] = float(np.cos(2 * np.pi * hour / 24))
+
+                all_features["rsi_alignment"] = (
+                    (1 if rsi_1h >= 50 else -1) *
+                    (1 if rsi_4h >= 50 else -1)
+                )
+                all_features["atr_percentile"] = kx.get("atr_percentile", 0.5)
+                all_features["rsi_15m"] = float(indicator_row.get("rsi", 50))
+
+                # Bollinger Band Width — regime detection
+                bb_up = float(indicator_row.get("bb_upper", 0))
+                bb_lo = float(indicator_row.get("bb_lower", 0))
+                bb_m = float(indicator_row.get("sma_20", 0))
+                all_features["bbw"] = ((bb_up - bb_lo) / bb_m * 100) if bb_m > 0 else 0
 
                 # Get features in model's expected order
                 model_features = self._knn_scaler.feature_names_in_ if hasattr(self._knn_scaler, 'feature_names_in_') else None

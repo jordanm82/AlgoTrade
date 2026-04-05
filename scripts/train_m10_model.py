@@ -45,12 +45,19 @@ SERIES = {
 }
 ASSETS_SYMS = {"BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD", "XRP": "XRP/USD"}
 
-# M10 features: same indicators + distance at minute 10
+# M10 features: same as M0 (23 features) but distance computed at minute 10
 FEATURE_NAMES = [
     "macd_15m", "norm_return", "ema_slope", "roc_5",
     "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
     "vol_ratio", "adx", "rsi_1h", "rsi_4h",
     "distance_from_strike",  # this is the BIG one at minute 10
+    # Kalshi-specific
+    "prev_result", "prev_3_yes_pct", "streak_length",
+    "strike_delta", "strike_trend_3",
+    # Time + technical
+    "hour_sin", "hour_cos",
+    "rsi_alignment", "atr_percentile", "rsi_15m",
+    "bbw",  # Bollinger Band Width — regime detection
 ]
 
 
@@ -178,8 +185,16 @@ def main():
         cb_5m = five_m_data[asset].get("coinbase", pd.DataFrame())
         bs_5m = five_m_data[asset].get("bitstamp", pd.DataFrame())
 
+        # Sort chronologically for lookback features
+        markets = sorted(markets, key=lambda x: x.get("close_time", ""))
+
+        # Pre-compute ATR percentile
+        atr_s = df_15m["atr"].dropna()
+        atr_r20 = atr_s.rolling(20)
+        atr_pctile = ((atr_s - atr_r20.min()) / (atr_r20.max() - atr_r20.min())).fillna(0.5)
+
         count = 0
-        for m in markets:
+        for mi, m in enumerate(markets):
             strike = float(m.get("floor_strike") or 0)
             result = m.get("result", "")
             close_time = m.get("close_time", "")
@@ -258,6 +273,62 @@ def main():
                 m4h = df_4h.index <= ws_naive
                 if m4h.sum() >= 10:
                     feat["rsi_4h"] = float(df_4h.loc[m4h].iloc[-1].get("rsi", 50))
+
+            # Kalshi-specific lookback features
+            prev_results = []
+            prev_strikes = []
+            for lb in range(1, 4):
+                if mi - lb >= 0:
+                    pm = markets[mi - lb]
+                    pr_res = pm.get("result", "")
+                    ps = float(pm.get("floor_strike") or 0)
+                    if pr_res:
+                        prev_results.append(1 if pr_res == "yes" else 0)
+                    if ps:
+                        prev_strikes.append(ps)
+
+            feat["prev_result"] = prev_results[0] if prev_results else 0.5
+            feat["prev_3_yes_pct"] = sum(prev_results) / len(prev_results) if prev_results else 0.5
+
+            streak = 0
+            if prev_results:
+                last_r = prev_results[0]
+                for r in prev_results:
+                    if r == last_r:
+                        streak += 1
+                    else:
+                        break
+                streak = streak if last_r == 1 else -streak
+            feat["streak_length"] = streak
+
+            feat["strike_delta"] = (strike - prev_strikes[0]) / atr if prev_strikes and atr > 0 else 0.0
+            if len(prev_strikes) >= 2 and atr > 0:
+                deltas = [strike - prev_strikes[0]]
+                for k in range(len(prev_strikes) - 1):
+                    deltas.append(prev_strikes[k] - prev_strikes[k + 1])
+                feat["strike_trend_3"] = sum(d / atr for d in deltas) / len(deltas)
+            else:
+                feat["strike_trend_3"] = feat["strike_delta"]
+
+            # Time features
+            hour = window_start.hour
+            feat["hour_sin"] = float(np.sin(2 * np.pi * hour / 24))
+            feat["hour_cos"] = float(np.cos(2 * np.pi * hour / 24))
+
+            # Technical additions
+            feat["rsi_alignment"] = (
+                (1 if feat["rsi_1h"] >= 50 else -1) *
+                (1 if feat["rsi_4h"] >= 50 else -1)
+            )
+            prev_atr_p = atr_pctile[atr_pctile.index < ws_naive]
+            feat["atr_percentile"] = float(prev_atr_p.iloc[-1]) if len(prev_atr_p) > 0 else 0.5
+            feat["rsi_15m"] = float(pr.get("rsi", 50))
+
+            # Bollinger Band Width — regime detection
+            bb_upper = float(pr.get("bb_upper", 0))
+            bb_lower = float(pr.get("bb_lower", 0))
+            bb_mid = float(pr.get("sma_20", 0))
+            feat["bbw"] = ((bb_upper - bb_lower) / bb_mid * 100) if bb_mid > 0 else 0
 
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue

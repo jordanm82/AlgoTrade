@@ -748,6 +748,8 @@ class RichDashboard:
             self.daemon._running = False
         sig.signal(sig.SIGINT, _shutdown)
         sig.signal(sig.SIGTERM, _shutdown)
+        import atexit
+        atexit.register(lambda: self.daemon._cancel_all_resting_orders("process exit"))
 
         # Startup
         self._fetch_balance()
@@ -797,8 +799,9 @@ class RichDashboard:
                         if not in_entry_window:
                             self._refresh_positions()
                             self._fetch_balance()
-                            if hasattr(self.daemon, 'check_price_watches'):
-                                self.daemon.check_price_watches()
+                            # Price watches DISABLED — if we don't fill in minutes 0-1, we skip.
+                            # Late entries are price reversion trades with stale signals.
+                            pass
                     except Exception:
                         pass
                     live.update(self._build_layout())
@@ -821,10 +824,10 @@ class RichDashboard:
                     if self.arb_mode:
                         should_eval = time_since_eval >= 50
                     else:
-                        # Entry: every 5s during min 0-4 until bet placed
-                        # Confirm: every 5s at min 5
+                        # Entry: every 5s during min 0-1 (one shot at window open)
+                        # Confirm: every 5s at min 10+
                         # Normal: every 50s for monitoring
-                        entry_trigger = (min_in <= 4 and time_since_eval >= 5)
+                        entry_trigger = (min_in <= 1 and time_since_eval >= 5)
                         confirm_trigger = (min_in == 10 and time_since_eval >= 5)  # min 5 disabled
                         normal_trigger = (min_in >= 5 and min_in != 10 and time_since_eval >= 50)
                         should_eval = entry_trigger or confirm_trigger or normal_trigger
@@ -841,6 +844,10 @@ class RichDashboard:
                 # Update layout every second for instant log visibility
                 else:
                     live.update(self._build_layout())
+
+        # Cancel all resting orders before exit
+        if not self.daemon.dry_run or self.daemon.demo:
+            self.daemon._cancel_all_resting_orders("shutdown")
 
         # Final trading summary
         self._console.print("\n")
