@@ -28,7 +28,6 @@ BASE_FEATURES = [
     "macd_15m", "norm_return", "ema_slope", "roc_5",
     "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
     "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
-    "prev_result", "prev_3_yes_pct", "streak_length",
     "strike_delta", "strike_trend_3",
     "hour_sin", "hour_cos",
     "rsi_alignment", "atr_percentile", "rsi_15m", "bbw",
@@ -36,7 +35,7 @@ BASE_FEATURES = [
 
 CONFLUENCE_FEATURES = [
     "alt_rsi_avg", "alt_rsi_1h_avg", "alt_momentum_align",
-    "prev_result_consensus", "alt_distance_avg",
+    "alt_distance_avg",
 ]
 
 ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES

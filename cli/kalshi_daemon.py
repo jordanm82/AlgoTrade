@@ -42,21 +42,20 @@ class KalshiDaemon:
         "XRP/USDT": "KXXRP15M",
     }
 
-    # Per-asset M0 entry thresholds (per-asset confluence models)
-    # With confluence, models are much more confident — can use tighter thresholds
+    # Per-asset M0 entry thresholds (no backwards-looking momentum features)
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 67,  # 89.5% WR, $716 P&L
-        "ETH/USDT": 60,  # 87.7% WR, $716 P&L
-        "SOL/USDT": 63,  # 86.4% WR, $595 P&L
-        "XRP/USDT": 67,  # 84.2% WR, $309 P&L
+        "BTC/USDT": 57,  # 68.8% WR, $170 P&L — best P&L
+        "ETH/USDT": 60,  # 69.4% WR, $145 P&L
+        "SOL/USDT": 60,  # 68.0% WR, $119 P&L
+        "XRP/USDT": 57,  # 68.6% WR, $100 P&L
     }
 
-    # Per-asset M10 exit thresholds (per-asset confluence M10 models)
+    # Per-asset M10 exit thresholds
     KALSHI_M10_THRESHOLDS = {
-        "BTC/USDT": 65,  # 92.2% WR, $810 P&L
-        "ETH/USDT": 60,  # 92.3% WR, $840 P&L
-        "SOL/USDT": 65,  # 92.3% WR, $730 P&L
-        "XRP/USDT": 60,  # 91.6% WR, $447 P&L
+        "BTC/USDT": 60,  # 86.8% WR, $661 P&L
+        "ETH/USDT": 60,  # 88.5% WR, $706 P&L
+        "SOL/USDT": 60,  # 87.1% WR, $607 P&L
+        "XRP/USDT": 60,  # 89.5% WR, $405 P&L
     }
 
     # Per-asset TEK (technical/probability table) thresholds
@@ -2202,8 +2201,19 @@ class KalshiDaemon:
                         self._kalshi_pending_signals[asset]["bet_btc_score"] = self.compute_btc_score(d)
                         self._kalshi_pending_signals[asset]["bet_tbl_score"] = self._kalshi_pending_signals[asset].get("bet_tbl_score", 0)
             elif was_skipped:
-                # Price too high at entry — skip entirely, no late entries
-                pass
+                # Price too high — try once at min 0, once at min 1, then stop
+                if asset in self._kalshi_pending_signals:
+                    pending_sig = self._kalshi_pending_signals[asset]
+                    last_skip_min = pending_sig.get("_last_skip_min", -1)
+                    current_min = datetime.now(timezone.utc).minute % 15
+                    if last_skip_min == current_min:
+                        # Already skipped this minute — suppress until next minute
+                        pending_sig["bet_placed"] = True if current_min >= 1 else False
+                    else:
+                        # First skip this minute — record it, allow retry next minute
+                        pending_sig["_last_skip_min"] = current_min
+                        if current_min >= 1:
+                            pending_sig["bet_placed"] = True  # min 1 was last chance
 
         self.kalshi_predictions = predictions
 

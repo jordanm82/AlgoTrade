@@ -30,7 +30,7 @@ BASE_FEATURES = [
     "macd_15m", "norm_return", "ema_slope", "roc_5",
     "macd_1h", "price_vs_ema", "hourly_return", "trend_direction",
     "vol_ratio", "adx", "rsi_1h", "rsi_4h", "distance_from_strike",
-    "prev_result", "prev_3_yes_pct", "streak_length",
+    # prev_result, prev_3_yes_pct, streak_length REMOVED — backwards-looking momentum trap
     "strike_delta", "strike_trend_3",
     "hour_sin", "hour_cos",
     "rsi_alignment", "atr_percentile", "rsi_15m", "bbw",
@@ -40,7 +40,7 @@ CONFLUENCE_FEATURES = [
     "alt_rsi_avg",
     "alt_rsi_1h_avg",
     "alt_momentum_align",
-    "prev_result_consensus",
+    # prev_result_consensus REMOVED — backwards-looking momentum trap
     "alt_distance_avg",
 ]
 
