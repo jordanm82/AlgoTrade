@@ -707,11 +707,18 @@ class KalshiDaemon:
             if not current_price:
                 continue
 
-            # Get ATR from cached 15m data
+            # Get ATR from cached 15m data — filter to BEFORE window start (matches backtest)
             df_15m = self._kalshi_cached_dataframes.get(symbol)
             if df_15m is None or len(df_15m) < 5:
                 continue
-            pr = df_15m.iloc[-1]
+            now_m10 = datetime.now(timezone.utc)
+            ws_m10 = now_m10.replace(
+                minute=now_m10.minute - (now_m10.minute % 15), second=0, microsecond=0
+            ).replace(tzinfo=None)
+            df_15m_filtered = df_15m[df_15m.index < pd.Timestamp(ws_m10)]
+            if len(df_15m_filtered) < 5:
+                continue
+            pr = df_15m_filtered.iloc[-1]
             atr = float(pr.get("atr", 0))
             if pd.isna(atr) or atr <= 0:
                 continue
@@ -745,19 +752,16 @@ class KalshiDaemon:
                 "distance_from_strike": distance,
             }
             # 1h/4h context — filter by window start (matches backtest)
-            now_ws = datetime.now(timezone.utc)
-            ws_naive_m10 = now_ws.replace(
-                minute=now_ws.minute - (now_ws.minute % 15), second=0, microsecond=0, tzinfo=None
-            )
+            # ws_m10 already computed above from now_m10
             df_1h = self._kalshi_cached_dataframes.get(f"{symbol}_1h")
             df_4h = self._kalshi_cached_dataframes.get(f"{symbol}_4h")
             if df_1h is not None and len(df_1h) >= 20:
-                m1h = df_1h[df_1h.index <= ws_naive_m10]
+                m1h = df_1h[df_1h.index <= pd.Timestamp(ws_m10)]
                 if len(m1h) >= 20:
                     feat["rsi_1h"] = float(m1h.iloc[-1].get("rsi", 50))
                     feat["macd_1h"] = float(m1h.iloc[-1].get("macd_hist", 0))
             if df_4h is not None and len(df_4h) >= 10:
-                m4h = df_4h[df_4h.index <= ws_naive_m10]
+                m4h = df_4h[df_4h.index <= pd.Timestamp(ws_m10)]
                 if len(m4h) >= 10:
                     feat["rsi_4h"] = float(m4h.iloc[-1].get("rsi", 50))
 
@@ -1763,6 +1767,9 @@ class KalshiDaemon:
                     kx["window_start_naive"] = current_window_start_pd
 
                     # Use pre-filtered 15m data (last completed candle = backtest parity)
+                    # Get BRTI price for distance calculation (matches backtest's 5m open)
+                    setup_price = _prefetched_prices.get(symbol) or self._get_coinbase_price(symbol)
+
                     signal = None
                     if strike and close_time_dt:
                         try:
@@ -1773,6 +1780,7 @@ class KalshiDaemon:
                                     df_15m_filtered, strike_price=float(strike),
                                     minutes_remaining=12,
                                     market_data=market_data, df_1h=df_1h,
+                                    current_price=setup_price,
                                     df_4h=self._kalshi_cached_dataframes.get(f"{symbol}_4h"),
                                     kalshi_extra=kx,
                                 )
