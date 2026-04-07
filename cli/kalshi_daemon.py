@@ -798,6 +798,52 @@ class KalshiDaemon:
             bb_mid = float(pr.get("sma_20", 0))
             feat["bbw"] = ((bb_upper - bb_lower) / bb_mid * 100) if bb_mid > 0 else 0
 
+            # Intra-window 5m features — what happened during minutes 0-10
+            try:
+                df_1m = self.fetcher.ohlcv(symbol, "1m", limit=15)
+                if df_1m is not None and len(df_1m) >= 10:
+                    # Split into two 5m periods relative to window start
+                    ws_ts = pd.Timestamp(ws_m10)
+                    min5_ts = ws_ts + timedelta(minutes=5)
+                    c1 = df_1m[(df_1m.index >= ws_ts) & (df_1m.index < min5_ts)]
+                    c2 = df_1m[(df_1m.index >= min5_ts) & (df_1m.index < ws_ts + timedelta(minutes=10))]
+
+                    if len(c1) >= 3 and len(c2) >= 3 and atr > 0:
+                        c1_open = float(c1.iloc[0]["open"])
+                        c1_close = float(c1.iloc[-1]["close"])
+                        c1_high = float(c1["high"].max())
+                        c1_low = float(c1["low"].min())
+                        c1_vol = float(c1["volume"].sum())
+
+                        c2_close = float(c2.iloc[-1]["close"])
+                        c2_high = float(c2["high"].max())
+                        c2_low = float(c2["low"].min())
+                        c2_vol = float(c2["volume"].sum())
+
+                        feat["price_move_atr"] = (c2_close - c1_open) / atr
+                        feat["candle1_range_atr"] = (c1_high - c1_low) / atr
+                        feat["candle2_range_atr"] = (c2_high - c2_low) / atr
+                        feat["momentum_shift"] = (c2_close - c1_close) / atr
+                        feat["volume_acceleration"] = c2_vol / c1_vol if c1_vol > 0 else 1.0
+                    else:
+                        feat["price_move_atr"] = 0
+                        feat["candle1_range_atr"] = 0
+                        feat["candle2_range_atr"] = 0
+                        feat["momentum_shift"] = 0
+                        feat["volume_acceleration"] = 1.0
+                else:
+                    feat["price_move_atr"] = 0
+                    feat["candle1_range_atr"] = 0
+                    feat["candle2_range_atr"] = 0
+                    feat["momentum_shift"] = 0
+                    feat["volume_acceleration"] = 1.0
+            except Exception:
+                feat["price_move_atr"] = 0
+                feat["candle1_range_atr"] = 0
+                feat["candle2_range_atr"] = 0
+                feat["momentum_shift"] = 0
+                feat["volume_acceleration"] = 1.0
+
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
 

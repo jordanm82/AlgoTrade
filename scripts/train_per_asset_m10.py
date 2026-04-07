@@ -38,7 +38,16 @@ CONFLUENCE_FEATURES = [
     "alt_distance_avg",
 ]
 
-ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES
+# 5m candle features — what happened DURING the window (minutes 0-10)
+INTRA_WINDOW_FEATURES = [
+    "price_move_atr",       # total price move from min 0 to min 10 (in ATR units)
+    "candle1_range_atr",    # 5m candle 1 (min 0-5) range / ATR — volatility burst
+    "candle2_range_atr",    # 5m candle 2 (min 5-10) range / ATR
+    "momentum_shift",       # candle2 close vs candle1 close (direction change?)
+    "volume_acceleration",  # candle2 volume / candle1 volume (buying pressure)
+]
+
+ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + INTRA_WINDOW_FEATURES
 
 
 def main():
@@ -210,6 +219,49 @@ def main():
             all_prev = [target_prev] + alt_prev_results
             feat["prev_result_consensus"] = sum(1 for r in all_prev if r == 1) / len(all_prev) if len(all_prev) >= 2 else 0.5
             feat["alt_distance_avg"] = sum(alt_distances) / len(alt_distances) if alt_distances else 0
+
+            # === Intra-window 5m features (what happened during minutes 0-10) ===
+            min5 = ws_n + timedelta(minutes=5)
+            # Candle 1: minutes 0-5
+            c1_prices = []
+            for df_5m in [cb_5m, bs_5m]:
+                if df_5m.empty: continue
+                mask = (df_5m.index >= ws_n) & (df_5m.index < min5)
+                if mask.sum() > 0:
+                    c1_prices.append(df_5m[mask].iloc[0])
+            # Candle 2: minutes 5-10
+            c2_prices = []
+            for df_5m in [cb_5m, bs_5m]:
+                if df_5m.empty: continue
+                mask = (df_5m.index >= min5) & (df_5m.index < min10)
+                if mask.sum() > 0:
+                    c2_prices.append(df_5m[mask].iloc[0])
+
+            if c1_prices and c2_prices and atr > 0:
+                # Average across exchanges
+                c1_open = sum(float(c["open"]) for c in c1_prices) / len(c1_prices)
+                c1_close = sum(float(c["close"]) for c in c1_prices) / len(c1_prices)
+                c1_high = sum(float(c["high"]) for c in c1_prices) / len(c1_prices)
+                c1_low = sum(float(c["low"]) for c in c1_prices) / len(c1_prices)
+                c1_vol = sum(float(c["volume"]) for c in c1_prices) / len(c1_prices)
+
+                c2_open = sum(float(c["open"]) for c in c2_prices) / len(c2_prices)
+                c2_close = sum(float(c["close"]) for c in c2_prices) / len(c2_prices)
+                c2_high = sum(float(c["high"]) for c in c2_prices) / len(c2_prices)
+                c2_low = sum(float(c["low"]) for c in c2_prices) / len(c2_prices)
+                c2_vol = sum(float(c["volume"]) for c in c2_prices) / len(c2_prices)
+
+                feat["price_move_atr"] = (c2_close - c1_open) / atr
+                feat["candle1_range_atr"] = (c1_high - c1_low) / atr
+                feat["candle2_range_atr"] = (c2_high - c2_low) / atr
+                feat["momentum_shift"] = (c2_close - c1_close) / atr
+                feat["volume_acceleration"] = c2_vol / c1_vol if c1_vol > 0 else 1.0
+            else:
+                feat["price_move_atr"] = 0
+                feat["candle1_range_atr"] = 0
+                feat["candle2_range_atr"] = 0
+                feat["momentum_shift"] = 0
+                feat["volume_acceleration"] = 1.0
 
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
