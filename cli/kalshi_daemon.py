@@ -257,20 +257,26 @@ class KalshiDaemon:
             # Sort by close_time descending (most recent first)
             settled.sort(key=lambda m: m.get("close_time", ""), reverse=True)
 
-            # Get ATR for normalization
+            # Get ATR for normalization — filter to before window start (matches training)
             df_15m = self._kalshi_cached_dataframes.get(symbol)
+            now_ws_kx = datetime.now(timezone.utc)
+            ws_kx = now_ws_kx.replace(
+                minute=now_ws_kx.minute - (now_ws_kx.minute % 15), second=0, microsecond=0
+            ).replace(tzinfo=None)
             atr = 0
             if df_15m is not None and len(df_15m) >= 20:
-                atr = float(df_15m.iloc[-1].get("atr", 0))
-                if pd.isna(atr):
-                    atr = 0
-                # ATR percentile
-                atr_s = df_15m["atr"].dropna()
-                if len(atr_s) >= 20:
-                    r20 = atr_s.rolling(20)
-                    mn, mx = float(r20.min().iloc[-1]), float(r20.max().iloc[-1])
-                    if mx > mn:
-                        extra["atr_percentile"] = (atr - mn) / (mx - mn)
+                df_15m_filt = df_15m[df_15m.index < pd.Timestamp(ws_kx)]
+                if len(df_15m_filt) >= 20:
+                    atr = float(df_15m_filt.iloc[-1].get("atr", 0))
+                    if pd.isna(atr):
+                        atr = 0
+                    # ATR percentile — on FILTERED data (no future leakage)
+                    atr_s = df_15m_filt["atr"].dropna()
+                    if len(atr_s) >= 20:
+                        r20 = atr_s.rolling(20)
+                        mn, mx = float(r20.min().iloc[-1]), float(r20.max().iloc[-1])
+                        if mx > mn:
+                            extra["atr_percentile"] = (atr - mn) / (mx - mn)
 
             # Previous results and strikes
             prev_results = []
@@ -310,6 +316,7 @@ class KalshiDaemon:
             pass
 
         # === Cross-asset confluence features ===
+        # All filtering uses ws_kx (window start) to match training exactly
         all_assets = list(self.KALSHI_PAIRS.keys())  # symbols like "BTC/USDT"
         alt_symbols = [s for s in all_assets if s.split("/")[0] != asset]
 
@@ -317,18 +324,22 @@ class KalshiDaemon:
         alt_prev_results, alt_distances = [], []
 
         for alt_sym in alt_symbols:
-            alt_asset = alt_sym.split("/")[0]
-            # Alt RSI from cached 15m data
+            # Alt RSI 15m — filter to before window start (matches training)
             alt_15m = self._kalshi_cached_dataframes.get(alt_sym)
-            if alt_15m is not None and len(alt_15m) >= 2:
-                rsi_val = float(alt_15m.iloc[-1].get("rsi", 50))
+            alt_15m_filt = None
+            if alt_15m is not None:
+                alt_15m_filt = alt_15m[alt_15m.index < pd.Timestamp(ws_kx)]
+            if alt_15m_filt is not None and len(alt_15m_filt) >= 2:
+                rsi_val = float(alt_15m_filt.iloc[-1].get("rsi", 50))
                 alt_rsi_15m.append(rsi_val)
                 alt_momentum.append(1 if rsi_val >= 50 else -1)
 
-            # Alt RSI 1h
+            # Alt RSI 1h — filter by window start (matches training: df_1h[index <= ws_naive].iloc[-1])
             alt_1h = self._kalshi_cached_dataframes.get(f"{alt_sym}_1h")
             if alt_1h is not None and len(alt_1h) >= 2:
-                alt_rsi_1h.append(float(alt_1h.iloc[-2].get("rsi", 50)))
+                alt_1h_filt = alt_1h[alt_1h.index <= pd.Timestamp(ws_kx)]
+                if len(alt_1h_filt) >= 2:
+                    alt_rsi_1h.append(float(alt_1h_filt.iloc[-1].get("rsi", 50)))
 
             # Alt previous settlement result
             alt_series = self.KALSHI_PAIRS.get(alt_sym, "")
@@ -340,29 +351,28 @@ class KalshiDaemon:
                     if r:
                         alt_prev_results.append(1 if r == "yes" else 0)
 
-            # Alt distance from strike
-            if self._brti_proxy is not None:
+            # Alt distance from strike — use BRTI price + open market strike
+            # Training uses 5m open + settled market strike by close_time match.
+            # BRTI proxy at window open ≈ 5m candle open (same exchanges, ~same time)
+            if self._brti_proxy is not None and alt_15m_filt is not None and len(alt_15m_filt) >= 2:
                 usd_sym = alt_sym.replace("/USDT", "/USD")
                 alt_price = self._brti_proxy.get_price(usd_sym)
-                if alt_price and hasattr(self, '_kalshi_open_markets_cache'):
-                    if alt_series in self._kalshi_open_markets_cache:
-                        for mk in self._kalshi_open_markets_cache[alt_series]:
-                            alt_strike = float(mk.get("floor_strike") or 0)
-                            if alt_strike and alt_15m is not None and len(alt_15m) >= 2:
-                                alt_atr = float(alt_15m.iloc[-1].get("atr", 0))
-                                if alt_atr > 0:
-                                    alt_distances.append((alt_price - alt_strike) / alt_atr)
-                                break
+                if alt_price and hasattr(self, '_kalshi_open_markets_cache') and alt_series in self._kalshi_open_markets_cache:
+                    for mk in self._kalshi_open_markets_cache[alt_series]:
+                        alt_strike = float(mk.get("floor_strike") or 0)
+                        if alt_strike:
+                            alt_atr = float(alt_15m_filt.iloc[-1].get("atr", 0))
+                            if alt_atr > 0:
+                                alt_distances.append((alt_price - alt_strike) / alt_atr)
+                            break
 
         extra["alt_rsi_avg"] = sum(alt_rsi_15m) / len(alt_rsi_15m) if alt_rsi_15m else 50
         extra["alt_rsi_1h_avg"] = sum(alt_rsi_1h) / len(alt_rsi_1h) if alt_rsi_1h else 50
         extra["alt_momentum_align"] = sum(alt_momentum) if alt_momentum else 0
 
-        # Consensus: this asset's prev_result + alt prev_results
-        all_prev = []
-        if extra["prev_result"] != 0.5:
-            all_prev.append(extra["prev_result"])
-        all_prev.extend(alt_prev_results)
+        # Consensus: ALWAYS include target's prev_result (matches training)
+        target_prev = extra["prev_result"]  # 0, 1, or 0.5
+        all_prev = [target_prev] + alt_prev_results
         extra["prev_result_consensus"] = sum(1 for r in all_prev if r == 1) / len(all_prev) if len(all_prev) >= 2 else 0.5
 
         extra["alt_distance_avg"] = sum(alt_distances) / len(alt_distances) if alt_distances else 0
