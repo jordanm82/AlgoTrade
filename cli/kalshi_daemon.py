@@ -54,7 +54,7 @@ class KalshiDaemon:
     KALSHI_M10_THRESHOLDS = {
         "BTC/USDT": 60,  # 86.8% WR, $661 P&L
         "ETH/USDT": 60,  # 88.5% WR, $706 P&L
-        "SOL/USDT": 60,  # 87.1% WR, $607 P&L
+        "SOL/USDT": 55,  # 85.8% WR, $610 P&L
         "XRP/USDT": 60,  # 89.5% WR, $405 P&L
     }
 
@@ -744,14 +744,22 @@ class KalshiDaemon:
                 "rsi_4h": 50.0,
                 "distance_from_strike": distance,
             }
-            # 1h/4h context
+            # 1h/4h context — filter by window start (matches backtest)
+            now_ws = datetime.now(timezone.utc)
+            ws_naive_m10 = now_ws.replace(
+                minute=now_ws.minute - (now_ws.minute % 15), second=0, microsecond=0, tzinfo=None
+            )
             df_1h = self._kalshi_cached_dataframes.get(f"{symbol}_1h")
             df_4h = self._kalshi_cached_dataframes.get(f"{symbol}_4h")
-            if df_1h is not None and len(df_1h) >= 21:
-                feat["rsi_1h"] = float(df_1h.iloc[-2].get("rsi", 50))
-                feat["macd_1h"] = float(df_1h.iloc[-2].get("macd_hist", 0))
-            if df_4h is not None and len(df_4h) >= 11:
-                feat["rsi_4h"] = float(df_4h.iloc[-2].get("rsi", 50))
+            if df_1h is not None and len(df_1h) >= 20:
+                m1h = df_1h[df_1h.index <= ws_naive_m10]
+                if len(m1h) >= 20:
+                    feat["rsi_1h"] = float(m1h.iloc[-1].get("rsi", 50))
+                    feat["macd_1h"] = float(m1h.iloc[-1].get("macd_hist", 0))
+            if df_4h is not None and len(df_4h) >= 10:
+                m4h = df_4h[df_4h.index <= ws_naive_m10]
+                if len(m4h) >= 10:
+                    feat["rsi_4h"] = float(m4h.iloc[-1].get("rsi", 50))
 
             # Kalshi-specific + time + technical + confluence features
             kx = self._get_kalshi_extra(asset, symbol, strike)
@@ -1750,18 +1758,19 @@ class KalshiDaemon:
                     # V3: query Kalshi for strike price + time remaining
                     strike, close_time_dt, market_ticker = self._get_kalshi_strike(series_ticker)
 
-                    # Compute Kalshi-specific features for 23-feature model
+                    # Compute Kalshi-specific features for per-asset model
                     kx = self._get_kalshi_extra(asset, symbol, float(strike) if strike else 0)
+                    kx["window_start_naive"] = current_window_start_pd
 
-                    # Build minute-3 snapshot using shared function (same as backtest)
+                    # Use pre-filtered 15m data (last completed candle = backtest parity)
                     signal = None
                     if strike and close_time_dt:
                         try:
-                            df_1m_setup = self.fetcher.ohlcv(symbol, "1m", limit=10)
-                            snapshot = build_minute3_snapshot(df_15m, df_1m_setup, current_window_start_pd)
-                            if snapshot is not None:
+                            # Filter to candles BEFORE window start (matches backtest exactly)
+                            df_15m_filtered = df_15m[df_15m.index < current_window_start_pd]
+                            if df_15m_filtered is not None and len(df_15m_filtered) >= 20:
                                 signal = self.kalshi_predictor.predict(
-                                    snapshot, strike_price=float(strike),
+                                    df_15m_filtered, strike_price=float(strike),
                                     minutes_remaining=12,
                                     market_data=market_data, df_1h=df_1h,
                                     df_4h=self._kalshi_cached_dataframes.get(f"{symbol}_4h"),
@@ -1880,18 +1889,9 @@ class KalshiDaemon:
                     except Exception:
                         pass
 
-                # At minute 0: use cached 15m directly (no sub-candle data yet)
-                # At minute 1+: build snapshot from 1m candles if available
-                if minute_in_window >= 1:
-                    try:
-                        df_sub = _prefetched_1m.get(symbol)
-                        if df_15m is not None and df_sub is not None and len(df_sub) > 0:
-                            snapshot = build_minute3_snapshot(df_15m, df_sub, current_window_start_pd)
-                            if snapshot is not None:
-                                df_15m = snapshot
-                    except Exception:
-                        pass  # fall through to use cached 15m
-                # At minute 0: df_15m is already the cached 15m with indicators — use as-is
+                # Filter to candles BEFORE window start (matches backtest exactly)
+                # No synthetic snapshots — use pre-computed features from cached DataFrame
+                df_15m = df_15m[df_15m.index < current_window_start_pd]
                 if df_15m is None or len(df_15m) < 50:
                     predictions.append({
                         "symbol": symbol, "asset": asset,
@@ -1935,6 +1935,7 @@ class KalshiDaemon:
                     if strike and close_time_dt:
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
                         kx = self._get_kalshi_extra(asset, symbol, float(strike))
+                        kx["window_start_naive"] = current_window_start_pd
                         signal = self.kalshi_predictor.predict(
                             df_15m, strike_price=float(strike),
                             minutes_remaining=mins_left,

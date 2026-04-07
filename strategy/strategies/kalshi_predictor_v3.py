@@ -215,109 +215,86 @@ class KalshiPredictorV3:
                     kalshi_extra: dict | None = None) -> float | None:
         """Predict probability that price closes above strike.
 
-        Strike-relative mode: uses distance_from_strike as primary feature.
-        Dual-signal mode: trend + conviction must agree.
-        Single-model mode (legacy): returns single model probability.
+        PARITY RULE: All features MUST be read from pre-computed DataFrame columns,
+        exactly as the backtest/training scripts compute them. No inline recomputation.
+        The daemon's _fetch_all() pre-computes norm_return, vol_ratio, ema_slope,
+        price_vs_ema, hourly_return on the full cached DataFrame — use those directly.
 
         Returns probability (0.0-1.0) or None if models unavailable.
         """
-        if self._knn is None or self._knn_scaler is None:
+        if self._knn is None and not self._per_asset_models:
             return None
         if df is None or len(df) < 20:
             return None
 
-        # Indicator row selection:
-        # - With snapshot (synthetic last row): use df.iloc[-2] (last real candle)
-        # - Without snapshot (raw 15m data): use df.iloc[-1] (last completed candle)
-        # Check: if last row's index matches a 15m boundary, it's likely real data
-        last_idx = df.index[-1]
-        has_synthetic = (last_idx.minute % 15 != 0) if hasattr(last_idx, 'minute') else False
-        if has_synthetic and len(df) >= 2:
-            indicator_row = df.iloc[-2]  # skip synthetic row
-            current_close = float(df.iloc[-1]["close"])
-        else:
-            indicator_row = df.iloc[-1]  # last row IS the completed candle
-            current_close = float(df.iloc[-1]["close"])
+        # Use the last completed 15m candle — ALWAYS iloc[-1] on pre-filtered data.
+        # The daemon passes cached 15m data (no synthetic rows). Backtest does the same.
+        # prev_candles = df[df.index < window_start] → iloc[-1] = last completed candle.
+        indicator_row = df.iloc[-1]
 
         try:
-            # === Extract all 15 features (same order as training) ===
             prev_close = float(indicator_row["close"])
-            vol_sma = float(indicator_row.get("vol_sma_20", 0))
-            bb_range = float(indicator_row.get("bb_upper", 0)) - float(indicator_row.get("bb_lower", 0))
-
-            # norm_return: exclude synthetic row if present, otherwise use full series
-            if has_synthetic:
-                pct = df["close"].iloc[:-1].pct_change()
-            else:
-                pct = df["close"].pct_change()
-            norm_ret_series = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
-
             sma_val = float(indicator_row.get("sma_20", prev_close))
             atr_val = float(indicator_row.get("atr", 1))
             adx_val = float(indicator_row.get("adx", 20))
 
-            price_vs_ema = (prev_close - sma_val) / atr_val if atr_val > 0 else 0
-
-            # hourly_return: 4-candle return matching training's pct_change(4)
-            # indicator_row is the anchor — go 4 candles back from its position
-            ir_pos = -2 if has_synthetic else -1  # position of indicator_row in df
-            hr_back = ir_pos - 4  # 4 candles before indicator_row
-            if len(df) >= abs(hr_back):
-                hr = (prev_close - float(df.iloc[hr_back]["close"])) / float(df.iloc[hr_back]["close"]) * 100
-            else:
-                hr = 0
-
-            # trend_direction: match training's zero-case for sma_val
+            # trend_direction
             if sma_val > 0:
                 trend_sign = 1 if prev_close >= sma_val else -1
             else:
                 trend_sign = 0
-            trend_dir = adx_val * trend_sign
 
-            # ema_slope: pct_change(3) at indicator_row position
-            if has_synthetic:
-                ema_series = df["ema_12"].iloc[:-1]  # exclude synthetic
-            else:
-                ema_series = df["ema_12"]
-            ema_slope_val = float(ema_series.pct_change(3).iloc[-1] * 100) if len(ema_series) >= 4 and pd.notna(ema_series.pct_change(3).iloc[-1]) else 0
+            # READ pre-computed derived features from DataFrame columns
+            # These are computed by _fetch_all() on the full cached series (matches training)
+            nr = indicator_row.get("norm_return", 0)
+            vr = indicator_row.get("vol_ratio", 1)
+            es = indicator_row.get("ema_slope", 0)
+            pve = indicator_row.get("price_vs_ema", 0)
+            hr = indicator_row.get("hourly_return", 0)
 
-            # 1h/4h: use iloc[-2] to guarantee a completed candle (not in-progress)
-            if df_1h is not None and len(df_1h) >= 21:
-                r1h = df_1h.iloc[-2]
-                rsi_1h = float(r1h.get("rsi", 50))
-                macd_1h = float(r1h.get("macd_hist", 0))
-            elif df_1h is not None and len(df_1h) >= 20:
-                r1h = df_1h.iloc[-1]
-                rsi_1h = float(r1h.get("rsi", 50))
-                macd_1h = float(r1h.get("macd_hist", 0))
-            else:
-                rsi_1h = 50.0
-                macd_1h = 0.0
+            # 1h/4h: filter by window time from kalshi_extra, matching backtest
+            kx = kalshi_extra or {}
+            ws_naive = kx.get("window_start_naive")  # set by daemon at eval time
 
-            if df_4h is not None and len(df_4h) >= 11:
-                rsi_4h = float(df_4h.iloc[-2].get("rsi", 50))
-            elif df_4h is not None and len(df_4h) >= 10:
-                rsi_4h = float(df_4h.iloc[-1].get("rsi", 50))
-            else:
-                rsi_4h = 50.0
+            rsi_1h, macd_1h = 50.0, 0.0
+            if df_1h is not None and len(df_1h) >= 20:
+                if ws_naive is not None:
+                    m1h = df_1h[df_1h.index <= ws_naive]
+                    if len(m1h) >= 20:
+                        r1h = m1h.iloc[-1]
+                        rsi_1h = float(r1h.get("rsi", 50))
+                        macd_1h = float(r1h.get("macd_hist", 0))
+                else:
+                    # Fallback: use iloc[-2] (last completed)
+                    r1h = df_1h.iloc[-2] if len(df_1h) >= 21 else df_1h.iloc[-1]
+                    rsi_1h = float(r1h.get("rsi", 50))
+                    macd_1h = float(r1h.get("macd_hist", 0))
 
-            # All 15 features in canonical order
+            rsi_4h = 50.0
+            if df_4h is not None and len(df_4h) >= 10:
+                if ws_naive is not None:
+                    m4h = df_4h[df_4h.index <= ws_naive]
+                    if len(m4h) >= 10:
+                        rsi_4h = float(m4h.iloc[-1].get("rsi", 50))
+                else:
+                    rsi_4h = float(df_4h.iloc[-2].get("rsi", 50)) if len(df_4h) >= 11 else float(df_4h.iloc[-1].get("rsi", 50))
+
             all_features = {
                 "rsi_15m": float(indicator_row.get("rsi", 50)),
                 "stochrsi_15m": float(indicator_row.get("stochrsi_k", 50)),
                 "macd_15m": float(indicator_row.get("macd_hist", 0)),
-                "norm_return": float(norm_ret_series.iloc[-1]) if len(norm_ret_series) > 0 and pd.notna(norm_ret_series.iloc[-1]) else 0,
-                "vol_ratio": float(indicator_row.get("volume", 0)) / vol_sma if vol_sma > 0 else 1.0,
-                "bb_position": (prev_close - float(indicator_row.get("bb_lower", 0))) / bb_range if bb_range > 0 else 0.5,
-                "ema_slope": ema_slope_val,
+                "norm_return": float(nr) if pd.notna(nr) else 0,
+                "vol_ratio": float(vr) if pd.notna(vr) else 1.0,
+                "bb_position": 0.5,  # not used by current models
+                "ema_slope": float(es) if pd.notna(es) else 0,
                 "adx": adx_val,
                 "roc_5": float(indicator_row.get("roc_5", 0)),
                 "rsi_1h": rsi_1h,
                 "macd_1h": macd_1h,
                 "rsi_4h": rsi_4h,
-                "price_vs_ema": price_vs_ema,
-                "hourly_return": hr,
-                "trend_direction": trend_dir,
+                "price_vs_ema": float(pve) if pd.notna(pve) else 0,
+                "hourly_return": float(hr) if pd.notna(hr) else 0,
+                "trend_direction": adx_val * trend_sign,
             }
 
             if any(pd.isna(v) or np.isinf(v) for v in all_features.values()):
@@ -330,11 +307,7 @@ class KalshiPredictorV3:
 
                 all_features["distance_from_strike"] = distance_from_strike
 
-                # Kalshi-specific + time + technical features
-                kx = kalshi_extra or {}
-                all_features["prev_result"] = kx.get("prev_result", 0.5)
-                all_features["prev_3_yes_pct"] = kx.get("prev_3_yes_pct", 0.5)
-                all_features["streak_length"] = kx.get("streak_length", 0)
+                # Kalshi-specific + time features
                 all_features["strike_delta"] = kx.get("strike_delta", 0.0)
                 all_features["strike_trend_3"] = kx.get("strike_trend_3", 0.0)
 
@@ -347,7 +320,6 @@ class KalshiPredictorV3:
                     (1 if rsi_4h >= 50 else -1)
                 )
                 all_features["atr_percentile"] = kx.get("atr_percentile", 0.5)
-                all_features["rsi_15m"] = float(indicator_row.get("rsi", 50))
 
                 # Bollinger Band Width
                 bb_up = float(indicator_row.get("bb_upper", 0))
@@ -359,8 +331,13 @@ class KalshiPredictorV3:
                 all_features["alt_rsi_avg"] = kx.get("alt_rsi_avg", 50)
                 all_features["alt_rsi_1h_avg"] = kx.get("alt_rsi_1h_avg", 50)
                 all_features["alt_momentum_align"] = kx.get("alt_momentum_align", 0)
-                all_features["prev_result_consensus"] = kx.get("prev_result_consensus", 0.5)
                 all_features["alt_distance_avg"] = kx.get("alt_distance_avg", 0)
+
+                # Backwards-looking features (may not be in model but included for compatibility)
+                all_features["prev_result"] = kx.get("prev_result", 0.5)
+                all_features["prev_3_yes_pct"] = kx.get("prev_3_yes_pct", 0.5)
+                all_features["streak_length"] = kx.get("streak_length", 0)
+                all_features["prev_result_consensus"] = kx.get("prev_result_consensus", 0.5)
 
                 # Select per-asset model or fall back to unified
                 asset = kx.get("asset", "")
