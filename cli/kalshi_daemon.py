@@ -312,8 +312,8 @@ class KalshiDaemon:
                 else:
                     extra["strike_trend_3"] = extra["strike_delta"]
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(colored(f"  [PARITY WARN] _get_kalshi_extra({asset}) failed: {e}", "red"))
 
         # === Cross-asset confluence features ===
         # All filtering uses ws_kx (window start) to match training exactly
