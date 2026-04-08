@@ -1943,12 +1943,18 @@ class KalshiDaemon:
                 cb_price = _prefetched_prices.get(symbol) or self._get_coinbase_price(symbol)
                 df_15m = self._kalshi_cached_dataframes.get(symbol)
 
-                # If no cache (late start), fetch once
+                # If no cache (late start), run full fetch with derived features
                 if df_15m is None or len(df_15m) < 50:
                     try:
                         raw = self.fetcher.ohlcv(symbol, "15m", limit=200)
                         if raw is not None and not raw.empty:
                             df_15m = add_indicators(raw)
+                            pct = df_15m["close"].pct_change()
+                            df_15m["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
+                            df_15m["vol_ratio"] = df_15m["volume"] / df_15m["vol_sma_20"]
+                            df_15m["ema_slope"] = df_15m["ema_12"].pct_change(3) * 100
+                            df_15m["price_vs_ema"] = (df_15m["close"] - df_15m["sma_20"]) / df_15m["atr"].replace(0, np.nan)
+                            df_15m["hourly_return"] = df_15m["close"].pct_change(4) * 100
                             self._kalshi_cached_dataframes[symbol] = df_15m
                     except Exception:
                         pass
