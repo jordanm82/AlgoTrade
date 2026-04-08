@@ -170,6 +170,13 @@ def build_features(prev, df_1h, df_4h, ws_naive, distance, *,
     feat["alt_momentum_align"] = kx.get("alt_momentum_align", 0)
     feat["alt_distance_avg"] = kx.get("alt_distance_avg", 0)
 
+    # Regime features
+    feat["return_4h"] = kx.get("return_4h", 0)
+    feat["return_12h"] = kx.get("return_12h", 0)
+    feat["price_vs_sma_1h"] = kx.get("price_vs_sma_1h", 0)
+    feat["lower_lows_4h"] = kx.get("lower_lows_4h", 0)
+    feat["trend_strength"] = kx.get("trend_strength", 0)
+
     if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
         return None
     return feat
@@ -359,6 +366,29 @@ def main():
             kx["alt_rsi_1h_avg"] = sum(ar1h) / len(ar1h) if ar1h else 50
             kx["alt_momentum_align"] = sum(amom) if amom else 0
             kx["alt_distance_avg"] = sum(adist) / len(adist) if adist else 0
+
+            # Regime features
+            if len(pc) >= 16:
+                kx["return_4h"] = (float(pc.iloc[-1]["close"]) - float(pc.iloc[-16]["close"])) / float(pc.iloc[-16]["close"]) * 100
+            else: kx["return_4h"] = 0
+            if len(pc) >= 48:
+                kx["return_12h"] = (float(pc.iloc[-1]["close"]) - float(pc.iloc[-48]["close"])) / float(pc.iloc[-48]["close"]) * 100
+            else: kx["return_12h"] = 0
+            if df1h is not None:
+                h1f = df1h[df1h.index <= wsn]
+                if len(h1f) >= 20 and atr > 0:
+                    kx["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr
+                else: kx["price_vs_sma_1h"] = 0
+            else: kx["price_vs_sma_1h"] = 0
+            if df4h is not None:
+                h4f = df4h[df4h.index <= wsn]
+                if len(h4f) >= 4:
+                    kx["lower_lows_4h"] = sum(1 for i in range(-3,0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
+                else: kx["lower_lows_4h"] = 0
+                if len(h4f) >= 10 and atr > 0:
+                    kx["trend_strength"] = (float(h4f.iloc[-1]["close"]) - float(h4f["close"].rolling(10).mean().iloc[-1])) / atr
+                else: kx["trend_strength"] = 0
+            else: kx["lower_lows_4h"] = 0; kx["trend_strength"] = 0
 
             # M0
             f0 = build_features(prev, df1h, df4h, wsn, (p0 - strike) / atr,

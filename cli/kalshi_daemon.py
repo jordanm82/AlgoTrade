@@ -377,6 +377,39 @@ class KalshiDaemon:
 
         extra["alt_distance_avg"] = sum(alt_distances) / len(alt_distances) if alt_distances else 0
 
+        # === REGIME FEATURES — multi-hour trend context ===
+        df_15m_regime = self._kalshi_cached_dataframes.get(symbol)
+        if df_15m_regime is not None:
+            filt = df_15m_regime[df_15m_regime.index < pd.Timestamp(ws_kx)]
+            if len(filt) >= 16:
+                extra["return_4h"] = (float(filt.iloc[-1]["close"]) - float(filt.iloc[-16]["close"])) / float(filt.iloc[-16]["close"]) * 100
+            if len(filt) >= 48:
+                extra["return_12h"] = (float(filt.iloc[-1]["close"]) - float(filt.iloc[-48]["close"])) / float(filt.iloc[-48]["close"]) * 100
+
+        # Price vs 1h SMA
+        alt_1h_self = self._kalshi_cached_dataframes.get(f"{symbol}_1h")
+        if alt_1h_self is not None:
+            h1f = alt_1h_self[alt_1h_self.index <= pd.Timestamp(ws_kx)]
+            atr_val = 0
+            if df_15m_regime is not None:
+                filt2 = df_15m_regime[df_15m_regime.index < pd.Timestamp(ws_kx)]
+                if len(filt2) > 0:
+                    atr_val = float(filt2.iloc[-1].get("atr", 0))
+                    if pd.isna(atr_val): atr_val = 0
+            if len(h1f) >= 20 and atr_val > 0:
+                h1_sma = float(h1f["close"].rolling(20).mean().iloc[-1])
+                extra["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - h1_sma) / atr_val
+
+        # Lower lows + trend strength from 4h
+        alt_4h_self = self._kalshi_cached_dataframes.get(f"{symbol}_4h")
+        if alt_4h_self is not None:
+            h4f = alt_4h_self[alt_4h_self.index <= pd.Timestamp(ws_kx)]
+            if len(h4f) >= 4:
+                extra["lower_lows_4h"] = sum(1 for i in range(-3, 0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
+            if len(h4f) >= 10 and atr_val > 0:
+                h4_sma = float(h4f["close"].rolling(10).mean().iloc[-1])
+                extra["trend_strength"] = (float(h4f.iloc[-1]["close"]) - h4_sma) / atr_val
+
         return extra
 
     def _get_kalshi_strike(self, series_ticker: str) -> tuple:
@@ -780,7 +813,9 @@ class KalshiDaemon:
             for k in ["prev_result", "prev_3_yes_pct", "streak_length",
                        "strike_delta", "strike_trend_3",
                        "alt_rsi_avg", "alt_rsi_1h_avg", "alt_momentum_align",
-                       "prev_result_consensus", "alt_distance_avg"]:
+                       "prev_result_consensus", "alt_distance_avg",
+                       "return_4h", "return_12h", "price_vs_sma_1h",
+                       "lower_lows_4h", "trend_strength"]:
                 feat[k] = kx.get(k, 0)
             feat["atr_percentile"] = kx.get("atr_percentile", 0.5)
             hour = datetime.now(timezone.utc).hour

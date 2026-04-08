@@ -346,6 +346,13 @@ class KalshiPredictorV3:
                 all_features["streak_length"] = kx.get("streak_length", 0)
                 all_features["prev_result_consensus"] = kx.get("prev_result_consensus", 0.5)
 
+                # Regime features — multi-hour trend context
+                all_features["return_4h"] = kx.get("return_4h", 0)
+                all_features["return_12h"] = kx.get("return_12h", 0)
+                all_features["price_vs_sma_1h"] = kx.get("price_vs_sma_1h", 0)
+                all_features["lower_lows_4h"] = kx.get("lower_lows_4h", 0)
+                all_features["trend_strength"] = kx.get("trend_strength", 0)
+
                 # Select per-asset model or fall back to unified
                 asset = kx.get("asset", "")
                 if asset in self._per_asset_models:

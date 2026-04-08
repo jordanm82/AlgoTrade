@@ -40,11 +40,20 @@ CONFLUENCE_FEATURES = [
     "alt_rsi_avg",
     "alt_rsi_1h_avg",
     "alt_momentum_align",
-    # prev_result_consensus REMOVED — backwards-looking momentum trap
     "alt_distance_avg",
 ]
 
-ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES
+# Regime detection — multi-hour context the model needs to distinguish
+# "dip in uptrend" (buy) from "continuation in downtrend" (sell)
+REGIME_FEATURES = [
+    "return_4h",        # price change over last 4 hours (% * 100)
+    "return_12h",       # price change over last 12 hours
+    "price_vs_sma_1h",  # price position relative to 1h SMA (in ATR units)
+    "lower_lows_4h",    # count of 4h candles making lower lows (0-3)
+    "trend_strength",   # 4h close vs 4h SMA — signed trend (positive=bull, negative=bear)
+]
+
+ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + REGIME_FEATURES
 
 
 def main():
@@ -217,6 +226,61 @@ def main():
             all_prev = [target_prev] + alt_prev_results
             feat["prev_result_consensus"] = sum(1 for r in all_prev if r == 1) / len(all_prev) if len(all_prev) >= 2 else 0.5
             feat["alt_distance_avg"] = sum(alt_distances) / len(alt_distances) if alt_distances else 0
+
+            # === REGIME FEATURES — multi-hour context ===
+            # 4h return: how much price moved in last 4 hours
+            hr4_candles = df_15m[df_15m.index < ws_n]
+            if len(hr4_candles) >= 16:  # 16 x 15m = 4 hours
+                c_now = float(hr4_candles.iloc[-1]["close"])
+                c_4h = float(hr4_candles.iloc[-16]["close"])
+                feat["return_4h"] = (c_now - c_4h) / c_4h * 100
+            else:
+                feat["return_4h"] = 0
+
+            # 12h return
+            if len(hr4_candles) >= 48:  # 48 x 15m = 12 hours
+                c_12h = float(hr4_candles.iloc[-48]["close"])
+                feat["return_12h"] = (float(hr4_candles.iloc[-1]["close"]) - c_12h) / c_12h * 100
+            else:
+                feat["return_12h"] = 0
+
+            # Price vs 1h SMA (in ATR units) — are we above or below the hourly average?
+            if df_1h is not None:
+                h1_filt = df_1h[df_1h.index <= ws_n]
+                if len(h1_filt) >= 20 and atr > 0:
+                    h1_sma = float(h1_filt["close"].rolling(20).mean().iloc[-1])
+                    h1_close = float(h1_filt.iloc[-1]["close"])
+                    feat["price_vs_sma_1h"] = (h1_close - h1_sma) / atr
+                else:
+                    feat["price_vs_sma_1h"] = 0
+            else:
+                feat["price_vs_sma_1h"] = 0
+
+            # Lower lows on 4h chart — how many of last 3 4h candles made lower lows?
+            if df_4h is not None:
+                h4_filt = df_4h[df_4h.index <= ws_n]
+                if len(h4_filt) >= 4:
+                    ll_count = 0
+                    for i in range(-3, 0):
+                        if float(h4_filt.iloc[i]["low"]) < float(h4_filt.iloc[i-1]["low"]):
+                            ll_count += 1
+                    feat["lower_lows_4h"] = ll_count
+                else:
+                    feat["lower_lows_4h"] = 0
+            else:
+                feat["lower_lows_4h"] = 0
+
+            # Trend strength: 4h close vs 4h SMA (signed, in ATR units)
+            if df_4h is not None:
+                h4_filt2 = df_4h[df_4h.index <= ws_n]
+                if len(h4_filt2) >= 10 and atr > 0:
+                    h4_sma = float(h4_filt2["close"].rolling(10).mean().iloc[-1])
+                    h4_close = float(h4_filt2.iloc[-1]["close"])
+                    feat["trend_strength"] = (h4_close - h4_sma) / atr
+                else:
+                    feat["trend_strength"] = 0
+            else:
+                feat["trend_strength"] = 0
 
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue

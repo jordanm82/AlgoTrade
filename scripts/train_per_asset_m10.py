@@ -47,7 +47,12 @@ INTRA_WINDOW_FEATURES = [
     "volume_acceleration",  # candle2 volume / candle1 volume (buying pressure)
 ]
 
-ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + INTRA_WINDOW_FEATURES
+REGIME_FEATURES = [
+    "return_4h", "return_12h", "price_vs_sma_1h",
+    "lower_lows_4h", "trend_strength",
+]
+
+ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + INTRA_WINDOW_FEATURES + REGIME_FEATURES
 
 
 def main():
@@ -262,6 +267,38 @@ def main():
                 feat["candle2_range_atr"] = 0
                 feat["momentum_shift"] = 0
                 feat["volume_acceleration"] = 1.0
+
+            # === REGIME FEATURES ===
+            hr4_candles = df_15m[df_15m.index < ws_n]
+            if len(hr4_candles) >= 16:
+                feat["return_4h"] = (float(hr4_candles.iloc[-1]["close"]) - float(hr4_candles.iloc[-16]["close"])) / float(hr4_candles.iloc[-16]["close"]) * 100
+            else:
+                feat["return_4h"] = 0
+            if len(hr4_candles) >= 48:
+                feat["return_12h"] = (float(hr4_candles.iloc[-1]["close"]) - float(hr4_candles.iloc[-48]["close"])) / float(hr4_candles.iloc[-48]["close"]) * 100
+            else:
+                feat["return_12h"] = 0
+            if df_1h is not None:
+                h1f = df_1h[df_1h.index <= ws_n]
+                if len(h1f) >= 20 and atr > 0:
+                    feat["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr
+                else:
+                    feat["price_vs_sma_1h"] = 0
+            else:
+                feat["price_vs_sma_1h"] = 0
+            if df_4h is not None:
+                h4f = df_4h[df_4h.index <= ws_n]
+                if len(h4f) >= 4:
+                    feat["lower_lows_4h"] = sum(1 for i in range(-3,0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
+                else:
+                    feat["lower_lows_4h"] = 0
+                if len(h4f) >= 10 and atr > 0:
+                    feat["trend_strength"] = (float(h4f.iloc[-1]["close"]) - float(h4f["close"].rolling(10).mean().iloc[-1])) / atr
+                else:
+                    feat["trend_strength"] = 0
+            else:
+                feat["lower_lows_4h"] = 0
+                feat["trend_strength"] = 0
 
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
