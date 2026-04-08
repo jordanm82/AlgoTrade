@@ -1850,6 +1850,7 @@ class KalshiDaemon:
                             self._kalshi_pending_signals[asset] = {
                                 "strike_price": float(strike),
                                 "close_time": close_time_dt,
+                                "_signal_ticker": market_ticker,  # exact market for this signal
                                 "probability": signal.probability,
                                 "recommended_side": signal.recommended_side,
                                 "max_price_cents": signal.max_price_cents,
@@ -1991,9 +1992,10 @@ class KalshiDaemon:
                     strike = pending.get("strike_price") if pending else None
                     close_time_dt = pending.get("close_time") if pending else None
 
+                    signal_ticker = pending.get("_signal_ticker") if pending else None
                     if not strike:
                         # No SETUP ran — query Kalshi for strike
-                        strike, close_time_dt, _ = self._get_kalshi_strike(series_ticker)
+                        strike, close_time_dt, signal_ticker = self._get_kalshi_strike(series_ticker)
 
                     if not strike and state == "CONFIRMED":
                         # Log when we can't find a market — helps debug missed windows
@@ -2115,6 +2117,7 @@ class KalshiDaemon:
                                 "symbol": symbol, "series_ticker": series_ticker,
                                 "signal": signal, "market_data": market_data,
                                 "state": state,
+                                "signal_ticker": signal_ticker,  # exact market from _get_kalshi_strike
                             })
                         model = "KNN" if signal.adjustments.get("mode") == "knn_early_entry" else "TBL"
                         reason_suffix = ""
@@ -2252,7 +2255,8 @@ class KalshiDaemon:
             if len(self._active_kalshi_bets) + actual_fills_this_eval >= max_bets:
                 break
             result = self._kalshi_execute_bet(
-                vs["symbol"], vs["series_ticker"], vs["signal"], vs["market_data"]
+                vs["symbol"], vs["series_ticker"], vs["signal"], vs["market_data"],
+                signal_ticker=vs.get("signal_ticker"),
             )
             asset = vs["symbol"].split("/")[0]
             reason = result.get("reason", "") if result else ""
@@ -2292,11 +2296,12 @@ class KalshiDaemon:
     # Bet execution
     # ------------------------------------------------------------------
 
-    def _kalshi_execute_bet(self, symbol: str, series_ticker: str, signal, market_data: dict | None) -> dict:
+    def _kalshi_execute_bet(self, symbol: str, series_ticker: str, signal, market_data: dict | None,
+                            signal_ticker: str | None = None) -> dict:
         """Execute a single Kalshi bet. Returns a pred dict with outcome details.
 
-        Handles: balance check, market discovery, orderbook pricing,
-        order placement, fill verification, active bet tracking.
+        signal_ticker: exact market ticker from signal generation (_get_kalshi_strike).
+        If provided, uses this ticker directly instead of re-discovering the market.
         """
         asset = symbol.split("/")[0]
         ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
@@ -2340,15 +2345,20 @@ class KalshiDaemon:
                 pending = self._kalshi_pending_signals.get(asset, {})
                 settle_time = pending.get("close_time")
 
-            # Query Kalshi for actual contract price
+            # Query Kalshi for actual contract price — use signal's ticker
             self._init_kalshi_client()
             if self.kalshi_client and strike:
                 try:
-                    series = self.KALSHI_PAIRS.get(symbol, "")
-                    markets = self.kalshi_client.get_markets(series_ticker=series, status="open")
-                    if markets:
-                        m = markets[0]
-                        ticker = m.get("ticker", "")
+                    if signal_ticker:
+                        ticker = signal_ticker
+                        m = self.kalshi_client.get_market(ticker)
+                        m = m.get("market", m)
+                    else:
+                        series = self.KALSHI_PAIRS.get(symbol, "")
+                        markets = self.kalshi_client.get_markets(series_ticker=series, status="open")
+                        m = markets[0] if markets else None
+                        ticker = m.get("ticker", "") if m else ""
+                    if m:
                         # Get the ask price for our side
                         if side == "yes":
                             contract_price = int(float(m.get("yes_ask_dollars", 0)) * 100)
@@ -2427,23 +2437,31 @@ class KalshiDaemon:
             balance_resp = self.kalshi_client.get_balance()
             balance_cents = balance_resp.get("balance", 0)
 
-            # Find the next 15-min market for this series
-            events = self.kalshi_client._get("/trade-api/v2/events", {
-                "series_ticker": series_ticker, "status": "open",
-                "limit": 3, "with_nested_markets": "true",
-            })
-            all_markets = []
-            for evt in events.get("events", []):
-                all_markets.extend(evt.get("markets", []))
-            if not all_markets:
-                pred["reason"] = f"no {series_ticker} markets found"
-                print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
-                return pred
-
-            # Sort by close_time to ensure we pick the soonest-expiring market
-            all_markets.sort(key=lambda m: m.get("close_time", "9999"))
-            market = all_markets[0]
-            ticker = market.get("ticker", "")
+            # Use the SAME market ticker that the signal was generated for.
+            # Previously re-discovered markets here, which could pick a DIFFERENT
+            # market than the signal predicted — causing systematic losses.
+            if signal_ticker:
+                ticker = signal_ticker
+                market = self.kalshi_client.get_market(ticker)
+                market = market.get("market", market)
+            else:
+                # Fallback: discover market (same logic as _get_kalshi_strike)
+                all_markets = self.kalshi_client.get_markets(
+                    series_ticker=series_ticker, status="open")
+                if not all_markets:
+                    pred["reason"] = f"no {series_ticker} markets found"
+                    print(colored(f"  [KALSHI] No markets for {series_ticker}", "yellow"))
+                    return pred
+                now_utc_exec = datetime.now(timezone.utc)
+                future = [m for m in all_markets
+                          if m.get("close_time", "") and
+                          datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")) > now_utc_exec]
+                if not future:
+                    pred["reason"] = f"no future {series_ticker} markets"
+                    return pred
+                future.sort(key=lambda m: m.get("close_time", "9999"))
+                market = future[0]
+                ticker = market.get("ticker", "")
 
             # Log market selection for debugging demo/live issues
             market_strike = market.get("floor_strike") or market.get("custom_strike")
