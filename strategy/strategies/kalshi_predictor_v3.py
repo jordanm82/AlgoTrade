@@ -245,7 +245,14 @@ class KalshiPredictorV3:
                 trend_sign = 0
 
             # READ pre-computed derived features from DataFrame columns
-            # These are computed by _fetch_all() on the full cached series (matches training)
+            # These MUST exist — computed by _fetch_all() on the full cached series
+            # If missing, the DataFrame was corrupted by a re-fetch without derived features
+            REQUIRED_DERIVED = ["norm_return", "vol_ratio", "ema_slope", "price_vs_ema", "hourly_return"]
+            missing = [f for f in REQUIRED_DERIVED if f not in indicator_row.index]
+            if missing:
+                print(f"  [PARITY ERR] Missing derived features: {missing} — skipping prediction")
+                return None
+
             nr = indicator_row.get("norm_return", 0)
             vr = indicator_row.get("vol_ratio", 1)
             es = indicator_row.get("ema_slope", 0)
