@@ -2088,11 +2088,13 @@ class KalshiDaemon:
                         strike, close_time_dt, signal_ticker = self._get_kalshi_strike(series_ticker)
 
                     if not strike and state == "CONFIRMED":
-                        # Log when we can't find a market — helps debug missed windows
-                        if minute_in_window <= 1:
+                        # Log once per asset per window
+                        wait_key = f"_wait_logged_{asset}_{current_window_start}"
+                        if minute_in_window <= 1 and not self._kalshi_cached_dataframes.get(wait_key):
                             print(colored(
                                 f"  [WAIT] {asset}: no Kalshi market yet (min {minute_in_window})",
                                 "dark_grey"))
+                            self._kalshi_cached_dataframes[wait_key] = True
 
                     if strike and close_time_dt:
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
@@ -2198,11 +2200,15 @@ class KalshiDaemon:
 
                         if state == "CONFIRMED" and all_pass:
                             dir_conf = prob_pct if signal.recommended_side == "YES" else (100 - prob_pct)
-                            print(colored(
-                                f"  [SIGNAL] {asset} {signal.recommended_side} "
-                                f"LR={dir_conf}% TEK={tbl_display}% → actionable",
-                                "cyan",
-                            ))
+                            # Only log SIGNAL once per asset per window
+                            signal_log_key = f"_signal_logged_{asset}_{current_window_start}"
+                            if not self._kalshi_cached_dataframes.get(signal_log_key):
+                                print(colored(
+                                    f"  [SIGNAL] {asset} {signal.recommended_side} "
+                                    f"LR={dir_conf}% TEK={tbl_display}% → actionable",
+                                    "cyan",
+                                ))
+                                self._kalshi_cached_dataframes[signal_log_key] = True
                             actionable_signals.append({
                                 "symbol": symbol, "series_ticker": series_ticker,
                                 "signal": signal, "market_data": market_data,
@@ -2214,18 +2220,8 @@ class KalshiDaemon:
                         dir_c = prob_pct if signal.recommended_side == "YES" else (100 - prob_pct)
                         if not meets_knn:
                             reason_suffix = f" (KNN below {asset_threshold}%)"
-                            if minute_in_window >= 2:
-                                print(colored(
-                                    f"  [SKIP] {asset} {signal.recommended_side} "
-                                    f"LR={dir_c}%<{asset_threshold}% TEK={tbl_display}%",
-                                    "dark_grey"))
                         elif not tbl_agrees:
                             reason_suffix = f" (TEK disagrees, need {tbl_threshold}%)"
-                            if minute_in_window >= 2:
-                                print(colored(
-                                    f"  [SKIP] {asset} {signal.recommended_side} "
-                                    f"LR={dir_c}% TEK={tbl_display}%<{tbl_threshold}%",
-                                    "dark_grey"))
                         elif state == "CONFIRMED":
                             reason_suffix = f" -> BETTING (LR+TEK)"
                         elif state == "MONITORING":
