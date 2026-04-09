@@ -378,8 +378,8 @@ class RichDashboard:
         dw = self.daemon._session_wins
         dl = self.daemon._session_losses
         dpl = getattr(self.daemon, '_session_partial_losses', 0)
-        dt_settled = dw + dl  # settlement WR excludes M10 exits
-        dwr = dw / dt_settled * 100 if dt_settled > 0 else 0
+        dt = dw + dl + dpl  # WR includes M10 exits (they ARE losses)
+        dwr = dw / dt * 100 if dt > 0 else 0
         pnl = sum(b.get("pnl_dollars", 0) for b in self.daemon._completed_bets)
         pnl_color = "green" if pnl >= 0 else "red"
 
