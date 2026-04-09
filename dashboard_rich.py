@@ -378,8 +378,8 @@ class RichDashboard:
         dw = self.daemon._session_wins
         dl = self.daemon._session_losses
         dpl = getattr(self.daemon, '_session_partial_losses', 0)
-        dt = dw + dl + dpl
-        dwr = dw / dt * 100 if dt > 0 else 0
+        dt_settled = dw + dl  # settlement WR excludes M10 exits
+        dwr = dw / dt_settled * 100 if dt_settled > 0 else 0
         pnl = sum(b.get("pnl_dollars", 0) for b in self.daemon._completed_bets)
         pnl_color = "green" if pnl >= 0 else "red"
 
@@ -799,45 +799,44 @@ class RichDashboard:
                         if not in_entry_window:
                             self._refresh_positions()
                             self._fetch_balance()
-                            # Price watches DISABLED — if we don't fill in minutes 0-1, we skip.
-                            # Late entries are price reversion trades with stale signals.
-                            pass
+
+                        # Pre-fetch Kalshi markets at minute 14 so they're cached for minute 0
+                        if min_in_refresh >= 13 and hasattr(self.daemon, '_prefetch_kalshi_markets'):
+                            self.daemon._prefetch_kalshi_markets()
                     except Exception:
                         pass
                     live.update(self._build_layout())
 
-                # Every 60 seconds: full eval tick
+                # Eval check every second — fast-path for entry window + M10
+                now_ts = time.time()
+                now_utc = datetime.now(timezone.utc)
+                min_in = now_utc.minute % 15
+                time_since_eval = now_ts - self.daemon._last_kalshi_eval
+
+                if self.arb_mode:
+                    should_eval = time_since_eval >= 50
+                else:
+                    # Entry: every 3s during min 0-1 (fastest possible at window open)
+                    # M10: every 5s at min 10+
+                    # Normal: every 50s for monitoring
+                    entry_trigger = (min_in <= 1 and time_since_eval >= 3)
+                    confirm_trigger = (min_in >= 10 and time_since_eval >= 5)
+                    normal_trigger = (min_in >= 2 and min_in < 10 and time_since_eval >= 50)
+                    should_eval = entry_trigger or confirm_trigger or normal_trigger
+
+                if should_eval:
+                    try:
+                        eval_fn()
+                    except Exception as e:
+                        self._log_lines.append(Text(f"EVAL ERR: {e}", style="red bold"))
+                    self.daemon._last_kalshi_eval = now_ts
+
+                # Every 60 seconds: tick counter + balance refresh
                 if seconds_elapsed % 60 == 0:
                     tick += 1
                     self._tick_count = tick
-
-                    # Refresh balance every 5 ticks
                     if tick % 5 == 0:
                         self._fetch_balance()
-
-                    # Eval triggers: entry at min 0, confirmation at min 5, else every 50s
-                    now_ts = time.time()
-                    now_utc = datetime.now(timezone.utc)
-                    min_in = now_utc.minute % 15
-                    sec_in = now_utc.second
-                    time_since_eval = now_ts - self.daemon._last_kalshi_eval
-                    if self.arb_mode:
-                        should_eval = time_since_eval >= 50
-                    else:
-                        # Entry: every 5s during min 0-1 (one shot at window open)
-                        # Confirm: every 5s at min 10+
-                        # Normal: every 50s for monitoring
-                        entry_trigger = (min_in <= 1 and time_since_eval >= 5)
-                        confirm_trigger = (min_in == 10 and time_since_eval >= 5)  # min 5 disabled
-                        normal_trigger = (min_in >= 5 and min_in != 10 and time_since_eval >= 50)
-                        should_eval = entry_trigger or confirm_trigger or normal_trigger
-
-                    if should_eval:
-                        try:
-                            eval_fn()
-                        except Exception as e:
-                            self._log_lines.append(Text(f"EVAL ERR: {e}", style="red bold"))
-                        self.daemon._last_kalshi_eval = now_ts
 
                     live.update(self._build_layout())
 
@@ -855,8 +854,8 @@ class RichDashboard:
         dw = self.daemon._session_wins
         dl = self.daemon._session_losses
         dpl = getattr(self.daemon, '_session_partial_losses', 0)
-        dt = dw + dl + dpl
-        dwr = dw / dt * 100 if dt > 0 else 0
+        dt_settled = dw + dl
+        dwr = dw / dt_settled * 100 if dt_settled > 0 else 0
         total_pnl = sum(b.get("pnl_dollars", 0) for b in completed)
         total_won = sum(b.get("pnl_dollars", 0) for b in completed if b.get("result") == "WIN")
         total_lost = sum(abs(b.get("pnl_dollars", 0)) for b in completed if b.get("result") == "LOSS")
