@@ -150,14 +150,28 @@ class KalshiDaemon:
     # ------------------------------------------------------------------
 
     def _fetch_all(self):
-        """Fetch and cache 15m + 1h + 4h candles for all pairs (parallel)."""
+        """Fetch and cache 15m + 1h + 4h candles for all pairs (parallel).
+
+        Uses explicit `since` parameter to ensure we get the LATEST candles
+        including any that just completed. limit=50 alone can miss the most
+        recent candle due to API lag.
+        """
         from concurrent.futures import ThreadPoolExecutor
+        import time as _time
+
+        # Compute 'since' timestamps to guarantee fresh data
+        now_ms = int(_time.time() * 1000)
+        since_15m = now_ms - 200 * 900_000      # 200 × 15m candles
+        since_1h = now_ms - 100 * 3_600_000      # 100 × 1h candles
+        since_4h = now_ms - 50 * 14_400_000      # 50 × 4h candles
 
         def _fetch_symbol(symbol):
             """Fetch all timeframes for one symbol."""
             results = {}
             try:
-                df = self.fetcher.ohlcv(symbol, timeframe="15m", limit=200)
+                df = self.fetcher.ohlcv(symbol, timeframe="15m", limit=200, since=since_15m)
+                if df is None or df.empty:
+                    df = self.fetcher.ohlcv(symbol, timeframe="15m", limit=200)
                 df = add_indicators(df)
                 pct = df["close"].pct_change()
                 df["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
@@ -169,13 +183,17 @@ class KalshiDaemon:
             except Exception as e:
                 print(colored(f"  [WARN] 15m fetch failed for {symbol}: {e}", "yellow"))
             try:
-                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=50)
+                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=100, since=since_1h)
+                if df_1h is None or df_1h.empty:
+                    df_1h = self.fetcher.ohlcv(symbol, "1h", limit=100)
                 if df_1h is not None and not df_1h.empty:
                     results["1h"] = add_indicators(df_1h)
             except Exception:
                 pass
             try:
-                df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
+                df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50, since=since_4h)
+                if df_4h is None or df_4h.empty:
+                    df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
                 if df_4h is not None and not df_4h.empty:
                     results["4h"] = add_indicators(df_4h)
             except Exception:
@@ -193,6 +211,33 @@ class KalshiDaemon:
                 self._kalshi_cached_dataframes[f"{symbol}_1h"] = results["1h"]
             if "4h" in results:
                 self._kalshi_cached_dataframes[f"{symbol}_4h"] = results["4h"]
+
+    def _refresh_higher_timeframes(self):
+        """Lightweight refresh of 1h/4h candles to get latest completed candles."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _fetch_ht(symbol):
+            results = {}
+            try:
+                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=100)
+                if df_1h is not None and not df_1h.empty:
+                    results["1h"] = add_indicators(df_1h)
+            except Exception:
+                pass
+            try:
+                df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
+                if df_4h is not None and not df_4h.empty:
+                    results["4h"] = add_indicators(df_4h)
+            except Exception:
+                pass
+            return symbol, results
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for symbol, results in pool.map(_fetch_ht, self.KALSHI_PAIRS.keys()):
+                if "1h" in results:
+                    self._kalshi_cached_dataframes[f"{symbol}_1h"] = results["1h"]
+                if "4h" in results:
+                    self._kalshi_cached_dataframes[f"{symbol}_4h"] = results["4h"]
 
     def _prefetch_kalshi_markets(self):
         """Batch-fetch all K15 open + settled markets in 2 API calls.
@@ -1678,7 +1723,7 @@ class KalshiDaemon:
         # Pandas-compatible timestamp for DataFrame index comparisons
         current_window_start_pd = pd.Timestamp(current_window_start.replace(tzinfo=None))
 
-        # At window boundary: cancel stale resting orders, refresh data, re-subscribe WS
+        # At window boundary: cancel stale resting orders, refresh ALL data, re-subscribe WS
         if minute_in_window <= 1 and not self._kalshi_cached_dataframes.get("_refreshed_" + str(current_window_start)):
             if self._resting_orders and (not self.dry_run or self.demo):
                 self._cancel_all_resting_orders("window boundary")
@@ -1687,6 +1732,16 @@ class KalshiDaemon:
             self._kalshi_cached_dataframes["_refreshed_" + str(current_window_start)] = True
             if self.kalshi_ws:
                 self._ws_subscribe_current_markets()
+        elif minute_in_window <= 1:
+            # Entry window re-eval: refresh 1h/4h to get latest completed candles
+            # (1h candle may have completed since last _fetch_all)
+            self._refresh_higher_timeframes()
+
+        # Also refresh 1h/4h every 15 minutes to catch hourly candle completions
+        refresh_key = f"_1h_refreshed_{now_utc.hour}_{now_utc.minute // 15}"
+        if not self._kalshi_cached_dataframes.get(refresh_key):
+            self._refresh_higher_timeframes()
+            self._kalshi_cached_dataframes[refresh_key] = True
 
         # Prune active bets — clear at window boundary so new window can bet immediately
         now_ts = time.time()
