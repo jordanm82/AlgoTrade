@@ -52,10 +52,10 @@ class KalshiDaemon:
 
     # Per-asset M10 exit thresholds
     KALSHI_M10_THRESHOLDS = {
-        "BTC/USDT": 60,  # 86.8% WR, $661 P&L
-        "ETH/USDT": 60,  # 88.5% WR, $706 P&L
-        "SOL/USDT": 55,  # 85.8% WR, $610 P&L
-        "XRP/USDT": 60,  # 89.5% WR, $405 P&L
+        "BTC/USDT": 90,  # only exit on extreme M10 disagreement
+        "ETH/USDT": 90,
+        "SOL/USDT": 90,
+        "XRP/USDT": 90,
     }
 
     # Per-asset TEK (technical/probability table) thresholds
