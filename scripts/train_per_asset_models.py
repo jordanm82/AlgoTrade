@@ -361,11 +361,27 @@ def main():
                             kx_syn["lower_lows_4h"] = 0
                             kx_syn["trend_strength"] = 0
 
-                        # Confluence defaults for synthetic (no cross-asset data)
-                        kx_syn["alt_rsi_avg"] = 50
-                        kx_syn["alt_rsi_1h_avg"] = 50
-                        kx_syn["alt_momentum_align"] = 0
-                        kx_syn["alt_distance_avg"] = 0
+                        # Confluence from OTHER assets' synthetic data
+                        syn_alt_rsi = []
+                        syn_alt_rsi_1h = []
+                        syn_alt_mom = []
+                        for alt_asset in alt_assets:
+                            if alt_asset in syn_data:
+                                alt_syn_15m = syn_data[alt_asset]["15m"]
+                                alt_syn_1h = syn_data[alt_asset]["1h"]
+                                alt_filt = alt_syn_15m[alt_syn_15m.index < ws_syn]
+                                if len(alt_filt) >= 2:
+                                    rv = float(alt_filt.iloc[-1].get("rsi", 50))
+                                    syn_alt_rsi.append(rv)
+                                    syn_alt_mom.append(1 if rv >= 50 else -1)
+                                if alt_syn_1h is not None:
+                                    alt_1h_f = alt_syn_1h[alt_syn_1h.index <= ws_syn]
+                                    if len(alt_1h_f) >= 2:
+                                        syn_alt_rsi_1h.append(float(alt_1h_f.iloc[-1].get("rsi", 50)))
+                        kx_syn["alt_rsi_avg"] = sum(syn_alt_rsi) / len(syn_alt_rsi) if syn_alt_rsi else 50
+                        kx_syn["alt_rsi_1h_avg"] = sum(syn_alt_rsi_1h) / len(syn_alt_rsi_1h) if syn_alt_rsi_1h else 50
+                        kx_syn["alt_momentum_align"] = sum(syn_alt_mom) if syn_alt_mom else 0
+                        kx_syn["alt_distance_avg"] = 0  # can't compute without strikes
 
                         feat_syn = build_features(prev, syn_1h, syn_4h, ws_syn,
                                                   s["distance_from_strike"],
