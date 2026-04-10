@@ -187,6 +187,9 @@ class KalshiDaemon:
                 if df_1h is None or df_1h.empty:
                     df_1h = self.fetcher.ohlcv(symbol, "1h", limit=100)
                 if df_1h is not None and not df_1h.empty:
+                    # Drop last row — CCXT returns the in-progress candle which
+                    # has incomplete RSI/MACD. Backtest only uses completed candles.
+                    df_1h = df_1h.iloc[:-1]
                     results["1h"] = add_indicators(df_1h)
             except Exception:
                 pass
@@ -195,6 +198,7 @@ class KalshiDaemon:
                 if df_4h is None or df_4h.empty:
                     df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
                 if df_4h is not None and not df_4h.empty:
+                    df_4h = df_4h.iloc[:-1]  # drop in-progress candle
                     results["4h"] = add_indicators(df_4h)
             except Exception:
                 pass
@@ -220,13 +224,15 @@ class KalshiDaemon:
             results = {}
             try:
                 df_1h = self.fetcher.ohlcv(symbol, "1h", limit=100)
-                if df_1h is not None and not df_1h.empty:
+                if df_1h is not None and len(df_1h) > 1:
+                    df_1h = df_1h.iloc[:-1]  # drop in-progress candle
                     results["1h"] = add_indicators(df_1h)
             except Exception:
                 pass
             try:
                 df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
-                if df_4h is not None and not df_4h.empty:
+                if df_4h is not None and len(df_4h) > 1:
+                    df_4h = df_4h.iloc[:-1]  # drop in-progress candle
                     results["4h"] = add_indicators(df_4h)
             except Exception:
                 pass
