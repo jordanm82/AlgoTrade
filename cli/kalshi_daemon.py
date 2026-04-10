@@ -2051,9 +2051,15 @@ class KalshiDaemon:
                         pass
 
                 # Filter to candles BEFORE window start (matches backtest exactly)
-                # No synthetic snapshots — use pre-computed features from cached DataFrame
-                df_15m = df_15m[df_15m.index < current_window_start_pd]
                 if df_15m is None or len(df_15m) < 50:
+                    predictions.append({
+                        "symbol": symbol, "asset": asset,
+                        "direction": "--", "confidence": 0,
+                        "reason": "no cached 15m data", "ob": 0, "flow": 0, "state": state,
+                    })
+                    continue
+                df_15m = df_15m[df_15m.index < current_window_start_pd]
+                if len(df_15m) < 20:
                     predictions.append({
                         "symbol": symbol, "asset": asset,
                         "direction": "--", "confidence": 0,
