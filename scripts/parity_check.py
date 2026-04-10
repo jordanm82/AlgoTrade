@@ -72,8 +72,11 @@ def main():
     ind_data = {}
     for asset, sym in ASSETS_SYMS.items():
         df_15m = add_indicators(fetcher.ohlcv(sym, "15m", limit=200))
-        df_1h = add_indicators(fetcher.ohlcv(sym, "1h", limit=50))
-        df_4h = add_indicators(fetcher.ohlcv(sym, "4h", limit=50))
+        # Drop in-progress candles (CCXT returns current unfinished candle as last row)
+        raw_1h = fetcher.ohlcv(sym, "1h", limit=100)
+        df_1h = add_indicators(raw_1h.iloc[:-1]) if raw_1h is not None and len(raw_1h) > 1 else None
+        raw_4h = fetcher.ohlcv(sym, "4h", limit=50)
+        df_4h = add_indicators(raw_4h.iloc[:-1]) if raw_4h is not None and len(raw_4h) > 1 else None
         pct = df_15m["close"].pct_change()
         df_15m["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
         df_15m["vol_ratio"] = df_15m["volume"] / df_15m["vol_sma_20"]
