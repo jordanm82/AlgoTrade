@@ -102,8 +102,8 @@ def main():
         cb_5m = data[asset]["5m_cb"]
         bs_5m = data[asset]["5m_bs"]
         df_15m = add_indicators(data[asset]["15m"])
-        df_1h = add_indicators(data[asset]["1h"])
-        df_4h = add_indicators(data[asset]["4h"])
+        df_1h = add_indicators(data[asset]["1h"]) if not data[asset]["1h"].empty else None
+        df_4h = add_indicators(data[asset]["4h"]) if not data[asset]["4h"].empty else None
 
         # Add derived features
         pct = df_15m["close"].pct_change()

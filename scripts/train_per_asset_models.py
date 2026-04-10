@@ -59,11 +59,18 @@ ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + REGIME_FEATURES
 
 
 def main():
+    import argparse as _ap
+    _parser = _ap.ArgumentParser()
+    _parser.add_argument("--synthetic", action="store_true", help="Include synthetic labels from historical data")
+    _args = _parser.parse_args()
+
     client = KalshiClient(api_key_id=KALSHI_API_KEY_ID, private_key_path=str(KALSHI_KEY_FILE))
     fetcher = DataFetcher()
 
     print("=" * 80)
     print("PER-ASSET MODELS WITH CROSS-ASSET CONFLUENCE")
+    if _args.synthetic:
+        print("*** INCLUDING SYNTHETIC LABELS FROM HISTORICAL DATA ***")
     print("=" * 80)
 
     # Fetch all data
@@ -288,8 +295,98 @@ def main():
                 continue
             rows.append({**feat, "label": label, "ts": close_dt})
 
+        # Merge synthetic data if available
+        if _args.synthetic:
+            syn_path = Path("data/store/synthetic_labels.pkl")
+            if syn_path.exists():
+                syn_data = pickle.load(open(syn_path, "rb"))
+                if target_asset in syn_data:
+                    syn_asset = syn_data[target_asset]
+                    syn_samples = syn_asset["samples"]
+                    syn_15m = syn_asset["15m"]
+                    syn_1h = syn_asset["1h"]
+                    syn_4h = syn_asset["4h"]
+
+                    syn_atr_s = syn_15m["atr"].dropna()
+                    syn_ar20 = syn_atr_s.rolling(20)
+                    syn_atr_p = ((syn_atr_s - syn_ar20.min()) / (syn_ar20.max() - syn_ar20.min())).fillna(0.5)
+
+                    syn_count = 0
+                    for s in syn_samples:
+                        idx = s["_15m_idx"]
+                        if idx < 20 or idx >= len(syn_15m) - 1:
+                            continue
+                        prev = syn_15m.iloc[idx]
+                        atr_syn = float(prev.get("atr", 0))
+                        if pd.isna(atr_syn) or atr_syn <= 0:
+                            continue
+                        ws_syn = syn_15m.index[idx + 1]  # window start
+
+                        # Build features same as Kalshi path
+                        kx_syn = {"strike_delta": 0, "strike_trend_3": 0}
+
+                        # ATR percentile
+                        pa_syn = syn_atr_p[syn_atr_p.index < ws_syn]
+                        apv_syn = float(pa_syn.iloc[-1]) if len(pa_syn) > 0 else 0.5
+
+                        # Regime features
+                        prev_c_syn = syn_15m[syn_15m.index < ws_syn]
+                        if len(prev_c_syn) >= 16:
+                            kx_syn["return_4h"] = (float(prev_c_syn.iloc[-1]["close"]) - float(prev_c_syn.iloc[-16]["close"])) / float(prev_c_syn.iloc[-16]["close"]) * 100
+                        else:
+                            kx_syn["return_4h"] = 0
+                        if len(prev_c_syn) >= 48:
+                            kx_syn["return_12h"] = (float(prev_c_syn.iloc[-1]["close"]) - float(prev_c_syn.iloc[-48]["close"])) / float(prev_c_syn.iloc[-48]["close"]) * 100
+                        else:
+                            kx_syn["return_12h"] = 0
+                        if syn_1h is not None:
+                            h1f = syn_1h[syn_1h.index <= ws_syn]
+                            if len(h1f) >= 20 and atr_syn > 0:
+                                kx_syn["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr_syn
+                            else:
+                                kx_syn["price_vs_sma_1h"] = 0
+                        else:
+                            kx_syn["price_vs_sma_1h"] = 0
+                        if syn_4h is not None:
+                            h4f = syn_4h[syn_4h.index <= ws_syn]
+                            if len(h4f) >= 4:
+                                kx_syn["lower_lows_4h"] = sum(1 for i in range(-3, 0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
+                            else:
+                                kx_syn["lower_lows_4h"] = 0
+                            if len(h4f) >= 10 and atr_syn > 0:
+                                kx_syn["trend_strength"] = (float(h4f.iloc[-1]["close"]) - float(h4f["close"].rolling(10).mean().iloc[-1])) / atr_syn
+                            else:
+                                kx_syn["trend_strength"] = 0
+                        else:
+                            kx_syn["lower_lows_4h"] = 0
+                            kx_syn["trend_strength"] = 0
+
+                        # Confluence defaults for synthetic (no cross-asset data)
+                        kx_syn["alt_rsi_avg"] = 50
+                        kx_syn["alt_rsi_1h_avg"] = 50
+                        kx_syn["alt_momentum_align"] = 0
+                        kx_syn["alt_distance_avg"] = 0
+
+                        feat_syn = build_features(prev, syn_1h, syn_4h, ws_syn,
+                                                  s["distance_from_strike"],
+                                                  kalshi_extra=kx_syn, atr_pctile_val=apv_syn)
+                        if not feat_syn:
+                            continue
+                        if any(pd.isna(v) or np.isinf(v) for v in feat_syn.values()):
+                            continue
+                        # Ensure timezone-naive timestamp for sorting compatibility
+                        syn_ts = s["ts"]
+                        if hasattr(syn_ts, 'tzinfo') and syn_ts.tzinfo is None:
+                            syn_ts = syn_ts.replace(tzinfo=timezone.utc)
+                        elif not hasattr(syn_ts, 'tzinfo'):
+                            syn_ts = pd.Timestamp(syn_ts, tz='UTC')
+                        rows.append({**feat_syn, "label": s["label"], "ts": syn_ts})
+                        syn_count += 1
+
+                    print(f"  + {syn_count} synthetic samples added")
+
         df_all = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
-        print(f"  Samples: {len(df_all)} | YES: {df_all['label'].mean():.1%}")
+        print(f"  Total samples: {len(df_all)} | YES: {df_all['label'].mean():.1%}")
 
         split = int(len(df_all) * 0.7)
         df_train = df_all.iloc[:split]
