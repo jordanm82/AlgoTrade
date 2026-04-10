@@ -44,10 +44,10 @@ class KalshiDaemon:
 
     # Per-asset M0 entry thresholds (no backwards-looking momentum features)
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 57,  # 68.8% WR, $170 P&L — best P&L
-        "ETH/USDT": 60,  # 69.4% WR, $145 P&L
-        "SOL/USDT": 60,  # 68.0% WR, $119 P&L
-        "XRP/USDT": 57,  # 68.6% WR, $100 P&L
+        "BTC/USDT": 65,  # 70.0% WR — selective to compensate for live underperformance
+        "ETH/USDT": 65,  # 73.6% WR
+        "SOL/USDT": 65,  # 68.5% WR
+        "XRP/USDT": 65,  # 69.5% WR
     }
 
     # Per-asset M10 exit thresholds
