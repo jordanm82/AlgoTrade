@@ -16,7 +16,7 @@ Read this file completely before every trading session. It is your operational c
 - Same timing (minute 0 in both training and live, NOT minute 5 for training and minute 0 for live)
 - Same labels (Kalshi settlement results, NOT Coinbase candle direction)
 - Same strike source (Kalshi floor_strike, NOT Coinbase candle open)
-- Same features (all 23 features computed identically in training, backtest, and live)
+- Same features (all 29 M0 / 35 M10 features computed identically in training, backtest, and live)
 - If you change ANY data path in live, you MUST retrain the model to match
 
 **NO RESTING BUY ORDERS.** If the ask > MAX_ENTRY (60c), skip the bet. NEVER place a resting limit order below the market ask hoping it will fill — this is adverse selection. Fills on resting orders below market systematically lose because they only fill when the market turns against the bet.
@@ -36,43 +36,43 @@ data/fetcher.py           — Coinbase via CCXT (market data)
 data/brti_proxy.py        — Coinbase+Bitstamp averaged price (BRTI proxy)
 data/brti_display.py      — CF Benchmarks scrape (dashboard display only, NOT for trading)
 data/indicators.py        — RSI, BB, MACD, ATR, EMA
-strategy/strategies/kalshi_predictor_v3.py — Strike-relative LogReg model (23 features)
+strategy/strategies/kalshi_predictor_v3.py — Per-asset LogReg model loader (29/35 features)
 strategy/snapshot.py      — Minute-3 snapshot builder
 config/settings.py        — API keys, risk limits
 config/production.py      — Production settings
-models/knn_kalshi.pkl     — M0 entry model (LogReg, 23-feature strike-relative)
-models/m10_kalshi.pkl     — M10 exit model (LogReg, 23-feature, minute-10 distance)
+models/m0_{btc,eth,sol,xrp}.pkl — Per-asset M0 entry models (29 features each)
+models/m10_{btc,eth,sol,xrp}.pkl — Per-asset M10 exit models (35 features each)
 ```
 
 ## Kalshi K15 UpDown Strategy (V3)
 
-### Model — 23-Feature Strike-Relative LogReg
+### Model — Per-Asset LogReg with Cross-Asset Confluence + Regime Detection
 
-Predicts the actual Kalshi question: "Will price close above strike?"
+Predicts the actual Kalshi question: "Will price close above strike?" Separate model per asset (BTC, ETH, SOL, XRP).
 
 **Training data sources (must match live exactly):**
 - **Labels:** Kalshi settled market result (yes/no) — ground truth
 - **Strike:** Kalshi floor_strike — actual settlement strike
 - **Price at minute 0:** Coinbase + Bitstamp 5m candle OPEN averaged
-- **Indicators:** Coinbase 15m/1h/4h candles (previous completed candle)
+- **Indicators:** Coinbase 15m/1h/4h candles (previous completed candle; in-progress candle dropped)
+- **Training data:** 12 months synthetic data (~160K samples) + Kalshi settlements
 - **Training script:** `./venv/bin/python scripts/retrain_kalshi_labels.py`
-- **Backtest script:** `./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 60 --m10-threshold 70 --exit-min 10 --exit-max 25`
+- **Backtest script:** `./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 65 --m10-threshold 80 --exit-min 10 --exit-max 25`
 - Auto-triggered on daemon startup when model > 7 days old
 
-**23 features (grouped by source):**
+**M0 entry model — 29 features (no rsi_15m):**
 
-*Technical indicators (from previous 15m candle):*
-- `rsi_15m` (#1, -1.79) — short-term momentum (mean-reversion signal)
-- `price_vs_ema` (#3, +0.85) — trend position relative to EMA
+*Technical indicators (from previous completed 15m candle):*
+- `price_vs_ema` — trend position relative to EMA
 - `macd_15m`, `norm_return`, `ema_slope`, `roc_5`, `vol_ratio`, `adx`
 - `hourly_return`, `trend_direction`
 
-*Higher timeframe context:*
-- `rsi_1h` (#2, +1.28) — hourly momentum (continuation signal)
+*Higher timeframe context (in-progress candle dropped):*
+- `rsi_1h` — hourly momentum (continuation signal)
 - `macd_1h`, `rsi_4h`
 
 *Strike-relative:*
-- `distance_from_strike` (#5, +0.29) — price vs strike in ATR units
+- `distance_from_strike` — price vs strike in ATR units
 
 *Kalshi-specific (lookback from recent settlements):*
 - `prev_result` — last window's settlement (yes=1/no=0)
@@ -81,20 +81,35 @@ Predicts the actual Kalshi question: "Will price close above strike?"
 - `strike_delta` — strike movement vs previous window (ATR-normalized)
 - `strike_trend_3` — average strike movement over last 3 windows
 
+*Cross-asset confluence:*
+- `alt_rsi_avg` — average RSI 15m of other 3 assets
+- `alt_rsi_1h_avg` — average RSI 1h of other 3 assets
+- `alt_momentum_align` — directional consensus across assets
+- `prev_result_consensus` — cross-asset settlement agreement
+- `alt_distance_avg` — average distance from strike of other assets
+
+*Regime detection:*
+- `return_4h`, `return_12h` — multi-hour return context
+- `price_vs_sma_1h` — price vs 1h 20-SMA in ATR units
+- `lower_lows_4h` — count of lower lows in last 3 4h candles
+- `trend_strength` — price vs 4h 10-SMA in ATR units
+
 *Time + derived:*
 - `hour_sin`, `hour_cos` — cyclical hour encoding
 - `rsi_alignment` — 1h/4h RSI agreement (+1 aligned, -1 diverging)
 - `atr_percentile` — current ATR vs 20-period range (volatility regime)
 
-**Walk-forward validated:** 67.5% entry WR at threshold 60, 1 losing day over 60 days.
-
 ### M10 Confirmation Model
 
-Separate model trained on minute-10 data. Decides hold or exit at minute 10.
-- **Distance coefficient:** +3.70 (dominant feature — by minute 10, distance tells most of the story)
-- **Same 23 features** as M0, but distance computed from minute-10 price
-- **Threshold:** 70/30 — only exits on high-conviction disagreement
-- **Accuracy:** 89% (exits are almost always correct)
+Separate per-asset model trained on minute-10 data. Decides hold or exit at minute 10.
+- **35 features** — same 29 as M0 plus `rsi_15m` and 5 intra-window 5m features:
+  - `rsi_15m` — available at minute 10 (candle nearly complete)
+  - `price_move_atr` — total price move during minutes 0-10
+  - `candle1_range_atr`, `candle2_range_atr` — range of two 5m sub-periods
+  - `momentum_shift` — direction change between 5m sub-periods
+  - `volume_acceleration` — volume ratio between 5m sub-periods
+- **Distance coefficient:** dominant feature — by minute 10, distance tells most of the story
+- **Threshold:** 80/20 — only exits on very high-conviction disagreement
 - **Training script:** `./venv/bin/python scripts/train_m10_model.py`
 
 ### Execution Lifecycle — Minute-0 Entry + M10 Exit
@@ -103,12 +118,12 @@ Separate model trained on minute-10 data. Decides hold or exit at minute 10.
 |------|-------|--------|
 | :00:03 | CONFIRMED | Signal + reprice up to 60c for ~8s. If ask > 60c → skip (no resting orders) |
 | :02-:09 | MONITORING | Hold position, no new entries |
-| :10+ | M10 CONFIRM | M10 model: hold or exit. Only exits at 70%+ confidence. Sell at bid (floor 10c) |
+| :10+ | M10 CONFIRM | Per-asset M10 model: hold or exit. Only exits at 80%+ confidence. Sell at bid (floor 10c) |
 | :15 | SETTLEMENT | Kalshi settles. P&L computed from our entry price + result |
 
 **No resting buy orders.** If the ask isn't ≤ 60c at minute 0, we skip. The reprice loop tries 4 times over ~8 seconds, then cancels if still unfilled.
 
-**M10 exit:** If M10 disagrees with bet side at 70%+ confidence → sell at current bid. If bid < 10c → place resting sell at 10c floor. Bet is immediately removed from `_pending_bets` to prevent double-counting at settlement.
+**M10 exit:** If per-asset M10 disagrees with bet side at 80%+ confidence → sell at current bid. If bid < 10c → place resting sell at 10c floor. Bet is immediately removed from `_pending_bets` to prevent double-counting at settlement.
 
 **Shutdown:** All resting orders cancelled on Ctrl+C, SIGTERM, window boundary, and via atexit handler.
 
@@ -125,9 +140,9 @@ Separate model trained on minute-10 data. Decides hold or exit at minute 10.
 
 ### Betting Rules
 
-- **Entry threshold:** 60% confidence (model prob >= 60 for YES, <= 40 for NO)
+- **Entry threshold:** 65% confidence (model prob >= 65 for YES, <= 35 for NO) — all assets
 - **Max entry price:** 60c — if ask > 60c, skip entirely (NO resting orders)
-- **M10 exit threshold:** 70/30 — only exit when M10 disagrees at 70%+ confidence
+- **M10 exit threshold:** 80/20 — only exit when per-asset M10 disagrees at 80%+ confidence
 - **Position sizing:** flat 5% of balance per bet (CLI: `--maxsize=N`)
 - **Max concurrent bets:** configurable (CLI: `--maxbets=N`, default 3)
 - **No duplicate positions:** won't bet on an asset that already has an open position from any window
@@ -145,13 +160,13 @@ On startup, the daemon queries Kalshi for existing positions and resting orders 
 
 | File | Purpose |
 |------|---------|
-| `scripts/retrain_kalshi_labels.py` | Retrain M0 model (23 features, Kalshi labels) |
-| `scripts/train_m10_model.py` | Retrain M10 model (23 features, minute-10 distance) |
+| `scripts/retrain_kalshi_labels.py` | Retrain per-asset M0 models (29 features, Kalshi labels) |
+| `scripts/train_m10_model.py` | Retrain per-asset M10 models (35 features, minute-10 distance) |
 | `scripts/backtest_kalshi_labels.py` | Backtest with M0 entry + M10 exit simulation |
 | `data/store/trade_debug.jsonl` | Order lifecycle debug log (market select, fills, settlements) |
 | `data/store/feature_log.jsonl` | Model prediction feature audit log |
-| `models/knn_kalshi.pkl` | M0 entry model (auto-retrains when > 7 days old) |
-| `models/m10_kalshi.pkl` | M10 exit model |
+| `models/m0_{asset}.pkl` | Per-asset M0 entry models (auto-retrains when > 7 days old) |
+| `models/m10_{asset}.pkl` | Per-asset M10 exit models |
 
 ### Running
 
@@ -165,8 +180,8 @@ python dashboard_rich.py --live --maxbets=3 --maxsize=5
 # Demo (Kalshi demo exchange — tests order plumbing only, NOT model)
 python dashboard_rich.py --demo
 
-# Backtest (60 days, threshold 60, M10 threshold 70)
-./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 60 --m10-threshold 70 --exit-min 10 --exit-max 25
+# Backtest (60 days, threshold 65, M10 threshold 80)
+./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 65 --m10-threshold 80 --exit-min 10 --exit-max 25
 ```
 
 **WARNING:** Demo exchange has no real liquidity and prices don't track live. Only useful for testing order lifecycle, NOT for validating predictions.
@@ -203,4 +218,8 @@ python dashboard_rich.py --demo
 - **Entry window.** Only enter at minute 0-1. Re-evaluating at minutes 2-4 with stale indicators + drifting price generates bad signals.
 - **Kalshi market transitions take seconds.** At window boundary, query for future markets only (close_time > now) to avoid betting on the just-settled window.
 - **Demo exchange can't validate predictions.** Same strikes/settlements as production, but no real liquidity. Only tests order plumbing.
-- **Losing days are NO-heavy choppy days.** The model's NO side underperforms on sideways markets near the strike. Higher thresholds (60) filter out weak signals and reduce losing days from 14 to 1 over 60 days.
+- **Losing days are NO-heavy choppy days.** The model's NO side underperforms on sideways markets near the strike. Higher thresholds (65) filter out weak signals and reduce losing days.
+- **In-progress candle leaks future data.** CCXT returns the current (incomplete) candle as the last row in 1h/4h data. Must drop it before computing indicators, or the model sees partial future data that training never had.
+- **Per-asset models outperform unified.** Each asset has different volatility regimes and RSI behavior. Per-asset models with cross-asset confluence capture both asset-specific patterns and market-wide signals.
+- **rsi_15m is NOT available at minute 0.** The 15m candle hasn't closed yet, so rsi_15m is from the prior candle and stale. M0 excludes it (29 features); M10 includes it (candle nearly complete at minute 10).
+- **Settlement P&L must use known entry price.** Kalshi settlements API cost fields mix buy/sell transactions. Always track entry_price at fill time and compute P&L as (payout - entry_price).
