@@ -33,7 +33,9 @@ BASE_FEATURES = [
     # prev_result, prev_3_yes_pct, streak_length REMOVED — backwards-looking momentum trap
     "strike_delta", "strike_trend_3",
     "hour_sin", "hour_cos",
-    "rsi_alignment", "atr_percentile", "rsi_15m", "bbw",
+    "rsi_alignment", "atr_percentile", "bbw",
+    # rsi_15m REMOVED from M0 — causes mean-reversion bias that buys every dip.
+    # Kept in M10 where short-term RSI is valid for 5-min exit decisions.
 ]
 
 CONFLUENCE_FEATURES = [
