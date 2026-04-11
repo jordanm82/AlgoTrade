@@ -353,7 +353,7 @@ class KalshiPredictorV3:
                 all_features["lower_lows_4h"] = kx.get("lower_lows_4h", 0)
                 all_features["trend_strength"] = kx.get("trend_strength", 0)
 
-                # Interaction features — let LogReg learn conditional relationships
+                # Interaction features — XGBoost uses these for conditional relationships
                 _pve = all_features.get("price_vs_ema", 0)
                 _es = all_features.get("ema_slope", 0)
                 _ts = all_features["trend_strength"]

@@ -42,7 +42,7 @@ class KalshiDaemon:
         "XRP/USDT": "KXXRP15M",
     }
 
-    # Per-asset M0 entry thresholds (29 features, no rsi_15m)
+    # Per-asset M0 entry thresholds (33 features, no rsi_15m)
     KALSHI_THRESHOLDS = {
         "BTC/USDT": 65,
         "ETH/USDT": 65,
@@ -50,7 +50,7 @@ class KalshiDaemon:
         "XRP/USDT": 65,
     }
 
-    # Per-asset M10 exit thresholds (35 features, with rsi_15m + 5m intra-window)
+    # Per-asset M10 exit thresholds (39 features, with rsi_15m + 5m intra-window)
     KALSHI_M10_THRESHOLDS = {
         "BTC/USDT": 80,
         "ETH/USDT": 80,
@@ -738,7 +738,7 @@ class KalshiDaemon:
     MIN_SELL_PRICE = 10  # floor: won't sell below 10c, place resting sell instead
 
     def _load_m10_model(self):
-        """Lazy-load per-asset M10 models (35 features each)."""
+        """Lazy-load per-asset M10 models (39 features each)."""
         if self._m10_model is not None:
             return
         try:
@@ -767,9 +767,9 @@ class KalshiDaemon:
             print(colored(f"  [M10] Model load failed: {e}", "yellow"))
 
     def _m10_confirm(self):
-        """At minute 10, run per-asset M10 model (35 features) to decide: hold or exit.
+        """At minute 10, run per-asset M10 model (39 features) to decide: hold or exit.
 
-        M10 model has 35 features: 29 M0 features + rsi_15m + 5 intra-window 5m features.
+        M10 model has 39 features: 33 M0 features + rsi_15m + 5 intra-window 5m features.
         Threshold 80/20 — only exits on very high-conviction disagreement.
         """
         if not self._pending_bets:
@@ -947,7 +947,7 @@ class KalshiDaemon:
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
 
-            # Select per-asset M10 model (35 features) or fall back to unified
+            # Select per-asset M10 model (39 features) or fall back to unified
             if hasattr(self, '_m10_per_asset') and asset in self._m10_per_asset:
                 pa_model, pa_scaler, pa_features = self._m10_per_asset[asset]
                 X = np.array([feat.get(f, 0) for f in pa_features]).reshape(1, -1)
@@ -1713,8 +1713,8 @@ class KalshiDaemon:
     def _kalshi_eval(self):
         """Kalshi evaluation — per-asset models, minute-0 entry only.
 
-        Uses per-asset M0 models (29 features, no rsi_15m) for entry at minute 0-1,
-        and per-asset M10 models (35 features, with rsi_15m + 5m intra-window) for
+        Uses per-asset M0 models (33 features, no rsi_15m) for entry at minute 0-1,
+        and per-asset M10 models (39 features, with rsi_15m + 5m intra-window) for
         exit decisions at minute 10+. Cross-asset confluence and regime detection
         features are computed for all assets. In-progress 1h/4h candles are dropped.
 
@@ -1732,7 +1732,7 @@ class KalshiDaemon:
         if self._resting_orders and minute_in_window >= 1:
             self._check_resting_orders()
 
-        # Minute 10+ confirmation — uses per-asset M10 models (35 features incl rsi_15m + 5m intra-window).
+        # Minute 10+ confirmation — uses per-asset M10 models (39 features incl rsi_15m + 5m intra-window).
         # Use >= 10 instead of == 10 so we don't miss it if eval doesn't land exactly at min 10.
         # Each bet has _m10_checked flag to prevent double-runs.
         if minute_in_window >= 10:
@@ -3173,7 +3173,7 @@ class KalshiDaemon:
         - Strike: Kalshi floor_strike — actual settlement strike
         - Price: Coinbase + Bitstamp 5m average — BRTI proxy
         - Per-asset models with cross-asset confluence + regime detection
-        - 29 M0 features (no rsi_15m), 35 M10 features (with rsi_15m + 5m intra-window)
+        - 33 M0 features (no rsi_15m), 35 M10 features (with rsi_15m + 5m intra-window)
         - Trained on 12 months synthetic data (~160K samples)
         """
         import subprocess

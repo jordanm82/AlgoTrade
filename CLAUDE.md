@@ -16,7 +16,7 @@ Read this file completely before every trading session. It is your operational c
 - Same timing (minute 0 in both training and live, NOT minute 5 for training and minute 0 for live)
 - Same labels (Kalshi settlement results, NOT Coinbase candle direction)
 - Same strike source (Kalshi floor_strike, NOT Coinbase candle open)
-- Same features (all 29 M0 / 35 M10 features computed identically in training, backtest, and live)
+- Same features (all 33 M0 / 39 M10 features computed identically in training, backtest, and live)
 - If you change ANY data path in live, you MUST retrain the model to match
 
 **NO RESTING BUY ORDERS.** If the ask > MAX_ENTRY (60c), skip the bet. NEVER place a resting limit order below the market ask hoping it will fill — this is adverse selection. Fills on resting orders below market systematically lose because they only fill when the market turns against the bet.
@@ -36,19 +36,19 @@ data/fetcher.py           — Coinbase via CCXT (market data)
 data/brti_proxy.py        — Coinbase+Bitstamp averaged price (BRTI proxy)
 data/brti_display.py      — CF Benchmarks scrape (dashboard display only, NOT for trading)
 data/indicators.py        — RSI, BB, MACD, ATR, EMA
-strategy/strategies/kalshi_predictor_v3.py — Per-asset LogReg model loader (29/35 features)
+strategy/strategies/kalshi_predictor_v3.py — Per-asset XGBoost model loader (33/39 features)
 strategy/snapshot.py      — Minute-3 snapshot builder
 config/settings.py        — API keys, risk limits
 config/production.py      — Production settings
-models/m0_{btc,eth,sol,xrp}.pkl — Per-asset M0 entry models (29 features each)
-models/m10_{btc,eth,sol,xrp}.pkl — Per-asset M10 exit models (35 features each)
+models/m0_{btc,eth,sol,xrp}.pkl — Per-asset XGBoost M0 entry models (33 features each)
+models/m10_{btc,eth,sol,xrp}.pkl — Per-asset XGBoost M10 exit models (39 features each)
 ```
 
 ## Kalshi K15 UpDown Strategy (V3)
 
-### Model — Per-Asset LogReg with Cross-Asset Confluence + Regime Detection
+### Model — Per-Asset XGBoost with Cross-Asset Confluence + Regime Detection
 
-Predicts the actual Kalshi question: "Will price close above strike?" Separate model per asset (BTC, ETH, SOL, XRP).
+Predicts the actual Kalshi question: "Will price close above strike?" Separate XGBoost model per asset (BTC, ETH, SOL, XRP). XGBoost replaces LogReg because it can learn conditional relationships (e.g., "below EMA in downtrend → NO" vs LogReg's fixed "below EMA → always YES").
 
 **Training data sources (must match live exactly):**
 - **Labels:** Kalshi settled market result (yes/no) — ground truth
@@ -60,7 +60,9 @@ Predicts the actual Kalshi question: "Will price close above strike?" Separate m
 - **Backtest script:** `./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 65 --m10-threshold 80 --exit-min 10 --exit-max 25`
 - Auto-triggered on daemon startup when model > 7 days old
 
-**M0 entry model — 29 features (no rsi_15m):**
+**M0 entry model — 33 features (XGBoost, no rsi_15m):**
+
+*Anti-overfitting:* subsample=0.7, colsample_bytree=0.7, learning_rate=0.03, max_depth=4, min_child_weight=50, early stopping on 15% validation set. Trained on 12 months synthetic data (~160K samples) + Kalshi settlements.
 
 *Technical indicators (from previous completed 15m candle):*
 - `price_vs_ema` — trend position relative to EMA
@@ -98,19 +100,27 @@ Predicts the actual Kalshi question: "Will price close above strike?" Separate m
 - `hour_sin`, `hour_cos` — cyclical hour encoding
 - `rsi_alignment` — 1h/4h RSI agreement (+1 aligned, -1 diverging)
 - `atr_percentile` — current ATR vs 20-period range (volatility regime)
+- `bbw` — Bollinger Band Width (ranging vs trending regime)
+
+*Interaction features (let XGBoost learn conditional relationships):*
+- `pve_x_trend` — price_vs_ema × trend_strength
+- `pve_x_return12h` — price_vs_ema × return_12h
+- `slope_x_trend` — ema_slope × trend_strength
+- `slope_x_return12h` — ema_slope × return_12h
 
 ### M10 Confirmation Model
 
-Separate per-asset model trained on minute-10 data. Decides hold or exit at minute 10.
-- **35 features** — same 29 as M0 plus `rsi_15m` and 5 intra-window 5m features:
+Separate per-asset XGBoost model trained on minute-10 data. Decides hold or exit at minute 10.
+- **39 features** — same 33 as M0 plus `rsi_15m` and 5 intra-window 5m features, plus interaction features:
   - `rsi_15m` — available at minute 10 (candle nearly complete)
   - `price_move_atr` — total price move during minutes 0-10
   - `candle1_range_atr`, `candle2_range_atr` — range of two 5m sub-periods
   - `momentum_shift` — direction change between 5m sub-periods
   - `volume_acceleration` — volume ratio between 5m sub-periods
-- **Distance coefficient:** dominant feature — by minute 10, distance tells most of the story
+- **Top features:** `distance_from_strike` (0.25) and `price_move_atr` (0.12-0.14) dominate exit decisions
 - **Threshold:** 80/20 — only exits on very high-conviction disagreement
-- **Training script:** `./venv/bin/python scripts/train_m10_model.py`
+- **Anti-overfitting:** same XGBoost settings as M0
+- **Training script:** `./venv/bin/python scripts/train_per_asset_m10.py`
 
 ### Execution Lifecycle — Minute-0 Entry + M10 Exit
 
@@ -160,13 +170,13 @@ On startup, the daemon queries Kalshi for existing positions and resting orders 
 
 | File | Purpose |
 |------|---------|
-| `scripts/retrain_kalshi_labels.py` | Retrain per-asset M0 models (29 features, Kalshi labels) |
-| `scripts/train_m10_model.py` | Retrain per-asset M10 models (35 features, minute-10 distance) |
+| `scripts/train_xgboost_per_asset.py` | Train per-asset XGBoost M0 models (33 features) |
+| `scripts/train_per_asset_m10.py` | Train per-asset XGBoost M10 models (39 features) |
 | `scripts/backtest_kalshi_labels.py` | Backtest with M0 entry + M10 exit simulation |
 | `data/store/trade_debug.jsonl` | Order lifecycle debug log (market select, fills, settlements) |
 | `data/store/feature_log.jsonl` | Model prediction feature audit log |
-| `models/m0_{asset}.pkl` | Per-asset M0 entry models (auto-retrains when > 7 days old) |
-| `models/m10_{asset}.pkl` | Per-asset M10 exit models |
+| `models/m0_{asset}.pkl` | Per-asset XGBoost M0 entry models |
+| `models/m10_{asset}.pkl` | Per-asset XGBoost M10 exit models |
 
 ### Running
 
@@ -223,3 +233,6 @@ python dashboard_rich.py --demo
 - **Per-asset models outperform unified.** Each asset has different volatility regimes and RSI behavior. Per-asset models with cross-asset confluence capture both asset-specific patterns and market-wide signals.
 - **rsi_15m is NOT available at minute 0.** The 15m candle hasn't closed yet, so rsi_15m is from the prior candle and stale. M0 excludes it (29 features); M10 includes it (candle nearly complete at minute 10).
 - **Settlement P&L must use known entry price.** Kalshi settlements API cost fields mix buy/sell transactions. Always track entry_price at fill time and compute P&L as (payout - entry_price).
+- **LogReg cannot learn conditional relationships.** `price_vs_ema × -0.98` ALWAYS pushes YES when price is below EMA, regardless of trend. XGBoost can learn "IF below EMA AND downtrend THEN NO." This was the root cause of persistent YES bias in bearish markets.
+- **Synthetic training data must compute ALL features identically to live.** Defaulting confluence features to 50/0 in synthetic data trained the model to expect neutral confluence. In live, real values (63 vs 50) caused a -0.76 logit shift systematically biasing predictions.
+- **XGBoost anti-overfitting is critical.** Use subsample=0.7, colsample=0.7, learning_rate=0.03, max_depth=4, min_child_weight=50, and early stopping on a validation set. Without these, XGBoost memorizes training data.
