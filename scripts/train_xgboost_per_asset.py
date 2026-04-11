@@ -317,18 +317,20 @@ def main():
 
         print(f"  Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
 
-        # XGBoost with anti-overfitting
+        # XGBoost with stronger anti-overfitting
         model = XGBClassifier(
-            n_estimators=2000,          # high max, early stopping will find optimal
-            learning_rate=0.03,         # small step size for fine-grained early stopping
-            max_depth=4,                # shallow trees to prevent memorization
-            min_child_weight=50,        # need 50+ samples per leaf
-            subsample=0.7,              # random 70% of rows per tree
-            colsample_bytree=0.7,       # random 70% of features per tree
-            reg_alpha=0.1,              # L1 regularization
-            reg_lambda=1.0,             # L2 regularization
-            scale_pos_weight=1.0,       # balanced classes
+            n_estimators=5000,          # high max, early stopping MUST trigger
+            learning_rate=0.01,         # very small steps for fine-grained stopping
+            max_depth=3,                # shallower trees
+            min_child_weight=100,       # need 100+ samples per leaf
+            subsample=0.6,              # random 60% of rows per tree
+            colsample_bytree=0.6,       # random 60% of features per tree
+            reg_alpha=1.0,              # stronger L1
+            reg_lambda=5.0,             # stronger L2
+            gamma=1.0,                  # min loss reduction for split
+            scale_pos_weight=1.0,
             eval_metric="logloss",
+            early_stopping_rounds=50,   # stop if no improvement for 50 rounds
             random_state=42,
             verbosity=0,
         )

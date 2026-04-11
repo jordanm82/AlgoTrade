@@ -369,7 +369,11 @@ class KalshiPredictorV3:
                     pa_model, pa_scaler, pa_features = self._per_asset_models[asset]
                     vals = [all_features.get(f, 0) for f in pa_features]
                     X = np.array(vals).reshape(1, -1)
-                    prob_up = float(pa_model.predict_proba(pa_scaler.transform(X))[0][1])
+                    # XGBoost: predict on raw features (trained on raw)
+                    # LogReg: predict on scaled features (trained on scaled)
+                    is_tree_model = hasattr(pa_model, 'get_booster') or 'XGB' in type(pa_model).__name__
+                    X_pred = X if is_tree_model else pa_scaler.transform(X)
+                    prob_up = float(pa_model.predict_proba(X_pred)[0][1])
                 elif self._knn is not None:
                     model_features = self._knn_scaler.feature_names_in_ if hasattr(self._knn_scaler, 'feature_names_in_') else None
                     feature_names = model_features if model_features is not None else [

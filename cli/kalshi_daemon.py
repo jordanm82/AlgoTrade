@@ -951,7 +951,10 @@ class KalshiDaemon:
             if hasattr(self, '_m10_per_asset') and asset in self._m10_per_asset:
                 pa_model, pa_scaler, pa_features = self._m10_per_asset[asset]
                 X = np.array([feat.get(f, 0) for f in pa_features]).reshape(1, -1)
-                prob = float(pa_model.predict_proba(pa_scaler.transform(X))[0][1])
+                # XGBoost: raw features. LogReg: scaled features.
+                is_tree = hasattr(pa_model, 'get_booster') or 'XGB' in type(pa_model).__name__
+                X_pred = X if is_tree else pa_scaler.transform(X)
+                prob = float(pa_model.predict_proba(X_pred)[0][1])
             else:
                 feature_names = self._m10_scaler.feature_names_in_ if hasattr(self._m10_scaler, 'feature_names_in_') else [
                     "macd_15m", "norm_return", "ema_slope", "roc_5",
