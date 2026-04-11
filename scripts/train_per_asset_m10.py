@@ -10,7 +10,7 @@ import pickle, sys, time
 import numpy as np, pandas as pd
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -321,25 +321,52 @@ def main():
         df_all = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
         print(f"  Samples: {len(df_all)} | YES: {df_all['label'].mean():.1%}")
 
-        split = int(len(df_all) * 0.7)
-        df_train = df_all.iloc[:split]
-        df_test = df_all.iloc[split:]
+        # 70/15/15 split with early stopping
+        split_train = int(len(df_all) * 0.70)
+        split_val = int(len(df_all) * 0.85)
+        df_train = df_all.iloc[:split_train]
+        df_val = df_all.iloc[split_train:split_val]
+        df_test = df_all.iloc[split_val:]
+
+        X_train = df_train[ALL_FEATURES].values
         y_train = df_train["label"].values
+        X_val = df_val[ALL_FEATURES].values
+        y_val = df_val["label"].values
+        X_test = df_test[ALL_FEATURES].values
         y_test = df_test["label"].values
 
+        print(f"  Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
+
+        model = XGBClassifier(
+            n_estimators=2000,
+            learning_rate=0.03,
+            max_depth=4,
+            min_child_weight=50,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            eval_metric="logloss",
+            random_state=42,
+            verbosity=0,
+        )
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+        best_iter = model.best_iteration if hasattr(model, 'best_iteration') else model.n_estimators
+        print(f"  Best iteration: {best_iter}")
+
+        # Top features by importance
+        importances = dict(zip(ALL_FEATURES, model.feature_importances_))
+        print(f"\n  Top 10 features:")
+        for name, imp in sorted(importances.items(), key=lambda x: -x[1])[:10]:
+            marker = " [5m]" if name in INTRA_WINDOW_FEATURES else ""
+            print(f"    {name:<24}: {imp:.4f}{marker}")
+
+        # Threshold sweep
         scaler = StandardScaler()
-        X_train = scaler.fit_transform(df_train[ALL_FEATURES].values)
-        model = LogisticRegression(max_iter=1000, C=1.0, class_weight="balanced")
-        model.fit(X_train, y_train)
-
-        # Top features
-        print(f"\n  Top 5 features:")
-        for name, coef in sorted(zip(ALL_FEATURES, model.coef_[0]), key=lambda x: abs(x[1]), reverse=True)[:5]:
-            marker = " [C]" if name in CONFLUENCE_FEATURES else ""
-            print(f"    {name:<24}: {coef:>+8.4f}{marker}")
-
-        # Threshold sweep for M10 exit decision
-        probs = model.predict_proba(scaler.transform(df_test[ALL_FEATURES].values))[:, 1]
+        scaler.fit(X_train)
+        scaler.feature_names_in_ = np.array(ALL_FEATURES)
+        probs = model.predict_proba(X_test)[:, 1]
         print(f"\n  {'Thresh':>6} | {'Bets':>5} {'WR':>6} | {'P&L':>7}")
         print(f"  {'-' * 35}")
         for t in [55, 60, 65, 70, 75, 80]:
