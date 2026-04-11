@@ -353,6 +353,16 @@ class KalshiPredictorV3:
                 all_features["lower_lows_4h"] = kx.get("lower_lows_4h", 0)
                 all_features["trend_strength"] = kx.get("trend_strength", 0)
 
+                # Interaction features — let LogReg learn conditional relationships
+                _pve = all_features.get("price_vs_ema", 0)
+                _es = all_features.get("ema_slope", 0)
+                _ts = all_features["trend_strength"]
+                _r12 = all_features["return_12h"]
+                all_features["pve_x_trend"] = _pve * _ts
+                all_features["pve_x_return12h"] = _pve * _r12
+                all_features["slope_x_trend"] = _es * _ts
+                all_features["slope_x_return12h"] = _es * _r12
+
                 # Select per-asset model or fall back to unified
                 asset = kx.get("asset", "")
                 if asset in self._per_asset_models:

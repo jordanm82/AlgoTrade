@@ -52,7 +52,11 @@ REGIME_FEATURES = [
     "lower_lows_4h", "trend_strength",
 ]
 
-ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + INTRA_WINDOW_FEATURES + REGIME_FEATURES
+INTERACTION_FEATURES = [
+    "pve_x_trend", "pve_x_return12h", "slope_x_trend", "slope_x_return12h",
+]
+
+ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + INTRA_WINDOW_FEATURES + REGIME_FEATURES + INTERACTION_FEATURES
 
 
 def main():
@@ -299,6 +303,16 @@ def main():
             else:
                 feat["lower_lows_4h"] = 0
                 feat["trend_strength"] = 0
+
+            # Interaction features
+            _pve = feat.get("price_vs_ema", 0)
+            _es = feat.get("ema_slope", 0)
+            _ts = feat.get("trend_strength", 0)
+            _r12 = feat.get("return_12h", 0)
+            feat["pve_x_trend"] = _pve * _ts
+            feat["pve_x_return12h"] = _pve * _r12
+            feat["slope_x_trend"] = _es * _ts
+            feat["slope_x_return12h"] = _es * _r12
 
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue

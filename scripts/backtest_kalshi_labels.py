@@ -177,6 +177,12 @@ def build_features(prev, df_1h, df_4h, ws_naive, distance, *,
     feat["lower_lows_4h"] = kx.get("lower_lows_4h", 0)
     feat["trend_strength"] = kx.get("trend_strength", 0)
 
+    # Interaction features
+    feat["pve_x_trend"] = feat["price_vs_ema"] * feat["trend_strength"]
+    feat["pve_x_return12h"] = feat["price_vs_ema"] * feat["return_12h"]
+    feat["slope_x_trend"] = feat.get("ema_slope", 0) * feat["trend_strength"]
+    feat["slope_x_return12h"] = feat.get("ema_slope", 0) * feat["return_12h"]
+
     if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
         return None
     return feat

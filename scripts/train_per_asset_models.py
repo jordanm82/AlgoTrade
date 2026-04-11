@@ -55,7 +55,17 @@ REGIME_FEATURES = [
     "trend_strength",   # 4h close vs 4h SMA — signed trend (positive=bull, negative=bear)
 ]
 
-ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + REGIME_FEATURES
+# Interaction features — let LogReg learn conditional relationships.
+# Without these, negative × negative = positive, so "below EMA" ALWAYS means YES.
+# With these, the model can learn "below EMA in downtrend = NO".
+INTERACTION_FEATURES = [
+    "pve_x_trend",       # price_vs_ema × trend_strength
+    "pve_x_return12h",   # price_vs_ema × return_12h
+    "slope_x_trend",     # ema_slope × trend_strength
+    "slope_x_return12h", # ema_slope × return_12h
+]
+
+ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + REGIME_FEATURES + INTERACTION_FEATURES
 
 
 def main():
@@ -291,6 +301,16 @@ def main():
             else:
                 feat["trend_strength"] = 0
 
+            # Interaction features
+            pve = feat.get("price_vs_ema", 0)
+            es = feat.get("ema_slope", 0)
+            ts_val = feat.get("trend_strength", 0)
+            r12 = feat.get("return_12h", 0)
+            feat["pve_x_trend"] = pve * ts_val
+            feat["pve_x_return12h"] = pve * r12
+            feat["slope_x_trend"] = es * ts_val
+            feat["slope_x_return12h"] = es * r12
+
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
             rows.append({**feat, "label": label, "ts": close_dt})
@@ -388,6 +408,15 @@ def main():
                                                   kalshi_extra=kx_syn, atr_pctile_val=apv_syn)
                         if not feat_syn:
                             continue
+                        # Interaction features
+                        pve_s = feat_syn.get("price_vs_ema", 0)
+                        es_s = feat_syn.get("ema_slope", 0)
+                        ts_s = feat_syn.get("trend_strength", kx_syn.get("trend_strength", 0))
+                        r12_s = feat_syn.get("return_12h", kx_syn.get("return_12h", 0))
+                        feat_syn["pve_x_trend"] = pve_s * ts_s
+                        feat_syn["pve_x_return12h"] = pve_s * r12_s
+                        feat_syn["slope_x_trend"] = es_s * ts_s
+                        feat_syn["slope_x_return12h"] = es_s * r12_s
                         if any(pd.isna(v) or np.isinf(v) for v in feat_syn.values()):
                             continue
                         # Ensure timezone-naive timestamp for sorting compatibility

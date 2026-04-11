@@ -888,6 +888,16 @@ class KalshiDaemon:
             bb_mid = float(pr.get("sma_20", 0))
             feat["bbw"] = ((bb_upper - bb_lower) / bb_mid * 100) if bb_mid > 0 else 0
 
+            # Interaction features
+            _pve_m10 = feat.get("price_vs_ema", 0)
+            _es_m10 = feat.get("ema_slope", 0)
+            _ts_m10 = feat.get("trend_strength", 0)
+            _r12_m10 = feat.get("return_12h", 0)
+            feat["pve_x_trend"] = _pve_m10 * _ts_m10
+            feat["pve_x_return12h"] = _pve_m10 * _r12_m10
+            feat["slope_x_trend"] = _es_m10 * _ts_m10
+            feat["slope_x_return12h"] = _es_m10 * _r12_m10
+
             # Intra-window 5m features — what happened during minutes 0-10
             try:
                 df_1m = self.fetcher.ohlcv(symbol, "1m", limit=15)
