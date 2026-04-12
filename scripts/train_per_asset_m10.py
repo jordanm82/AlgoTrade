@@ -338,15 +338,14 @@ def main():
         print(f"  Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
 
         model = XGBClassifier(
-            n_estimators=5000,
-            learning_rate=0.01,
-            max_depth=3,
-            min_child_weight=100,
-            subsample=0.6,
-            colsample_bytree=0.6,
-            reg_alpha=1.0,
-            reg_lambda=5.0,
-            gamma=1.0,
+            n_estimators=2000,
+            learning_rate=0.03,
+            max_depth=4,
+            min_child_weight=50,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
             eval_metric="logloss",
             early_stopping_rounds=50,
             random_state=42,
