@@ -57,3 +57,76 @@ def test_compute_chop_metrics_full_data_all_assets():
     # Market-wide matches per-asset since all four are identical
     assert out["bbw_15m_mkt"] == pytest.approx(10.0)
     assert out["bbw_1h_mkt"] == pytest.approx(10.0)
+
+
+def test_compute_chop_metrics_missing_1h():
+    """1h df absent for the bet's asset — 1h fields are None; 15m fields still computed."""
+    cache = {"BTC/USDT": _make_df(n=30, atr_variable=True)}
+    for pair in ("ETH/USDT", "SOL/USDT", "XRP/USDT"):
+        cache[pair] = _make_df(n=30, atr_variable=True)
+        cache[f"{pair}_1h"] = _make_df(n=30, atr_variable=True)
+
+    d = _make_daemon(cache)
+    out = d._compute_chop_metrics("BTC")
+
+    assert out["bbw_15m"] is not None
+    assert out["atr_pct_15m"] is not None
+    assert out["bbw_1h"] is None
+    assert out["atr_pct_1h"] is None
+    # Market 1h still has 3 other assets — should still compute
+    assert out["bbw_1h_mkt"] is not None
+
+
+def test_compute_chop_metrics_short_15m():
+    """15m df has fewer than 20 rows — 15m fields are None."""
+    cache = {"BTC/USDT": _make_df(n=5)}
+    cache["BTC/USDT_1h"] = _make_df(n=30, atr_variable=True)
+    for pair in ("ETH/USDT", "SOL/USDT", "XRP/USDT"):
+        cache[pair] = _make_df(n=30, atr_variable=True)
+        cache[f"{pair}_1h"] = _make_df(n=30, atr_variable=True)
+
+    d = _make_daemon(cache)
+    out = d._compute_chop_metrics("BTC")
+
+    assert out["bbw_15m"] is None
+    assert out["atr_pct_15m"] is None
+    assert out["bbw_1h"] is not None
+
+
+def test_compute_chop_metrics_one_asset_missing_from_market():
+    """Only one asset has data — market-wide fields are None (needs ≥2)."""
+    cache = {
+        "BTC/USDT": _make_df(n=30, atr_variable=True),
+        "BTC/USDT_1h": _make_df(n=30, atr_variable=True),
+    }
+    d = _make_daemon(cache)
+    out = d._compute_chop_metrics("BTC")
+
+    assert out["bbw_15m"] is not None
+    assert out["bbw_15m_mkt"] is None
+    assert out["atr_pct_15m_mkt"] is None
+    assert out["bbw_1h_mkt"] is None
+    assert out["atr_pct_1h_mkt"] is None
+
+
+def test_compute_chop_metrics_all_assets_missing():
+    """Empty cache — every field is None and helper does not raise."""
+    d = _make_daemon(cache={})
+    out = d._compute_chop_metrics("BTC")
+
+    assert set(out.keys()) == {
+        "bbw_15m", "atr_pct_15m", "bbw_1h", "atr_pct_1h",
+        "bbw_15m_mkt", "atr_pct_15m_mkt", "bbw_1h_mkt", "atr_pct_1h_mkt",
+    }
+    assert all(v is None for v in out.values())
+
+
+def test_compute_chop_metrics_degenerate_bbw():
+    """sma_20 == 0 — BBW is None (guards against divide-by-zero)."""
+    df = _make_df(n=30, sma_20=0.0)
+    cache = {"BTC/USDT": df, "BTC/USDT_1h": df}
+    d = _make_daemon(cache)
+    out = d._compute_chop_metrics("BTC")
+
+    assert out["bbw_15m"] is None
+    assert out["bbw_1h"] is None
