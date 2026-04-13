@@ -2549,6 +2549,7 @@ class KalshiDaemon:
         If provided, uses this ticker directly instead of re-discovering the market.
         """
         asset = symbol.split("/")[0]
+        chop_metrics = self._compute_chop_metrics(asset)
         ob_imb = (market_data or {}).get("order_book", {}).get("imbalance", 0)
         net_flow = (market_data or {}).get("trade_flow", {}).get("net_flow", 0)
 
@@ -2623,6 +2624,23 @@ class KalshiDaemon:
                 except Exception:
                     pass
 
+            # Log dry-run market selection (same schema as live, plus chop_metrics)
+            self._log_trade_debug(
+                asset=asset, action="MARKET_SELECT",
+                details={
+                    "ticker": ticker,
+                    "market_strike": strike,
+                    "model_strike": strike,
+                    "close_time": settle_time.isoformat() if settle_time else "?",
+                    "side": side,
+                    "direction": direction_label,
+                    "n_markets": 1,
+                    "demo": self.demo,
+                    "dry_run": True,
+                    **chop_metrics,
+                }
+            )
+
             # If ask > max, DON'T fill — match live behavior exactly
             # Live would place a resting order that may never fill
             if contract_price > MAX_ENTRY_CENTS:
@@ -2655,6 +2673,7 @@ class KalshiDaemon:
                     "cost_cents": cost,
                     "potential_profit_cents": potential_profit,
                     "ticker": ticker,
+                    "chop_metrics": chop_metrics,
                 })
                 self._session_bets_placed += 1
 
@@ -2712,7 +2731,6 @@ class KalshiDaemon:
             market_strike = market.get("floor_strike") or market.get("custom_strike")
             market_close = market.get("close_time", "?")
             model_strike = signal.strike_price if isinstance(signal, KalshiV3Signal) else 0
-            chop_metrics = self._compute_chop_metrics(asset)
             self._log_trade_debug(
                 asset=asset, action="MARKET_SELECT",
                 details={
