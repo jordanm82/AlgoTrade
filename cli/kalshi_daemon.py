@@ -1139,6 +1139,7 @@ class KalshiDaemon:
                         "bid": current_bid, "sell_price": self.MIN_SELL_PRICE,
                         "entry": entry, "count": bet.get("count", 0),
                         "ticker": ticker,
+                        **(bet.get("chop_metrics") or {}),
                     }
                 )
 
@@ -1191,6 +1192,7 @@ class KalshiDaemon:
                     "distance": distance, "bid": current_bid,
                     "entry": entry, "count": bet.get("count", 0),
                     "ticker": ticker,
+                    **(bet.get("chop_metrics") or {}),
                 }
             )
             self._exit_position(bet, current_bid,
