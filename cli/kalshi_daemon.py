@@ -246,6 +246,112 @@ class KalshiDaemon:
                 if "4h" in results:
                     self._kalshi_cached_dataframes[f"{symbol}_4h"] = results["4h"]
 
+    # ------------------------------------------------------------------
+    # Chop detection metrics (v1: logging only, no gating)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bbw_from_df(df) -> float | None:
+        """Bollinger Band Width as percent of sma_20 on the last completed row.
+        Returns None if df is missing, too short, or bands are degenerate.
+        """
+        if df is None or len(df) < 20:
+            return None
+        cols = df.columns
+        if not ("bb_upper" in cols and "bb_lower" in cols and "sma_20" in cols):
+            return None
+        row = df.iloc[-1]
+        try:
+            upper = float(row["bb_upper"])
+            lower = float(row["bb_lower"])
+            mid = float(row["sma_20"])
+        except (TypeError, ValueError):
+            return None
+        if not (mid > 0) or not np.isfinite(upper) or not np.isfinite(lower) or not np.isfinite(mid):
+            return None
+        return (upper - lower) / mid * 100.0
+
+    @staticmethod
+    def _atr_pct_from_df(df) -> float | None:
+        """ATR percentile — rolling-20 min/max normalization of the last ATR value.
+        Mirrors the existing atr_percentile formula in _build_kalshi_extras.
+        Returns None if df is missing, too short, or range is degenerate.
+        """
+        if df is None or len(df) < 20 or "atr" not in df.columns:
+            return None
+        atr_s = df["atr"].dropna()
+        if len(atr_s) < 20:
+            return None
+        r20 = atr_s.rolling(20)
+        try:
+            atr = float(atr_s.iloc[-1])
+            mn = float(r20.min().iloc[-1])
+            mx = float(r20.max().iloc[-1])
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(atr) or not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+            return None
+        return (atr - mn) / (mx - mn)
+
+    def _compute_chop_metrics(self, asset: str) -> dict:
+        """Compute BBW + ATR chop metrics for `asset` (per-asset) plus market-wide
+        averages over all four KALSHI_PAIRS assets. Returns a dict with 8 keys;
+        missing fields are None (no stale substitution — see CLAUDE.md fallback rule).
+        Never raises.
+        """
+        # 15m cache retains the in-progress window's opening candle; drop it so
+        # the last row matches what the model sees at decision time.
+        now_utc = datetime.now(timezone.utc)
+        minute_in_window = now_utc.minute % 15
+        window_start = now_utc.replace(
+            minute=now_utc.minute - minute_in_window,
+            second=0, microsecond=0, tzinfo=None,
+        )
+        window_start_pd = pd.Timestamp(window_start)
+
+        def _per_asset(symbol: str):
+            """Returns (bbw_15m, atr_pct_15m, bbw_1h, atr_pct_1h), each possibly None."""
+            try:
+                df15 = self._kalshi_cached_dataframes.get(symbol)
+                if df15 is not None:
+                    df15 = df15[df15.index < window_start_pd]
+                df1h = self._kalshi_cached_dataframes.get(f"{symbol}_1h")
+                return (
+                    self._bbw_from_df(df15),
+                    self._atr_pct_from_df(df15),
+                    self._bbw_from_df(df1h),
+                    self._atr_pct_from_df(df1h),
+                )
+            except Exception as e:
+                print(colored(f"  [CHOP] {symbol} metric error: {e}", "yellow"))
+                return (None, None, None, None)
+
+        my_symbol = f"{asset}/USDT"
+        my15_bbw, my15_atr, my1h_bbw, my1h_atr = _per_asset(my_symbol)
+
+        all_15_bbw, all_15_atr, all_1h_bbw, all_1h_atr = [], [], [], []
+        for pair in self.KALSHI_PAIRS:
+            b15, a15, b1h, a1h = _per_asset(pair)
+            if b15 is not None: all_15_bbw.append(b15)
+            if a15 is not None: all_15_atr.append(a15)
+            if b1h is not None: all_1h_bbw.append(b1h)
+            if a1h is not None: all_1h_atr.append(a1h)
+
+        def _mean(lst):
+            # Need at least 2 assets to call it "market-wide"
+            return sum(lst) / len(lst) if len(lst) >= 2 else None
+
+        return {
+            "bbw_15m": my15_bbw,
+            "atr_pct_15m": my15_atr,
+            "bbw_1h": my1h_bbw,
+            "atr_pct_1h": my1h_atr,
+            "bbw_15m_mkt": _mean(all_15_bbw),
+            "atr_pct_15m_mkt": _mean(all_15_atr),
+            "bbw_1h_mkt": _mean(all_1h_bbw),
+            "atr_pct_1h_mkt": _mean(all_1h_atr),
+        }
+
     def _prefetch_kalshi_markets(self):
         """Batch-fetch all K15 open + settled markets in 2 API calls.
 
