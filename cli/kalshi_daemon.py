@@ -51,11 +51,12 @@ class KalshiDaemon:
     }
 
     # Per-asset M10 exit thresholds (39 features, with rsi_15m + 5m intra-window)
+    # Backtest: t=90 gives best P&L ($66.6K) with 94% exit accuracy
     KALSHI_M10_THRESHOLDS = {
-        "BTC/USDT": 80,
-        "ETH/USDT": 80,
-        "SOL/USDT": 80,
-        "XRP/USDT": 80,
+        "BTC/USDT": 90,
+        "ETH/USDT": 90,
+        "SOL/USDT": 90,
+        "XRP/USDT": 90,
     }
 
     # Per-asset TEK (technical/probability table) thresholds
@@ -191,8 +192,8 @@ class KalshiDaemon:
                     # has incomplete RSI/MACD. Backtest only uses completed candles.
                     df_1h = df_1h.iloc[:-1]
                     results["1h"] = add_indicators(df_1h)
-            except Exception:
-                pass
+            except Exception as e:
+                print(colored(f"  [FETCH] {symbol} 1h failed: {e}", "yellow"))
             try:
                 df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50, since=since_4h)
                 if df_4h is None or df_4h.empty:
@@ -200,8 +201,8 @@ class KalshiDaemon:
                 if df_4h is not None and not df_4h.empty:
                     df_4h = df_4h.iloc[:-1]  # drop in-progress candle
                     results["4h"] = add_indicators(df_4h)
-            except Exception:
-                pass
+            except Exception as e:
+                print(colored(f"  [FETCH] {symbol} 4h failed: {e}", "yellow"))
             return symbol, results
 
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -227,15 +228,15 @@ class KalshiDaemon:
                 if df_1h is not None and len(df_1h) > 1:
                     df_1h = df_1h.iloc[:-1]  # drop in-progress candle
                     results["1h"] = add_indicators(df_1h)
-            except Exception:
-                pass
+            except Exception as e:
+                print(colored(f"  [REFRESH] {symbol} 1h failed: {e}", "yellow"))
             try:
                 df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
                 if df_4h is not None and len(df_4h) > 1:
                     df_4h = df_4h.iloc[:-1]  # drop in-progress candle
                     results["4h"] = add_indicators(df_4h)
-            except Exception:
-                pass
+            except Exception as e:
+                print(colored(f"  [REFRESH] {symbol} 4h failed: {e}", "yellow"))
             return symbol, results
 
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -756,13 +757,14 @@ class KalshiDaemon:
                             pa_data["scaler"],
                             pa_data["feature_names"],
                         )
-            # Load unified as fallback
-            with open("models/m10_kalshi.pkl", "rb") as f:
-                data = pickle.load(f)
-                self._m10_model = data.get("model") or data.get("knn")
-                self._m10_scaler = data["scaler"]
             if self._m10_per_asset:
+                # Use first per-asset model as sentinel so lazy-load doesn't re-trigger
+                first = next(iter(self._m10_per_asset.values()))
+                self._m10_model = first[0]
+                self._m10_scaler = first[1]
                 print(colored(f"  [M10] Loaded {len(self._m10_per_asset)} per-asset models", "green"))
+            else:
+                print(colored("  [M10] No per-asset models found", "yellow"))
         except Exception as e:
             print(colored(f"  [M10] Model load failed: {e}", "yellow"))
 
@@ -799,11 +801,16 @@ class KalshiDaemon:
             if not strike or not symbol:
                 continue
 
-            # Get current multi-exchange price
+            # Get 5m candle OPEN price (must match training exactly).
+            # Training uses get_avg_price(cb_5m, bs_5m, min10, "open") — the 5m candle
+            # open at minute 10, NOT a real-time spot price.
             usd_sym = symbol.replace("/USDT", "/USD")
-            current_price = self._brti_proxy.get_price(usd_sym)
+            current_price = self._brti_proxy.get_5m_candle_open(usd_sym)
             if not current_price:
-                continue
+                # Fallback to spot only if candle fetch fails
+                current_price = self._brti_proxy.get_price(usd_sym)
+                if not current_price:
+                    continue
 
             # Get ATR from cached 15m data — filter to BEFORE window start (matches backtest)
             df_15m = self._kalshi_cached_dataframes.get(symbol)
@@ -1063,6 +1070,9 @@ class KalshiDaemon:
                 bet["exited_early"] = True
                 self._completed_bets.append(bet)
                 self._session_partial_losses += 1
+                # Update dry-run balance (was missing — caused P&L vs balance mismatch)
+                if self.dry_run and not self.demo:
+                    self._dry_balance_cents += pnl_cents
                 self._pending_bets = [b for b in self._pending_bets if b is not bet]
                 continue
 
@@ -1865,8 +1875,9 @@ class KalshiDaemon:
                 })
                 continue
 
-            # Skip if already bet this window — show stored scores
-            if pending and pending.get("bet_placed"):
+            # Skip if already bet OR already attempted this window — show stored scores.
+            # bet_attempted covers unfilled+cancelled orders so we don't re-fire.
+            if pending and (pending.get("bet_placed") or pending.get("bet_attempted")):
                 predictions.append({
                     "symbol": symbol, "asset": asset,
                     "direction": pending.get("direction", "--"),
@@ -1886,7 +1897,7 @@ class KalshiDaemon:
             # Min 0-1:   CONFIRMED — bet at window open (one shot + reprice)
             # Min 2-9:   MONITORING — hold position
             # Min 10+:   M10 CONFIRM — M10 model decides hold or exit
-            if minute_in_window <= 1 and not (pending and pending.get("bet_placed")):
+            if minute_in_window <= 1 and not (pending and (pending.get("bet_placed") or pending.get("bet_attempted"))):
                 state = "CONFIRMED"
             elif minute_in_window == 10 and pending and pending.get("bet_placed") and not pending.get("confirmed_m10"):
                 state = "M10_CONFIRM"
@@ -1972,6 +1983,7 @@ class KalshiDaemon:
                                 "max_price_cents": signal.max_price_cents,
                                 "distance_atr": signal.distance_atr,
                                 "bet_placed": False,
+                                "bet_attempted": False,
                                 "window_start": current_window_start,
                                 # V1/V2 compat fields
                                 "direction": signal.recommended_side if signal.recommended_side != "SKIP" else "--",
@@ -2032,6 +2044,7 @@ class KalshiDaemon:
                             "setup_time": now_utc,
                             "confirmed": False,
                             "bet_placed": False,
+                            "bet_attempted": False,
                             "window_start": current_window_start,
                         }
                     predictions.append({
@@ -2160,6 +2173,7 @@ class KalshiDaemon:
                                 "max_price_cents": signal.max_price_cents,
                                 "distance_atr": signal.distance_atr,
                                 "bet_placed": False,
+                                "bet_attempted": False,
                                 "window_start": current_window_start,
                                 "direction": signal.recommended_side if signal.recommended_side != "SKIP" else "--",
                                 "base_conf": _dc,
@@ -2381,6 +2395,13 @@ class KalshiDaemon:
             has_fill = "filled=" in reason and "filled=0" not in reason
             is_dry_bet = "would bet" in reason
             was_skipped = "skipping" in reason or "price too high" in reason
+
+            # Mark attempted on any real order placement (filled or not) to prevent
+            # check_price_watches/eval from re-firing the same signal after an
+            # unfilled-and-cancelled order. Does NOT include pre-order skips —
+            # those stay eligible for price_watch retry.
+            if not was_skipped and asset in self._kalshi_pending_signals:
+                self._kalshi_pending_signals[asset]["bet_attempted"] = True
 
             if (has_fill or is_dry_bet) and not was_skipped:
                 actual_fills_this_eval += 1
@@ -2855,7 +2876,7 @@ class KalshiDaemon:
 
         # Sort by confidence (highest first) so best signals get priority
         watches = [(a, p) for a, p in self._kalshi_pending_signals.items()
-                   if p.get("price_watch") and not p.get("bet_placed")]
+                   if p.get("price_watch") and not p.get("bet_placed") and not p.get("bet_attempted")]
         watches.sort(key=lambda x: x[1].get("probability", 0), reverse=True)
 
         for asset, pending in watches:
@@ -2918,6 +2939,12 @@ class KalshiDaemon:
                     reason = result.get("reason", "") if result else ""
                     has_fill = "filled=" in reason and "filled=0" not in reason
                     is_dry = "would bet" in reason
+                    was_skipped = "skipping" in reason or "price too high" in reason
+                    # Lock this ticker as attempted — unfilled+cancelled orders
+                    # otherwise re-fire on the next 5s tick and stack positions.
+                    if not was_skipped:
+                        pending["bet_attempted"] = True
+                        pending["price_watch"] = False
                     if has_fill or is_dry:
                         pending["bet_placed"] = True
                         pending["price_watch"] = False
@@ -3407,6 +3434,7 @@ class KalshiDaemon:
                 "base_conf": 0,
                 "last_5m_conf": 0,
                 "bet_placed": True,
+                "bet_attempted": True,
                 "window_start": now_utc.replace(
                     minute=now_utc.minute - (now_utc.minute % 15),
                     second=0, microsecond=0,
@@ -3509,6 +3537,7 @@ class KalshiDaemon:
                     "base_conf": 0,
                     "last_5m_conf": 0,
                     "bet_placed": True,
+                    "bet_attempted": True,
                     "window_start": now_utc.replace(
                         minute=now_utc.minute - (now_utc.minute % 15),
                         second=0, microsecond=0,
