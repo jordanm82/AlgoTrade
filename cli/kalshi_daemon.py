@@ -3459,6 +3459,12 @@ class KalshiDaemon:
         Called on startup so the daemon can manage positions placed in a
         prior run (or earlier in the same session) that are still live.
         """
+        _empty_chop = {
+            "bbw_15m": None, "atr_pct_15m": None,
+            "bbw_1h": None, "atr_pct_1h": None,
+            "bbw_15m_mkt": None, "atr_pct_15m_mkt": None,
+            "bbw_1h_mkt": None, "atr_pct_1h_mkt": None,
+        }
         self._init_kalshi_client()
         if not self.kalshi_client:
             return
@@ -3552,6 +3558,7 @@ class KalshiDaemon:
                 "live": True,
                 "needs_fill_check": False,
                 "_recovered": True,
+                "chop_metrics": _empty_chop,
             }
             self._pending_bets.append(bet_entry)
             self._active_kalshi_bets[ticker] = time.time()
@@ -3654,6 +3661,7 @@ class KalshiDaemon:
                 "needs_fill_check": True,
                 "_ws_detected": False,
                 "_recovered": True,
+                "chop_metrics": _empty_chop,
             }
             self._resting_orders.append(resting_entry)
             self._active_kalshi_bets[ticker] = time.time()
