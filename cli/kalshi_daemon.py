@@ -1723,6 +1723,7 @@ class KalshiDaemon:
                                 "pnl_cents": pnl_cents,
                                 "ticker": m.get("ticker"),
                                 "demo": self.demo,
+                                **(bet.get("chop_metrics") or {}),
                             }
                         )
 
