@@ -2712,6 +2712,7 @@ class KalshiDaemon:
             market_strike = market.get("floor_strike") or market.get("custom_strike")
             market_close = market.get("close_time", "?")
             model_strike = signal.strike_price if isinstance(signal, KalshiV3Signal) else 0
+            chop_metrics = self._compute_chop_metrics(asset)
             self._log_trade_debug(
                 asset=asset, action="MARKET_SELECT",
                 details={
@@ -2723,6 +2724,7 @@ class KalshiDaemon:
                     "direction": direction_label,
                     "n_markets": len(all_markets),
                     "demo": self.demo,
+                    **chop_metrics,
                 }
             )
 
@@ -2956,6 +2958,7 @@ class KalshiDaemon:
                         "order_id": order_id,
                         "ticker": ticker,
                         "live": True,
+                        "chop_metrics": chop_metrics,
                     })
             # No resting order tracking — unfilled orders are always cancelled
 
