@@ -140,12 +140,15 @@ def build_features(prev, df_1h, df_4h, ws_naive, distance, *,
         "distance_from_strike": distance,
     }
     if df_1h is not None:
-        m1h = df_1h[df_1h.index <= ws_naive]
+        # Use '<' not '<=': the 1h candle indexed at ws_naive is the IN-PROGRESS
+        # candle at decision time (its full hour of data wasn't available yet
+        # in a live scenario). Including it would leak future data.
+        m1h = df_1h[df_1h.index < ws_naive]
         if len(m1h) >= 20:
             feat["rsi_1h"] = float(m1h.iloc[-1].get("rsi", 50))
             feat["macd_1h"] = float(m1h.iloc[-1].get("macd_hist", 0))
     if df_4h is not None:
-        m4h = df_4h[df_4h.index <= ws_naive]
+        m4h = df_4h[df_4h.index < ws_naive]
         if len(m4h) >= 10:
             feat["rsi_4h"] = float(m4h.iloc[-1].get("rsi", 50))
 
@@ -182,6 +185,11 @@ def build_features(prev, df_1h, df_4h, ws_naive, distance, *,
     feat["pve_x_return12h"] = feat["price_vs_ema"] * feat["return_12h"]
     feat["slope_x_trend"] = feat.get("ema_slope", 0) * feat["trend_strength"]
     feat["slope_x_return12h"] = feat.get("ema_slope", 0) * feat["return_12h"]
+    # RSI-centered × trend interactions
+    feat["rsi1h_x_r12h"] = (feat.get("rsi_1h", 50) - 50) * feat["return_12h"]
+    feat["rsi4h_x_r12h"] = (feat.get("rsi_4h", 50) - 50) * feat["return_12h"]
+    feat["rsi1h_x_r4h"] = (feat.get("rsi_1h", 50) - 50) * feat.get("return_4h", 0)
+    feat["dist_x_r12h"] = feat.get("distance_from_strike", 0) * feat["return_12h"]
 
     if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
         return None
@@ -381,13 +389,14 @@ def main():
                 kx["return_12h"] = (float(pc.iloc[-1]["close"]) - float(pc.iloc[-48]["close"])) / float(pc.iloc[-48]["close"]) * 100
             else: kx["return_12h"] = 0
             if df1h is not None:
-                h1f = df1h[df1h.index <= wsn]
+                # '<' drops the in-progress candle at wsn (see build_features)
+                h1f = df1h[df1h.index < wsn]
                 if len(h1f) >= 20 and atr > 0:
                     kx["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr
                 else: kx["price_vs_sma_1h"] = 0
             else: kx["price_vs_sma_1h"] = 0
             if df4h is not None:
-                h4f = df4h[df4h.index <= wsn]
+                h4f = df4h[df4h.index < wsn]
                 if len(h4f) >= 4:
                     kx["lower_lows_4h"] = sum(1 for i in range(-3,0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
                 else: kx["lower_lows_4h"] = 0
@@ -401,7 +410,10 @@ def main():
                                 kalshi_extra=kx, atr_pctile_val=apv)
             if not f0: continue
             X0 = np.array([f0.get(f, 0) for f in m0f]).reshape(1, -1)
-            prob = float(m0m.predict_proba(m0s.transform(X0))[0][1])
+            # XGBoost: predict on raw features; LogReg: predict on scaled
+            is_tree = hasattr(m0m, 'get_booster') or 'XGB' in type(m0m).__name__
+            X0_pred = X0 if is_tree else m0s.transform(X0)
+            prob = float(m0m.predict_proba(X0_pred)[0][1])
             pct_v = int(prob * 100)
             if pct_v >= m0_thresh: side = "yes"
             elif pct_v <= (100 - m0_thresh): side = "no"
@@ -446,7 +458,9 @@ def main():
                         f10["volume_acceleration"] = 1.0
 
                     X10 = np.array([f10.get(f, 0) for f in m10f]).reshape(1, -1)
-                    mp = float(m10m.predict_proba(m10s.transform(X10))[0][1])
+                    is_tree_m10 = hasattr(m10m, 'get_booster') or 'XGB' in type(m10m).__name__
+                    X10_pred = X10 if is_tree_m10 else m10s.transform(X10)
+                    mp = float(m10m.predict_proba(X10_pred)[0][1])
                     mpc = int(mp * 100)
                     ms = "yes" if mpc >= m10_thresh else "no" if mpc <= (100 - m10_thresh) else "skip"
                     if ms != "skip" and ms != side:

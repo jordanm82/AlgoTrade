@@ -291,13 +291,14 @@ def main():
             }
 
             if df_1h is not None:
-                m1h = df_1h.index <= ws_naive
+                # '<' drops the in-progress candle at ws_naive — live/backtest parity
+                m1h = df_1h.index < ws_naive
                 if m1h.sum() >= 20:
                     r1h = df_1h.loc[m1h].iloc[-1]
                     feat["rsi_1h"] = float(r1h.get("rsi", 50))
                     feat["macd_1h"] = float(r1h.get("macd_hist", 0))
             if df_4h is not None:
-                m4h = df_4h.index <= ws_naive
+                m4h = df_4h.index < ws_naive
                 if m4h.sum() >= 10:
                     feat["rsi_4h"] = float(df_4h.loc[m4h].iloc[-1].get("rsi", 50))
 

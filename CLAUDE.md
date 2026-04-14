@@ -16,10 +16,14 @@ Read this file completely before every trading session. It is your operational c
 - Same timing (minute 0 in both training and live, NOT minute 5 for training and minute 0 for live)
 - Same labels (Kalshi settlement results, NOT Coinbase candle direction)
 - Same strike source (Kalshi floor_strike, NOT Coinbase candle open)
-- Same features (all 33 M0 / 39 M10 features computed identically in training, backtest, and live)
+- Same features (M0 / M10 features computed identically in training, backtest, and live — exact counts vary per asset after feature-group selection; see model pkl `feature_names`)
 - If you change ANY data path in live, you MUST retrain the model to match
 
 **NO RESTING BUY ORDERS.** If the ask > MAX_ENTRY (60c), skip the bet. NEVER place a resting limit order below the market ask hoping it will fill — this is adverse selection. Fills on resting orders below market systematically lose because they only fill when the market turns against the bet.
+
+**PL IS A LOSS.** When reporting WR, always include M10 partial exits (`M10_EXIT` and `M10_RESTING_SELL` events) in the denominator. A PL means the M0 model picked the wrong side — the bet was going to lose at settlement and M10 saved some of it. Do NOT report WR as `W / (W + L)` ignoring PLs; report `W / (W + L + PL)` as "true WR" and always show the W/L/PL breakdown plus dollar P&L. Hiding PLs paints a misleadingly rosy picture of the M0 model.
+
+**DROP THE IN-PROGRESS CANDLE.** For higher-timeframe dataframes (1h, 4h), the candle whose index *equals* the current window_start is still in progress at decision time — its OHLC is incomplete live but looks finalized in historical/backtest data. Use `<` not `<=` when filtering by timestamp, or drop the last row with `.iloc[:-1]` right after fetch. Live code already does this; backtest and training previously used `<=` which created 22-point WR inflation vs live. Any new script that reads 1h/4h candles for a point-in-time computation must apply the same rule.
 
 ## System Overview
 
@@ -36,12 +40,12 @@ data/fetcher.py           — Coinbase via CCXT (market data)
 data/brti_proxy.py        — Coinbase+Bitstamp averaged price (BRTI proxy)
 data/brti_display.py      — CF Benchmarks scrape (dashboard display only, NOT for trading)
 data/indicators.py        — RSI, BB, MACD, ATR, EMA
-strategy/strategies/kalshi_predictor_v3.py — Per-asset XGBoost model loader (33/39 features)
+strategy/strategies/kalshi_predictor_v3.py — Per-asset XGBoost model loader
 strategy/snapshot.py      — Minute-3 snapshot builder
 config/settings.py        — API keys, risk limits
 config/production.py      — Production settings
-models/m0_{btc,eth,sol,xrp}.pkl — Per-asset XGBoost M0 entry models (33 features each)
-models/m10_{btc,eth,sol,xrp}.pkl — Per-asset XGBoost M10 exit models (39 features each)
+models/m0_{btc,eth,sol,xrp}.pkl — Per-asset XGBoost M0 entry models
+models/m10_{btc,eth,sol,xrp}.pkl — Per-asset XGBoost M10 exit models
 ```
 
 ## Kalshi K15 UpDown Strategy (V3)
@@ -107,6 +111,14 @@ Predicts the actual Kalshi question: "Will price close above strike?" Separate X
 - `pve_x_return12h` — price_vs_ema × return_12h
 - `slope_x_trend` — ema_slope × trend_strength
 - `slope_x_return12h` — ema_slope × return_12h
+
+*RSI × trend interactions (2026-04-13, to counter mean-reversion bias):*
+- `rsi1h_x_r12h` — (rsi_1h - 50) × return_12h
+- `rsi4h_x_r12h` — (rsi_4h - 50) × return_12h
+- `rsi1h_x_r4h` — (rsi_1h - 50) × return_4h
+- `dist_x_r12h` — distance_from_strike × return_12h
+  - RSI is centered at 50 so the product's sign carries meaning: positive product = "continuation" (overbought in uptrend or oversold in downtrend), negative = "reversion permitted." These were added after observing the model was fading multi-hour trends (betting NO on +5% rallies and losing) because plain `rsi_1h` dominated without conditional context.
+  - The legacy `interaction` group and the new `interaction_rsi` group are both in `FORCE_KEEP_GROUPS` in `scripts/train_xgboost_per_asset.py` — they bypass the incremental WR-based feature-selection vote, because the selector was dropping them on tiny WR deltas even when P&L improved.
 
 ### M10 Confirmation Model
 
@@ -236,3 +248,9 @@ python dashboard_rich.py --demo
 - **LogReg cannot learn conditional relationships.** `price_vs_ema × -0.98` ALWAYS pushes YES when price is below EMA, regardless of trend. XGBoost can learn "IF below EMA AND downtrend THEN NO." This was the root cause of persistent YES bias in bearish markets.
 - **Synthetic training data must compute ALL features identically to live.** Defaulting confluence features to 50/0 in synthetic data trained the model to expect neutral confluence. In live, real values (63 vs 50) caused a -0.76 logit shift systematically biasing predictions.
 - **XGBoost anti-overfitting is critical.** Use subsample=0.7, colsample=0.7, learning_rate=0.03, max_depth=4, min_child_weight=50, and early stopping on a validation set. Without these, XGBoost memorizes training data.
+- **In-progress candle lookahead bug (fixed 2026-04-13).** The backtest and training scripts filtered higher-timeframe candles with `<=` (`df_1h[df_1h.index <= ws]`), which INCLUDED the 1h/4h candle that was in-progress at decision time. Live correctly drops the in-progress candle via `.iloc[:-1]`. The backtest's finalized version of that candle embedded the upcoming hour's OHLC — effectively future data. This inflated backtest WR by ~22 points vs live (backtest 72% / live 50%). Fix: `<=` → `<` in `backtest_kalshi_labels.py`, `train_xgboost_per_asset.py`, `train_per_asset_m10.py`, `retrain_kalshi_labels.py`, `parity_check.py`. Any new script reading 1h/4h candles for a point-in-time computation MUST apply the same rule.
+- **parity_check.py is only half a parity check.** It compares live-logged features against backtest-style recomputed features, but both sides may share the same bug (the lookahead filter was present in both). A clean parity check should also compare training-time features against live — mismatches there can explain live under-performance even when live/backtest parity holds.
+- **Feature-group selector optimized for WR, not P&L.** The incremental feature-group test in `train_xgboost_per_asset.py` drops a group if WR delta < 0.5%, even when that group improved dollar P&L. After observing it dropping the `interaction` and `interaction_rsi` groups on 3/4 assets despite P&L gains, the groups were added to `FORCE_KEEP_GROUPS` to bypass the vote. Consider switching the selector's decision metric to P&L or a combined score.
+- **Mean-reversion bias (2026-04-13 diagnosis).** With rsi_15m removed, the model became broadly reversion-biased: fading both uptrends (NO bets when `return_12h > +3%`) and (symmetrically) downtrends. The existing `pve_x_*` and `slope_x_*` interactions don't multiply RSI — the actual dominant reversion signal. Added `rsi1h_x_r12h` / `rsi4h_x_r12h` / `rsi1h_x_r4h` / `dist_x_r12h` so XGBoost can learn "high RSI in a strong uptrend = continuation, not reversion." Do NOT ship a simple `|return_Xh| > threshold` skip gate as a band-aid — fix the model.
+- **Duplicate bet stacking (fixed 2026-04-13).** During minutes 0-1, `_kalshi_eval` runs every 5s. When a bet was placed but didn't fill (`filled=0`), `bet_placed` stayed False and the next tick placed ANOTHER order. Observed up to 12 stacked positions on a single ticker. Fix: new `bet_attempted` flag set after any real order attempt (even unfilled/cancelled), checked alongside `bet_placed` at every entry gate. See `_kalshi_pending_signals` init sites and `_kalshi_execute_bet`.
+- **Chop detection logging (2026-04-13).** Every `MARKET_SELECT`, `SETTLED`, `M10_EXIT`, and `M10_RESTING_SELL` event in `trade_debug.jsonl` now carries 8 chop fields: `bbw_15m`, `atr_pct_15m`, `bbw_1h`, `atr_pct_1h`, plus four `_mkt` market-wide averages. Computed by `_compute_chop_metrics()` at bet placement and stashed on the `_pending_bets` entry for re-emit. Log-only, no gating. Purpose: determine if a chop regime (narrow BBW, low ATR percentile) predicts losses so a future threshold bump can be justified.

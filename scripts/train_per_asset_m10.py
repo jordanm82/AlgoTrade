@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Train per-asset M10 exit models with cross-asset confluence features.
+"""Train per-asset M10 exit models with research-optimized XGBoost.
 
-Same as per-asset M0 but distance computed at minute 10.
+Same optimizations as M0 v2:
+  - Ultra-conservative: max_depth=2, lr=0.005, early_stopping=200
+  - Purged walk-forward (4h gap) + time-decay weighting (60d half-life)
+  - Additional 5m intra-window features (what happened during minutes 0-10)
 
 Usage:
     ./venv/bin/python scripts/train_per_asset_m10.py
@@ -38,13 +41,12 @@ CONFLUENCE_FEATURES = [
     "alt_distance_avg",
 ]
 
-# 5m candle features — what happened DURING the window (minutes 0-10)
 INTRA_WINDOW_FEATURES = [
-    "price_move_atr",       # total price move from min 0 to min 10 (in ATR units)
-    "candle1_range_atr",    # 5m candle 1 (min 0-5) range / ATR — volatility burst
-    "candle2_range_atr",    # 5m candle 2 (min 5-10) range / ATR
-    "momentum_shift",       # candle2 close vs candle1 close (direction change?)
-    "volume_acceleration",  # candle2 volume / candle1 volume (buying pressure)
+    "price_move_atr",
+    "candle1_range_atr",
+    "candle2_range_atr",
+    "momentum_shift",
+    "volume_acceleration",
 ]
 
 REGIME_FEATURES = [
@@ -54,9 +56,23 @@ REGIME_FEATURES = [
 
 INTERACTION_FEATURES = [
     "pve_x_trend", "pve_x_return12h", "slope_x_trend", "slope_x_return12h",
+    # RSI-centered × trend interactions for continuation vs reversion
+    "rsi1h_x_r12h", "rsi4h_x_r12h", "rsi1h_x_r4h", "dist_x_r12h",
 ]
 
 ALL_FEATURES = BASE_FEATURES + CONFLUENCE_FEATURES + INTRA_WINDOW_FEATURES + REGIME_FEATURES + INTERACTION_FEATURES
+
+# Purge gap: 4 hours = 16 fifteen-minute windows
+PURGE_GAP_SAMPLES = 16
+
+
+def compute_time_decay_weights(timestamps, half_life_days=60):
+    """Exponential decay weights — recent samples weighted more heavily."""
+    latest = timestamps.max()
+    days_ago = (latest - timestamps).dt.total_seconds() / 86400
+    weights = np.exp(-np.log(2) * days_ago / half_life_days)
+    weights = weights / weights.mean()
+    return weights.values
 
 
 def main():
@@ -64,7 +80,9 @@ def main():
     fetcher = DataFetcher()
 
     print("=" * 80)
-    print("PER-ASSET M10 MODELS WITH CROSS-ASSET CONFLUENCE")
+    print("PER-ASSET M10 MODELS v2 — RESEARCH-OPTIMIZED")
+    print("  max_depth=4, lr=0.02, early_stop=80, subsample=0.7")
+    print("  Purged walk-forward (4h gap) + time-decay weighting (60d half-life)")
     print("=" * 80)
 
     print("\n[1/4] Fetching settlements...")
@@ -116,12 +134,12 @@ def main():
         ind_data[asset] = {"15m": df_15m, "1h": df_1h, "4h": df_4h}
         print(f"  {asset}: {len(df_15m)} 15m candles")
 
-    print("\n[4/4] Training per-asset M10 models...")
+    print("\n[4/4] Training per-asset M10 models (optimized)...")
     all_assets = list(SERIES.keys())
 
     for target_asset in all_assets:
         print(f"\n{'=' * 80}")
-        print(f"M10 TRAINING: {target_asset}")
+        print(f"M10 TRAINING: {target_asset} (XGBoost v2 — optimized)")
         print(f"{'=' * 80}")
 
         alt_assets = [a for a in all_assets if a != target_asset]
@@ -159,21 +177,11 @@ def main():
             if pd.isna(atr) or atr <= 0: continue
 
             # Kalshi lookback
-            prev_results, prev_strikes = [], []
+            prev_strikes = []
             for lb in range(1, 4):
                 if mi - lb >= 0:
-                    pm = target_markets[mi - lb]
-                    pr = pm.get("result", "")
-                    ps = float(pm.get("floor_strike") or 0)
-                    if pr: prev_results.append(1 if pr == "yes" else 0)
+                    ps = float(target_markets[mi - lb].get("floor_strike") or 0)
                     if ps: prev_strikes.append(ps)
-            streak = 0
-            if prev_results:
-                lr = prev_results[0]
-                for r in prev_results:
-                    if r == lr: streak += 1
-                    else: break
-                streak = streak if lr == 1 else -streak
             sd = (strike - prev_strikes[0]) / atr if prev_strikes and atr > 0 else 0
             if len(prev_strikes) >= 2 and atr > 0:
                 ds = [strike - prev_strikes[0]]
@@ -182,9 +190,7 @@ def main():
                 st3 = sum(d / atr for d in ds) / len(ds)
             else:
                 st3 = sd
-            kx = {"prev_result": prev_results[0] if prev_results else 0.5,
-                  "prev_3_yes_pct": sum(prev_results) / len(prev_results) if prev_results else 0.5,
-                  "streak_length": streak, "strike_delta": sd, "strike_trend_3": st3}
+            kx = {"strike_delta": sd, "strike_trend_3": st3}
             pa = atr_pctile[atr_pctile.index < ws_n]
             apv = float(pa.iloc[-1]) if len(pa) > 0 else 0.5
 
@@ -195,7 +201,7 @@ def main():
 
             # Confluence
             alt_rsi_15m, alt_rsi_1h, alt_momentum = [], [], []
-            alt_prev_results, alt_distances = [], []
+            alt_distances = []
             for alt in alt_assets:
                 alt_15m = ind_data[alt]["15m"]
                 alt_1h_df = ind_data[alt]["1h"]
@@ -209,8 +215,6 @@ def main():
                     alt_1h_prev = alt_1h_df[alt_1h_df.index <= ws_n]
                     if len(alt_1h_prev) >= 2:
                         alt_rsi_1h.append(float(alt_1h_prev.iloc[-1].get("rsi", 50)))
-                if ct in settlement_by_time[alt]:
-                    alt_prev_results.append(settlement_by_time[alt][ct])
                 alt_price = get_avg_price(five_m[alt]["coinbase"], five_m[alt]["bitstamp"], min10, "open")
                 if alt_price and len(alt_prev_candles) >= 2:
                     alt_atr = float(alt_prev_candles.iloc[-1].get("atr", 0))
@@ -224,21 +228,16 @@ def main():
             feat["alt_rsi_avg"] = sum(alt_rsi_15m) / len(alt_rsi_15m) if alt_rsi_15m else 50
             feat["alt_rsi_1h_avg"] = sum(alt_rsi_1h) / len(alt_rsi_1h) if alt_rsi_1h else 50
             feat["alt_momentum_align"] = sum(alt_momentum) if alt_momentum else 0
-            target_prev = prev_results[0] if prev_results else 0.5
-            all_prev = [target_prev] + alt_prev_results
-            feat["prev_result_consensus"] = sum(1 for r in all_prev if r == 1) / len(all_prev) if len(all_prev) >= 2 else 0.5
             feat["alt_distance_avg"] = sum(alt_distances) / len(alt_distances) if alt_distances else 0
 
             # === Intra-window 5m features (what happened during minutes 0-10) ===
             min5 = ws_n + timedelta(minutes=5)
-            # Candle 1: minutes 0-5
             c1_prices = []
             for df_5m in [cb_5m, bs_5m]:
                 if df_5m.empty: continue
                 mask = (df_5m.index >= ws_n) & (df_5m.index < min5)
                 if mask.sum() > 0:
                     c1_prices.append(df_5m[mask].iloc[0])
-            # Candle 2: minutes 5-10
             c2_prices = []
             for df_5m in [cb_5m, bs_5m]:
                 if df_5m.empty: continue
@@ -247,7 +246,6 @@ def main():
                     c2_prices.append(df_5m[mask].iloc[0])
 
             if c1_prices and c2_prices and atr > 0:
-                # Average across exchanges
                 c1_open = sum(float(c["open"]) for c in c1_prices) / len(c1_prices)
                 c1_close = sum(float(c["close"]) for c in c1_prices) / len(c1_prices)
                 c1_high = sum(float(c["high"]) for c in c1_prices) / len(c1_prices)
@@ -283,7 +281,8 @@ def main():
             else:
                 feat["return_12h"] = 0
             if df_1h is not None:
-                h1f = df_1h[df_1h.index <= ws_n]
+                # '<' drops the in-progress candle at ws_n — live/backtest parity
+                h1f = df_1h[df_1h.index < ws_n]
                 if len(h1f) >= 20 and atr > 0:
                     feat["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr
                 else:
@@ -291,7 +290,7 @@ def main():
             else:
                 feat["price_vs_sma_1h"] = 0
             if df_4h is not None:
-                h4f = df_4h[df_4h.index <= ws_n]
+                h4f = df_4h[df_4h.index < ws_n]
                 if len(h4f) >= 4:
                     feat["lower_lows_4h"] = sum(1 for i in range(-3,0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
                 else:
@@ -313,6 +312,15 @@ def main():
             feat["pve_x_return12h"] = _pve * _r12
             feat["slope_x_trend"] = _es * _ts
             feat["slope_x_return12h"] = _es * _r12
+            # RSI-centered × trend interactions
+            _rsi1h_c = feat.get("rsi_1h", 50) - 50
+            _rsi4h_c = feat.get("rsi_4h", 50) - 50
+            _r4 = feat.get("return_4h", 0)
+            _dist = feat.get("distance_from_strike", 0)
+            feat["rsi1h_x_r12h"] = _rsi1h_c * _r12
+            feat["rsi4h_x_r12h"] = _rsi4h_c * _r12
+            feat["rsi1h_x_r4h"] = _rsi1h_c * _r4
+            feat["dist_x_r12h"] = _dist * _r12
 
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
@@ -321,12 +329,19 @@ def main():
         df_all = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
         print(f"  Samples: {len(df_all)} | YES: {df_all['label'].mean():.1%}")
 
-        # 70/15/15 split with early stopping
-        split_train = int(len(df_all) * 0.70)
-        split_val = int(len(df_all) * 0.85)
+        # Purged walk-forward split
+        n = len(df_all)
+        split_train = int(n * 0.70)
+        split_val_start = split_train + PURGE_GAP_SAMPLES
+        split_val_end = int(n * 0.85)
+        if split_val_start >= split_val_end:
+            split_val_start = split_train + 4
+            if split_val_start >= split_val_end:
+                split_val_start = split_train
+
         df_train = df_all.iloc[:split_train]
-        df_val = df_all.iloc[split_train:split_val]
-        df_test = df_all.iloc[split_val:]
+        df_val = df_all.iloc[split_val_start:split_val_end]
+        df_test = df_all.iloc[split_val_end:]
 
         X_train = df_train[ALL_FEATURES].values
         y_train = df_train["label"].values
@@ -335,23 +350,35 @@ def main():
         X_test = df_test[ALL_FEATURES].values
         y_test = df_test["label"].values
 
-        print(f"  Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
+        # Time-decay sample weights
+        latest = df_train["ts"].max()
+        days_ago = (latest - df_train["ts"]).dt.total_seconds() / 86400
+        sample_weights = np.exp(-np.log(2) * days_ago / 60)
+        sample_weights = sample_weights / sample_weights.mean()
+
+        print(f"  Train: {len(df_train)} | Gap: {PURGE_GAP_SAMPLES} | Val: {len(df_val)} | Test: {len(df_test)}")
 
         model = XGBClassifier(
             n_estimators=2000,
-            learning_rate=0.03,
+            learning_rate=0.02,
             max_depth=4,
             min_child_weight=50,
             subsample=0.7,
             colsample_bytree=0.7,
+            gamma=0.1,
             reg_alpha=0.1,
             reg_lambda=1.0,
             eval_metric="logloss",
-            early_stopping_rounds=50,
+            early_stopping_rounds=80,
             random_state=42,
             verbosity=0,
         )
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        model.fit(
+            X_train, y_train,
+            sample_weight=sample_weights.values,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
 
         best_iter = model.best_iteration if hasattr(model, 'best_iteration') else model.n_estimators
         print(f"  Best iteration: {best_iter}")
@@ -386,6 +413,12 @@ def main():
             pnl = w * 0.40 - l * 0.60
             print(f"  {t:>6} | {tot:>5} {wr:>5.1f}% | ${pnl:>+6.1f}")
 
+        # YES/NO balance check
+        yes_preds = sum(1 for p in probs if p >= 0.80)
+        no_preds = sum(1 for p in probs if p <= 0.20)
+        skip_preds = len(probs) - yes_preds - no_preds
+        print(f"\n  Signal balance (t=80): YES={yes_preds} NO={no_preds} SKIP={skip_preds}")
+
         out_path = Path(f"models/m10_{target_asset.lower()}.pkl")
         with open(out_path, "wb") as f:
             pickle.dump({
@@ -395,6 +428,8 @@ def main():
                 "feature_names": ALL_FEATURES,
                 "asset": target_asset,
                 "training_samples": len(df_train),
+                "model_class": "XGBClassifier",
+                "xgb_version": "v2_optimized",
             }, f)
         print(f"\n  Saved to {out_path}")
 

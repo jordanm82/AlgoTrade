@@ -140,7 +140,7 @@ def main():
         else:
             kx["return_12h"] = 0
         if df_1h is not None:
-            h1f = df_1h[df_1h.index <= ws]
+            h1f = df_1h[df_1h.index < ws]
             if len(h1f) >= 20 and atr > 0:
                 kx["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr
             else:
@@ -148,7 +148,7 @@ def main():
         else:
             kx["price_vs_sma_1h"] = 0
         if df_4h is not None:
-            h4f = df_4h[df_4h.index <= ws]
+            h4f = df_4h[df_4h.index < ws]
             if len(h4f) >= 4:
                 kx["lower_lows_4h"] = sum(1 for i in range(-3, 0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i - 1]["low"]))
             else:
