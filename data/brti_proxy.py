@@ -10,6 +10,7 @@ Parallel fetch, 10-second cache to avoid rate limits.
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import ccxt
 
@@ -64,7 +65,7 @@ class BRTIProxy:
             results = list(pool.map(_fetch, ["coinbase", "bitstamp"]))
 
         prices = [p for p in results if p is not None]
-        if not prices:
+        if len(prices) != 2:
             return None
 
         avg = sum(prices) / len(prices)
@@ -76,6 +77,95 @@ class BRTIProxy:
             self._cache[usdt_sym] = (avg, time.time())
 
         return avg
+
+    def get_5m_candle_open(self, symbol: str) -> float | None:
+        """Get the OPEN price of the current 5m candle (Coinbase+Bitstamp averaged).
+
+        Training computes M10 distance as: get_avg_price(cb_5m, bs_5m, min10, "open")
+        which is the 5m candle open. Live MUST use the same price, not real-time spot.
+        """
+        sym = symbol.replace("/USDT", "/USD")
+
+        def _fetch_ohlcv(name):
+            try:
+                ex = self._get_exchange(name)
+                if ex is None:
+                    return None
+                # Fetch last 1 candle of 5m timeframe
+                candles = ex.fetch_ohlcv(sym, "5m", limit=1)
+                if candles and len(candles) > 0:
+                    return candles[-1][1]  # [1] = open price
+                return None
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(_fetch_ohlcv, ["coinbase", "bitstamp"]))
+
+        opens = [p for p in results if p is not None]
+        if len(opens) != 2:
+            return None
+        return sum(opens) / len(opens)
+
+    def get_5m_window_candles(self, symbol: str, window_start: datetime) -> dict[str, dict[str, float]] | None:
+        """Return averaged 5m candles for minute-0/minute-5/minute-10 in a 15m window.
+
+        Strict parity:
+        - Requires BOTH Coinbase and Bitstamp candles for each required timestamp.
+        - Returns None if any required candle is missing from either exchange.
+        """
+        sym = symbol.replace("/USDT", "/USD")
+        ws = window_start if window_start.tzinfo else window_start.replace(tzinfo=timezone.utc)
+        required = [ws, ws + timedelta(minutes=5), ws + timedelta(minutes=10)]
+        required_ms = {int(dt.timestamp() * 1000): dt for dt in required}
+
+        def _fetch_ohlcv(name: str):
+            try:
+                ex = self._get_exchange(name)
+                if ex is None:
+                    return None
+                # Cover recent history around the current 15m window.
+                candles = ex.fetch_ohlcv(sym, "5m", limit=12)
+                if not candles:
+                    return None
+                by_ms = {int(c[0]): c for c in candles}
+                picked = {}
+                for ts_ms, dt in required_ms.items():
+                    c = by_ms.get(ts_ms)
+                    if c is None:
+                        return None
+                    picked[dt] = {
+                        "open": float(c[1]),
+                        "high": float(c[2]),
+                        "low": float(c[3]),
+                        "close": float(c[4]),
+                        "volume": float(c[5]),
+                    }
+                return picked
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            cb, bs = list(pool.map(_fetch_ohlcv, ["coinbase", "bitstamp"]))
+
+        if cb is None or bs is None:
+            return None
+
+        averaged = {}
+        labels = ["minute_0", "minute_5", "minute_10"]
+        for label, dt in zip(labels, required):
+            c1 = cb.get(dt)
+            c2 = bs.get(dt)
+            if c1 is None or c2 is None:
+                return None
+            averaged[label] = {
+                "open": (c1["open"] + c2["open"]) / 2.0,
+                "high": (c1["high"] + c2["high"]) / 2.0,
+                "low": (c1["low"] + c2["low"]) / 2.0,
+                "close": (c1["close"] + c2["close"]) / 2.0,
+                "volume": (c1["volume"] + c2["volume"]) / 2.0,
+            }
+        return averaged
 
     def get_prices_batch(self, symbols: list[str]) -> dict[str, float]:
         """Get prices for multiple symbols in one parallel batch."""
@@ -128,7 +218,7 @@ class BRTIProxy:
 
         with self._lock:
             for norm_sym, prices in by_sym.items():
-                if prices:
+                if len(prices) == 2:
                     avg = sum(prices) / len(prices)
                     self._cache[norm_sym] = (avg, time.time())
                     usdt = norm_sym.replace("/USD", "/USDT")

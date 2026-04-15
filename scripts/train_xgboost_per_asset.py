@@ -15,6 +15,7 @@ import argparse
 import pickle
 import sys
 import time
+import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -113,7 +114,101 @@ def evaluate_threshold(probs, y_true, threshold):
             "yw": yw, "yl": yl, "nw": nw, "nl": nl}
 
 
-def train_with_features(df_all, feature_list, label=""):
+def _evaluate_guardrails(probs, y_true, feat_df, *, threshold=65,
+                         continuation_dist=0.8, continuation_ret12=0.5):
+    """Evaluate calibration/continuation guardrails on a test slice."""
+    pcts = probs * 100.0
+    sides = np.array(["SKIP"] * len(probs), dtype=object)
+    sides[pcts >= threshold] = "YES"
+    sides[pcts <= (100 - threshold)] = "NO"
+
+    # Core decided-bet metrics
+    decided = sides != "SKIP"
+    wins = ((sides == "YES") & (y_true == 1)) | ((sides == "NO") & (y_true == 0))
+    losses = decided & (~wins)
+    total = int(decided.sum())
+    w = int(wins.sum())
+    l = int(losses.sum())
+    true_wr = (w / total * 100) if total > 0 else 0.0
+    pnl = w * 0.40 - l * 0.60
+
+    yes_mask = sides == "YES"
+    no_mask = sides == "NO"
+    y_tot = int(yes_mask.sum())
+    n_tot = int(no_mask.sum())
+    y_w = int(((yes_mask) & (y_true == 1)).sum())
+    n_w = int(((no_mask) & (y_true == 0)).sum())
+    y_wr = (y_w / y_tot * 100) if y_tot > 0 else 0.0
+    n_wr = (n_w / n_tot * 100) if n_tot > 0 else 0.0
+
+    # Continuation buckets (bull and bear symmetry)
+    if "distance_from_strike" in feat_df.columns and "return_12h" in feat_df.columns:
+        dist = feat_df["distance_from_strike"].values
+        ret12 = feat_df["return_12h"].values
+        bull = (dist >= continuation_dist) & (ret12 >= continuation_ret12)
+        bear = (dist <= -continuation_dist) & (ret12 <= -continuation_ret12)
+    else:
+        bull = np.zeros(len(probs), dtype=bool)
+        bear = np.zeros(len(probs), dtype=bool)
+
+    bull_n = int(bull.sum())
+    bear_n = int(bear.sum())
+    bull_no_rate = (float(((sides == "NO") & bull).sum()) / bull_n * 100) if bull_n > 0 else None
+    bear_yes_rate = (float(((sides == "YES") & bear).sum()) / bear_n * 100) if bear_n > 0 else None
+
+    # False-NO on bullish continuation windows where truth is YES and we took a side
+    bull_yes_decided = bull & (y_true == 1) & decided
+    bull_yes_decided_n = int(bull_yes_decided.sum())
+    bull_false_no = int(((sides == "NO") & bull_yes_decided).sum())
+    bull_false_no_rate = (bull_false_no / bull_yes_decided_n * 100) if bull_yes_decided_n > 0 else None
+
+    return {
+        "threshold": threshold,
+        "bets": total,
+        "wins": w,
+        "losses": l,
+        "true_wr": true_wr,
+        "pnl": pnl,
+        "yes_bets": y_tot,
+        "no_bets": n_tot,
+        "yes_wr": y_wr,
+        "no_wr": n_wr,
+        "bull_bucket_n": bull_n,
+        "bear_bucket_n": bear_n,
+        "bull_no_rate": bull_no_rate,
+        "bear_yes_rate": bear_yes_rate,
+        "bull_false_no_rate": bull_false_no_rate,
+    }
+
+
+def _apply_continuation_weights(df_train, y_train, base_weights, *,
+                                continuation_weight=1.0,
+                                continuation_dist=0.8,
+                                continuation_ret12=0.5):
+    """Upweight continuation-consistent labels in strong-trend buckets."""
+    if continuation_weight <= 1.0:
+        return base_weights
+    if "distance_from_strike" not in df_train.columns or "return_12h" not in df_train.columns:
+        return base_weights
+
+    w = base_weights.copy()
+    dist = df_train["distance_from_strike"].values
+    ret12 = df_train["return_12h"].values
+
+    bull = (dist >= continuation_dist) & (ret12 >= continuation_ret12) & (y_train == 1)
+    bear = (dist <= -continuation_dist) & (ret12 <= -continuation_ret12) & (y_train == 0)
+    w[bull] *= continuation_weight
+    w[bear] *= continuation_weight
+    # Keep mean around 1 for stable boosting behavior
+    w = w / w.mean()
+    return w
+
+
+def train_with_features(df_all, feature_list, label="", *,
+                        continuation_weight=1.0,
+                        continuation_dist=0.8,
+                        continuation_ret12=0.5,
+                        monotone_distance=False):
     """Train XGBoost with purged walk-forward split and time-decay weights.
 
     Returns (model, test_results_dict, best_iteration).
@@ -144,12 +239,18 @@ def train_with_features(df_all, feature_list, label=""):
     X_test = df_test[feature_list].values
     y_test = df_test["label"].values
 
-    # Time-decay sample weights (60-day half-life)
+    # Time-decay sample weights (60-day half-life) + continuation bucket weighting
     sample_weights = compute_time_decay_weights(df_train["ts"], half_life_days=60)
+    sample_weights = _apply_continuation_weights(
+        df_train, y_train, sample_weights,
+        continuation_weight=continuation_weight,
+        continuation_dist=continuation_dist,
+        continuation_ret12=continuation_ret12,
+    )
 
     # Balanced XGBoost — enough depth to learn conditional patterns,
     # regularization via subsampling and early stopping
-    model = XGBClassifier(
+    model_kwargs = dict(
         n_estimators=2000,
         learning_rate=0.02,
         max_depth=4,              # enough depth for conditional rules
@@ -165,6 +266,11 @@ def train_with_features(df_all, feature_list, label=""):
         random_state=42,
         verbosity=0,
     )
+    if monotone_distance and "distance_from_strike" in feature_list:
+        mono = [0] * len(feature_list)
+        mono[feature_list.index("distance_from_strike")] = 1
+        model_kwargs["monotone_constraints"] = tuple(mono)
+    model = XGBClassifier(**model_kwargs)
 
     model.fit(
         X_train, y_train,
@@ -178,6 +284,12 @@ def train_with_features(df_all, feature_list, label=""):
     # Evaluate on test set at threshold 65
     test_probs = model.predict_proba(X_test)[:, 1]
     results = evaluate_threshold(test_probs, y_test, 65)
+    results["guardrails"] = _evaluate_guardrails(
+        test_probs, y_test, df_test[feature_list],
+        threshold=65,
+        continuation_dist=continuation_dist,
+        continuation_ret12=continuation_ret12,
+    )
     results["best_iter"] = best_iter
     results["probs"] = test_probs
     results["y_test"] = y_test
@@ -187,10 +299,36 @@ def train_with_features(df_all, feature_list, label=""):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--synthetic", action="store_true",
+                        help="Backward-compatible alias for --synthetic-mode=raw")
+    parser.add_argument("--synthetic-mode", choices=["none", "raw", "fixed"], default="none",
+                        help="none=real only, raw=existing synthetic labels, fixed=synthetic labels corrected to current-window horizon")
+    parser.add_argument("--synthetic-ratio", type=float, default=1.0,
+                        help="Cap synthetic:real ratio per asset (1.0 means at most 1 synthetic sample per real sample)")
     parser.add_argument("--all-features", action="store_true",
                         help="Skip incremental testing, use all 33 features")
+    parser.add_argument("--assets", type=str, default="BTC,ETH,SOL,XRP",
+                        help="Comma-separated subset of assets to train, e.g. BTC or BTC,ETH")
+    parser.add_argument("--continuation-weight", type=float, default=1.0,
+                        help="Upweight continuation-consistent labels in strong trend buckets")
+    parser.add_argument("--continuation-dist", type=float, default=0.8,
+                        help="|distance_from_strike| threshold for continuation buckets")
+    parser.add_argument("--continuation-ret12", type=float, default=0.5,
+                        help="|return_12h| threshold for continuation buckets")
+    parser.add_argument("--monotone-distance", action="store_true",
+                        help="Apply monotonic +1 constraint to distance_from_strike")
+    parser.add_argument("--max-settlement-pages", type=int, default=50,
+                        help="Max pagination loops for settled markets fetch")
+    parser.add_argument("--report-json", type=str, default="",
+                        help="Optional path to write per-asset training/eval report JSON")
     args = parser.parse_args()
+    if args.synthetic and args.synthetic_mode == "none":
+        args.synthetic_mode = "raw"
+
+    selected_assets = [a.strip().upper() for a in args.assets.split(",") if a.strip()]
+    selected_assets = [a for a in selected_assets if a in SERIES]
+    if not selected_assets:
+        raise ValueError(f"No valid assets in --assets={args.assets}. Valid: {','.join(SERIES.keys())}")
 
     client = KalshiClient(api_key_id=KALSHI_API_KEY_ID, private_key_path=str(KALSHI_KEY_FILE))
     fetcher = DataFetcher()
@@ -199,17 +337,19 @@ def main():
     print("PER-ASSET XGBOOST v2 — RESEARCH-OPTIMIZED")
     print("  max_depth=4, lr=0.02, early_stop=80, subsample=0.7")
     print("  Purged walk-forward (4h gap) + time-decay weighting (60d half-life)")
-    if args.synthetic:
-        print("  *** INCLUDING SYNTHETIC LABELS ***")
+    print(f"  Assets: {','.join(selected_assets)}")
+    print(f"  Synthetic mode: {args.synthetic_mode} | cap ratio: {args.synthetic_ratio:.2f}")
+    print(f"  Continuation weight: {args.continuation_weight:.2f} | monotone distance: {args.monotone_distance}")
     print("=" * 80)
 
     # Fetch data (same as before)
     print("\n[1/4] Fetching settlements...")
     kalshi_markets = {}
-    for asset, series in SERIES.items():
+    for asset in selected_assets:
+        series = SERIES[asset]
         markets = []
         cursor = ""
-        for _ in range(50):
+        for _ in range(args.max_settlement_pages):
             params = {"series_ticker": series, "status": "settled", "limit": 1000}
             if cursor: params["cursor"] = cursor
             resp = client._get("/trade-api/v2/markets", params)
@@ -221,7 +361,7 @@ def main():
         print(f"  {asset}: {len(markets)}")
 
     settlement_by_time = {}
-    for asset in SERIES:
+    for asset in selected_assets:
         settlement_by_time[asset] = {}
         for mk in kalshi_markets[asset]:
             ct = mk.get("close_time", "")
@@ -230,7 +370,8 @@ def main():
 
     print("\n[2/4] Fetching 5m candles...")
     five_m = {}
-    for asset, sym in ASSETS_SYMS.items():
+    for asset in selected_assets:
+        sym = ASSETS_SYMS[asset]
         five_m[asset] = {}
         for ex in ["coinbase", "bitstamp"]:
             five_m[asset][ex] = fetch_5m_history(sym, ex, 100)
@@ -238,7 +379,8 @@ def main():
 
     print("\n[3/4] Fetching indicators...")
     ind_data = {}
-    for asset, sym in ASSETS_SYMS.items():
+    for asset in selected_assets:
+        sym = ASSETS_SYMS[asset]
         df_15m = add_indicators(fetch_candles(fetcher, sym, "15m", 110))
         df_1h = add_indicators(fetch_candles(fetcher, sym, "1h", 110))
         df_4h = add_indicators(fetch_candles(fetcher, sym, "4h", 110))
@@ -252,7 +394,21 @@ def main():
         print(f"  {asset}: {len(df_15m)} 15m candles")
 
     print("\n[4/4] Training per-asset XGBoost models (optimized)...")
-    all_assets = list(SERIES.keys())
+    all_assets = list(selected_assets)
+    report = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "settings": {
+            "assets": all_assets,
+            "synthetic_mode": args.synthetic_mode,
+            "synthetic_ratio": args.synthetic_ratio,
+            "continuation_weight": args.continuation_weight,
+            "continuation_dist": args.continuation_dist,
+            "continuation_ret12": args.continuation_ret12,
+            "monotone_distance": args.monotone_distance,
+            "all_features": args.all_features,
+        },
+        "assets": {},
+    }
 
     for target_asset in all_assets:
         print(f"\n{'=' * 80}")
@@ -341,7 +497,8 @@ def main():
                     rv = float(a15f.iloc[-1].get("rsi", 50))
                     ar15.append(rv); amom.append(1 if rv >= 50 else -1)
                 if a1h is not None:
-                    a1f = a1h[a1h.index <= ws_n]
+                    # '<' drops the in-progress 1h candle at ws_n.
+                    a1f = a1h[a1h.index < ws_n]
                     if len(a1f) >= 2: ar1h.append(float(a1f.iloc[-1].get("rsi", 50)))
             kx["alt_rsi_avg"] = sum(ar15)/len(ar15) if ar15 else 50
             kx["alt_rsi_1h_avg"] = sum(ar1h)/len(ar1h) if ar1h else 50
@@ -367,8 +524,11 @@ def main():
                 continue
             rows.append({**feat, "label": label, "ts": close_dt})
 
+        real_count = len(rows)
+        syn_rows = []
+
         # Merge synthetic data
-        if args.synthetic:
+        if args.synthetic_mode != "none":
             syn_path = Path("data/store/synthetic_labels.pkl")
             if syn_path.exists():
                 syn_data = pickle.load(open(syn_path, "rb"))
@@ -431,7 +591,8 @@ def main():
                                     syn_alt_rsi.append(rv)
                                     syn_alt_mom.append(1 if rv >= 50 else -1)
                                 if alt_syn_1h is not None:
-                                    alt_1h_f = alt_syn_1h[alt_syn_1h.index <= ws_syn]
+                                    # '<' drops the in-progress 1h candle at ws_syn.
+                                    alt_1h_f = alt_syn_1h[alt_syn_1h.index < ws_syn]
                                     if len(alt_1h_f) >= 2:
                                         syn_alt_rsi_1h.append(float(alt_1h_f.iloc[-1].get("rsi", 50)))
                         kx_syn["alt_rsi_avg"] = sum(syn_alt_rsi)/len(syn_alt_rsi) if syn_alt_rsi else 50
@@ -456,12 +617,31 @@ def main():
                         syn_ts = s["ts"]
                         if hasattr(syn_ts, 'tzinfo') and syn_ts.tzinfo is None:
                             syn_ts = syn_ts.replace(tzinfo=timezone.utc)
-                        rows.append({**feat_syn, "label": s["label"], "ts": syn_ts})
+                        syn_label = s["label"]
+                        if args.synthetic_mode == "fixed":
+                            strike_syn = float(s.get("strike", syn_15m.iloc[idx]["close"]))
+                            settle_idx = idx + 1  # same-window close, not next-window close
+                            if settle_idx >= len(syn_15m):
+                                continue
+                            settle_syn = float(syn_15m.iloc[settle_idx]["close"])
+                            syn_label = 1 if settle_syn > strike_syn else 0
+                        syn_rows.append({**feat_syn, "label": syn_label, "ts": syn_ts})
                         syn_count += 1
-                    print(f"  + {syn_count} synthetic samples")
+                    print(f"  + {syn_count} synthetic samples ({args.synthetic_mode})")
+
+        # Cap synthetic volume relative to real rows
+        if syn_rows and args.synthetic_ratio >= 0:
+            max_syn = int(real_count * args.synthetic_ratio)
+            if max_syn < len(syn_rows):
+                rng = np.random.default_rng(42)
+                keep_idx = rng.choice(len(syn_rows), size=max_syn, replace=False)
+                syn_rows = [syn_rows[i] for i in sorted(keep_idx)]
+            print(f"  + Using {len(syn_rows)} synthetic rows after ratio cap ({args.synthetic_ratio:.2f})")
+
+        rows.extend(syn_rows)
 
         df_all = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
-        print(f"  Total: {len(df_all)} | YES: {df_all['label'].mean():.1%}")
+        print(f"  Total: {len(df_all)} | Real: {real_count} | Syn: {len(syn_rows)} | YES: {df_all['label'].mean():.1%}")
 
         if args.all_features:
             # Skip incremental testing — just train with all features
@@ -473,7 +653,13 @@ def main():
             print(f"  Starting with {len(CORE_13)} core features")
 
             # Train baseline with core 13
-            _, core_results, _ = train_with_features(df_all, CORE_13, "core_13")
+            _, core_results, _ = train_with_features(
+                df_all, CORE_13, "core_13",
+                continuation_weight=args.continuation_weight,
+                continuation_dist=args.continuation_dist,
+                continuation_ret12=args.continuation_ret12,
+                monotone_distance=args.monotone_distance,
+            )
             if core_results is None or core_results["tot"] < 10:
                 print(f"  ERROR: Not enough test samples for {target_asset}")
                 continue
@@ -486,7 +672,13 @@ def main():
             # Test each group incrementally
             for group_name, group_feats in FEATURE_GROUPS.items():
                 candidate = best_features + group_feats
-                _, group_results, _ = train_with_features(df_all, candidate, group_name)
+                _, group_results, _ = train_with_features(
+                    df_all, candidate, group_name,
+                    continuation_weight=args.continuation_weight,
+                    continuation_dist=args.continuation_dist,
+                    continuation_ret12=args.continuation_ret12,
+                    monotone_distance=args.monotone_distance,
+                )
                 if group_results is None or group_results["tot"] < 10:
                     print(f"  + {group_name:15}: SKIP (insufficient data)")
                     if group_name in FORCE_KEEP_GROUPS:
@@ -534,10 +726,16 @@ def main():
         y_test = df_test["label"].values
 
         sample_weights = compute_time_decay_weights(df_train["ts"], half_life_days=60)
+        sample_weights = _apply_continuation_weights(
+            df_train, y_train, sample_weights,
+            continuation_weight=args.continuation_weight,
+            continuation_dist=args.continuation_dist,
+            continuation_ret12=args.continuation_ret12,
+        )
 
         print(f"  Train: {len(df_train)} | Gap: {PURGE_GAP_SAMPLES} | Val: {len(df_val)} | Test: {len(df_test)}")
 
-        model = XGBClassifier(
+        model_kwargs = dict(
             n_estimators=2000,
             learning_rate=0.02,
             max_depth=4,
@@ -553,6 +751,11 @@ def main():
             random_state=42,
             verbosity=0,
         )
+        if args.monotone_distance and "distance_from_strike" in best_features:
+            mono = [0] * len(best_features)
+            mono[best_features.index("distance_from_strike")] = 1
+            model_kwargs["monotone_constraints"] = tuple(mono)
+        model = XGBClassifier(**model_kwargs)
 
         model.fit(
             X_train, y_train,
@@ -588,6 +791,24 @@ def main():
         skip_preds = len(test_probs) - yes_preds - no_preds
         print(f"\n  Signal balance (t=65): YES={yes_preds} NO={no_preds} SKIP={skip_preds}")
 
+        guard = _evaluate_guardrails(
+            test_probs, y_test, df_test[best_features],
+            threshold=65,
+            continuation_dist=args.continuation_dist,
+            continuation_ret12=args.continuation_ret12,
+        )
+        print("\n  Guardrails @65")
+        print(f"    True WR: {guard['true_wr']:.1f}% | P&L: ${guard['pnl']:+.1f}")
+        print(f"    YES WR: {guard['yes_wr']:.1f}% ({guard['yes_bets']}) | NO WR: {guard['no_wr']:.1f}% ({guard['no_bets']})")
+        if guard["bull_no_rate"] is not None:
+            print(
+                f"    Bull bucket n={guard['bull_bucket_n']} | "
+                f"NO-rate={guard['bull_no_rate']:.1f}% | "
+                f"False-NO(when truth=YES)={guard['bull_false_no_rate'] if guard['bull_false_no_rate'] is not None else float('nan'):.1f}%"
+            )
+        if guard["bear_yes_rate"] is not None:
+            print(f"    Bear bucket n={guard['bear_bucket_n']} | YES-rate={guard['bear_yes_rate']:.1f}%")
+
         # Save
         scaler = StandardScaler()
         scaler.fit(X_train)
@@ -608,9 +829,30 @@ def main():
                     "max_depth": 4, "lr": 0.02, "early_stop": 80,
                     "subsample": 0.7, "purge_gap": PURGE_GAP_SAMPLES,
                     "time_decay_halflife": 60,
+                    "continuation_weight": args.continuation_weight,
+                    "continuation_dist": args.continuation_dist,
+                    "continuation_ret12": args.continuation_ret12,
+                    "monotone_distance": args.monotone_distance,
                 },
             }, f)
         print(f"\n  Saved to {out_path}")
+
+        report["assets"][target_asset] = {
+            "samples_total": int(len(df_all)),
+            "samples_real": int(real_count),
+            "samples_synthetic": int(len(syn_rows)),
+            "yes_rate_total": float(df_all["label"].mean()),
+            "features": list(best_features),
+            "best_iteration": int(best_iter),
+            "guardrails_t65": guard,
+        }
+
+    if args.report_json:
+        report_path = Path(args.report_json)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        print(f"\nReport saved: {report_path}")
 
 
 if __name__ == "__main__":

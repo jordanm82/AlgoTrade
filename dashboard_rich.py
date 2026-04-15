@@ -7,11 +7,12 @@ Usage:
     ./venv/bin/python dashboard_rich.py --arb --dry-run
 """
 import argparse
+import re
 import signal as sig
 import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, ".")
 
@@ -59,7 +60,88 @@ class RichDashboard:
         # Order tracking
         self._order_summary: list[dict] = []  # resting + filled orders this session
 
+        # Persistent activity log — rolls off at 48 hours
+        self._activity_log_path = "data/store/activity.log"
+        self._init_activity_log()
+
         self._install_log_capture()
+
+    def _init_activity_log(self):
+        """Initialize persistent activity log, rolling off entries older than 48 hours."""
+        import os
+        path = self._activity_log_path
+        if os.path.exists(path):
+            # Roll off lines older than 48 hours
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+            cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                with open(path, "r") as f:
+                    lines = f.readlines()
+                kept = [l for l in lines if l[:19] >= cutoff_str]
+                with open(path, "w") as f:
+                    f.writelines(kept)
+            except Exception:
+                pass  # if rolloff fails, just keep the file as-is
+
+    def _write_activity_log(self, line: str):
+        """Append a timestamped line to the persistent activity log."""
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            with open(self._activity_log_path, "a") as f:
+                f.write(f"{ts} {line}\n")
+        except Exception:
+            pass
+
+    def _compact_log_line(self, line: str) -> str:
+        """Keep network error logs readable while preserving core diagnostics."""
+        if not line:
+            return line
+
+        lower = line.lower()
+        is_kalshi_conn = "httpsconnectionpool(" in lower and "api.elections.kalshi.com" in lower
+        is_dns = "nameresolutionerror" in lower or "failed to resolve" in lower
+        is_unreachable = "network is unreachable" in lower
+
+        if is_kalshi_conn or is_dns or is_unreachable:
+            host_m = re.search(r"host='([^']+)'", line)
+            host = host_m.group(1) if host_m else "api.elections.kalshi.com"
+
+            # Prefer endpoint path/query over full URL blob
+            path = ""
+            url_m = re.search(r"url:\s*([^\s]+)", line)
+            if url_m:
+                raw_url = url_m.group(1)
+                path_m = re.search(r"(\/trade-api\/[^\s]+)", raw_url)
+                path = path_m.group(1) if path_m else raw_url
+            else:
+                path_m = re.search(r"(\/trade-api\/[^\s)\"']+)", line)
+                if path_m:
+                    path = path_m.group(1)
+
+            if is_dns:
+                reason = "DNS resolve failed"
+            elif is_unreachable:
+                reason = "network unreachable"
+            else:
+                reason = "connection failed"
+
+            prefix = line
+            if "HTTPSConnectionPool(" in line:
+                prefix = line.split("HTTPSConnectionPool(", 1)[0].rstrip(" :")
+            elif "NameResolutionError(" in line:
+                prefix = line.split("NameResolutionError(", 1)[0].rstrip(" :")
+
+            compact = f"{prefix}: {reason} host={host}"
+            if path:
+                compact += f" path={path}"
+            return compact
+
+        # Safety cap for any other unexpectedly long warning/error lines
+        max_len = 240
+        if ("[WARN]" in line or "ERR" in line) and len(line) > max_len:
+            return line[: max_len - 1] + "…"
+
+        return line
 
     def _install_log_capture(self):
         """Redirect daemon print() calls to our activity log."""
@@ -69,10 +151,10 @@ class RichDashboard:
             text = " ".join(str(a) for a in args)
             if not text.strip():
                 return
-            import re
             clean = re.sub(r'\x1b\[[0-9;]*m', '', text).strip()
             if not clean:
                 return
+            clean = self._compact_log_line(clean)
 
             style = "white"
             if "[SIGNAL]" in clean or "[RESTING FILL]" in clean:
@@ -99,6 +181,9 @@ class RichDashboard:
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             self._log_lines.append(Text(f"{ts} {clean}", style=style))
 
+            # Persist to activity log file
+            self._write_activity_log(clean)
+
         builtins.print = captured_print
 
     def _fetch_balance(self):
@@ -113,9 +198,10 @@ class RichDashboard:
                     bal = self.daemon.kalshi_client.get_balance()
                     self._kalshi_balance = bal.get("balance", 0) / 100
         except Exception as e:
+            msg = self._compact_log_line(f"[BAL ERR] {e}")
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            self._log_lines.append(Text(f"{ts} [BAL ERR] {e}", style="red"))
-            pass
+            self._log_lines.append(Text(f"{ts} {msg}", style="red"))
+            self._write_activity_log(msg)
 
     def _force_cancel_resting(self):
         """Force-cancel ALL resting orders at minute 10+. Runs every 15s from dashboard."""
@@ -332,8 +418,10 @@ class RichDashboard:
                 })
 
         except Exception as e:
+            msg = self._compact_log_line(f"[POS ERR] {e}")
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            self._log_lines.append(Text(f"{ts} [POS ERR] {e}", style="red"))
+            self._log_lines.append(Text(f"{ts} {msg}", style="red"))
+            self._write_activity_log(msg)
 
         # Show filled pending bets as positions (all modes — Kalshi API positions are transient)
         for bet in getattr(self.daemon, '_pending_bets', []):
@@ -474,7 +562,7 @@ class RichDashboard:
                           show_lines=False, pad_edge=False)
             table.add_column("ASSET", style="bold white", width=5)
             table.add_column("SIDE", width=4)
-            table.add_column("LR", justify="right", width=6)
+            table.add_column("M0", justify="right", width=6)
             table.add_column("M10", justify="right", width=6)
             table.add_column("PRICE", justify="right", width=12)
             table.add_column("TARGET", justify="right", width=12)
@@ -537,7 +625,14 @@ class RichDashboard:
                             diff = brti - target
                             dist_str = f"{'+' if diff >= 0 else ''}{diff:.{decimals}f}"
 
-                state_style = "cyan bold" if "BETTING" in state or "BET_PLACED" in state else "dim" if state in ("DONE", "CANCELLED") else "white"
+                if "BETTING" in state or "BET_PLACED" in state:
+                    state_style = "cyan bold"
+                elif "SKIPPED" in state:
+                    state_style = "yellow"
+                elif state in ("DONE", "CANCELLED"):
+                    state_style = "dim"
+                else:
+                    state_style = "white"
 
                 table.add_row(
                     asset, side_text,
@@ -746,14 +841,27 @@ class RichDashboard:
 
         def _shutdown(*_):
             self.daemon._running = False
+
+        def _release_lock():
+            if hasattr(self.daemon, "_release_instance_lock"):
+                self.daemon._release_instance_lock()
+
         sig.signal(sig.SIGINT, _shutdown)
         sig.signal(sig.SIGTERM, _shutdown)
         import atexit
         atexit.register(lambda: self.daemon._cancel_all_resting_orders("process exit"))
+        atexit.register(_release_lock)
 
         # Startup
         self._fetch_balance()
-        self.daemon.startup()
+        startup_ok = self.daemon.startup()
+        if startup_ok is False:
+            self.daemon._running = False
+            self._console.print(
+                "[LOCK] Another dashboard/daemon instance is already running. Exiting this instance.",
+                style="red bold",
+            )
+            return
 
         # Initial eval
         eval_fn = self.daemon._arb_eval if self.arb_mode else self.daemon._kalshi_eval
@@ -761,7 +869,9 @@ class RichDashboard:
             eval_fn()
             self.daemon._last_kalshi_eval = time.time()
         except Exception as e:
-            self._log_lines.append(Text(f"EVAL ERR: {e}", style="red bold"))
+            msg = self._compact_log_line(f"[EVAL ERR] {e}")
+            self._log_lines.append(Text(msg, style="red bold"))
+            self._write_activity_log(msg)
 
         total_ticks = self.max_cycles * 15
 
@@ -816,10 +926,10 @@ class RichDashboard:
                 if self.arb_mode:
                     should_eval = time_since_eval >= 50
                 else:
-                    # Entry: every 3s during min 0-1 (fastest possible at window open)
+                    # Entry: every 2s during min 0-1 for faster market readiness + fills
                     # M10: every 5s at min 10+
                     # Normal: every 50s for monitoring
-                    entry_trigger = (min_in <= 1 and time_since_eval >= 3)
+                    entry_trigger = (min_in <= 1 and time_since_eval >= 2)
                     confirm_trigger = (min_in >= 10 and time_since_eval >= 5)
                     normal_trigger = (min_in >= 2 and min_in < 10 and time_since_eval >= 50)
                     should_eval = entry_trigger or confirm_trigger or normal_trigger
@@ -828,7 +938,9 @@ class RichDashboard:
                     try:
                         eval_fn()
                     except Exception as e:
-                        self._log_lines.append(Text(f"EVAL ERR: {e}", style="red bold"))
+                        msg = self._compact_log_line(f"[EVAL ERR] {e}")
+                        self._log_lines.append(Text(msg, style="red bold"))
+                        self._write_activity_log(msg)
                     self.daemon._last_kalshi_eval = now_ts
 
                 # Every 60 seconds: tick counter + balance refresh
@@ -920,6 +1032,8 @@ class RichDashboard:
                 )
 
             self._console.print(trades)
+
+        _release_lock()
 
 
 def main():

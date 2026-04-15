@@ -230,26 +230,23 @@ def main():
             window_start = close_dt - timedelta(minutes=15)
             ws_naive = window_start.replace(tzinfo=None)
 
-            # Price at MINUTE 1 — use 5m candle OPEN as proxy
-            # The 5m candle starting at window_start has open = price at minute 0
-            # By minute 1, price has barely moved from open — this matches live entry
+            # Price at minute 0 — strict Coinbase+Bitstamp 5m candle OPEN average.
             prices_at_min1 = []
 
             for df_5m in [cb_5m, bs_5m]:
                 if df_5m.empty:
-                    continue
+                    prices_at_min1 = []
+                    break
                 # Find the 5m candle that starts at or near window_start
                 mask = (df_5m.index >= ws_naive) & (df_5m.index < ws_naive + timedelta(minutes=5))
                 if mask.sum() > 0:
                     # Use OPEN of first 5m candle = price at window start (minute 0)
                     prices_at_min1.append(float(df_5m[mask].iloc[0]["open"]))
                 else:
-                    # Fallback: use close of last candle before window
-                    before = df_5m[df_5m.index <= ws_naive]
-                    if len(before) > 0 and (ws_naive - before.index[-1]).total_seconds() < 600:
-                        prices_at_min1.append(float(before.iloc[-1]["close"]))
+                    prices_at_min1 = []
+                    break
 
-            if not prices_at_min1:
+            if len(prices_at_min1) != 2:
                 continue
             price_at_min1 = sum(prices_at_min1) / len(prices_at_min1)
 

@@ -12,7 +12,6 @@ import argparse
 import hashlib
 import json
 import pickle
-import random
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -28,6 +27,12 @@ from data.fetcher import DataFetcher
 from data.indicators import add_indicators
 from exchange.kalshi import KalshiClient
 from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
+from strategy.m10_feature_builder import (
+    build_common_feature_vector,
+    compute_confluence_features,
+    compute_m10_intra_from_exchange_dfs,
+    get_avg_price_5m,
+)
 
 SERIES = {"BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M", "XRP": "KXXRP15M"}
 ASSETS_SYMS = {"BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD", "XRP": "XRP/USD"}
@@ -38,11 +43,11 @@ MAX_CONTRACTS = 100
 ENTRY_CENTS = 60
 MAX_PER_WINDOW = 3
 M10_EXIT_CENTS = 10
-DAILY_LOSS_CAP = 0.20
+DEFAULT_DAILY_LOSS_CAP = 0.0
 
 # Per-asset thresholds (must match daemon)
-M0_THRESHOLDS = {"BTC": 57, "ETH": 60, "SOL": 60, "XRP": 57}
-M10_THRESHOLDS = {"BTC": 60, "ETH": 60, "SOL": 55, "XRP": 60}
+M0_THRESHOLDS = {"BTC": 65, "ETH": 65, "SOL": 65, "XRP": 65}
+M10_THRESHOLDS = {"BTC": 90, "ETH": 90, "SOL": 90, "XRP": 90}
 
 CACHE_DIR = Path("data/store/backtest_cache")
 
@@ -98,102 +103,38 @@ def fetch_candles(fetcher, symbol, timeframe, days):
 
 
 def get_avg_price(cb_5m, bs_5m, target_time, field="open"):
-    prices = []
-    for df_5m in [cb_5m, bs_5m]:
-        if df_5m.empty: continue
-        mask = (df_5m.index >= target_time) & (df_5m.index < target_time + timedelta(minutes=5))
-        if mask.sum() > 0:
-            prices.append(float(df_5m[mask].iloc[0][field]))
-        else:
-            before = df_5m[df_5m.index <= target_time]
-            if len(before) > 0 and (target_time - before.index[-1]).total_seconds() < 600:
-                prices.append(float(before.iloc[-1]["close"]))
-    if not prices: return None
-    return sum(prices) / len(prices)
+    # Backwards-compatible wrapper for callers and existing training imports.
+    return get_avg_price_5m(cb_5m, bs_5m, target_time, field)
+
+
+def get_m10_exit_price_cents(*, historical_bid_cents=None, floor_cents=M10_EXIT_CENTS):
+    """Conservative floor pricing assumption."""
+    if historical_bid_cents is None:
+        return int(floor_cents)
+    return max(int(floor_cents), int(historical_bid_cents))
+
+
+def estimate_m10_bid_cents(*, side: str, m10_yes_prob: float, floor_cents: int, spread_cents: int = 5):
+    """Estimate an actionable bid from model probability (bounds-mode upper estimate)."""
+    fair_yes = float(m10_yes_prob) * 100.0
+    fair_side = fair_yes if side == "yes" else (100.0 - fair_yes)
+    est_bid = int(round(fair_side - float(spread_cents)))
+    est_bid = max(int(floor_cents), min(99, est_bid))
+    return est_bid
 
 
 def build_features(prev, df_1h, df_4h, ws_naive, distance, *,
                     kalshi_extra=None, atr_pctile_val=0.5):
-    """Build feature vector from previous 15m candle + 1h/4h + extras."""
-    sma_val = float(prev.get("sma_20", 0))
-    adx_val = float(prev.get("adx", 20))
-    close_val = float(prev.get("close", 0))
-    ts_sign = (1 if close_val >= sma_val else -1) if sma_val > 0 else 0
-    pve = float(prev.get("price_vs_ema", 0))
-    hr = float(prev.get("hourly_return", 0))
-    if pd.isna(pve) or np.isinf(pve): pve = 0
-    if pd.isna(hr) or np.isinf(hr): hr = 0
-
-    feat = {
-        "macd_15m": float(prev.get("macd_hist", 0)),
-        "norm_return": float(prev.get("norm_return", 0)) if pd.notna(prev.get("norm_return")) else 0,
-        "ema_slope": float(prev.get("ema_slope", 0)) if pd.notna(prev.get("ema_slope")) else 0,
-        "roc_5": float(prev.get("roc_5", 0)),
-        "macd_1h": 0.0,
-        "price_vs_ema": pve,
-        "hourly_return": hr,
-        "trend_direction": adx_val * ts_sign,
-        "vol_ratio": float(prev.get("vol_ratio", 1)) if pd.notna(prev.get("vol_ratio")) else 1,
-        "adx": adx_val,
-        "rsi_1h": 50.0,
-        "rsi_4h": 50.0,
-        "distance_from_strike": distance,
-    }
-    if df_1h is not None:
-        # Use '<' not '<=': the 1h candle indexed at ws_naive is the IN-PROGRESS
-        # candle at decision time (its full hour of data wasn't available yet
-        # in a live scenario). Including it would leak future data.
-        m1h = df_1h[df_1h.index < ws_naive]
-        if len(m1h) >= 20:
-            feat["rsi_1h"] = float(m1h.iloc[-1].get("rsi", 50))
-            feat["macd_1h"] = float(m1h.iloc[-1].get("macd_hist", 0))
-    if df_4h is not None:
-        m4h = df_4h[df_4h.index < ws_naive]
-        if len(m4h) >= 10:
-            feat["rsi_4h"] = float(m4h.iloc[-1].get("rsi", 50))
-
-    # Strike/time/technical
-    kx = kalshi_extra or {}
-    feat["strike_delta"] = kx.get("strike_delta", 0.0)
-    feat["strike_trend_3"] = kx.get("strike_trend_3", 0.0)
-    hour = ws_naive.hour if hasattr(ws_naive, 'hour') else 12
-    feat["hour_sin"] = float(np.sin(2 * np.pi * hour / 24))
-    feat["hour_cos"] = float(np.cos(2 * np.pi * hour / 24))
-    feat["rsi_alignment"] = (1 if feat["rsi_1h"] >= 50 else -1) * (1 if feat["rsi_4h"] >= 50 else -1)
-    feat["atr_percentile"] = atr_pctile_val
-    feat["rsi_15m"] = float(prev.get("rsi", 50))
-    bb_upper = float(prev.get("bb_upper", 0))
-    bb_lower = float(prev.get("bb_lower", 0))
-    bb_mid = float(prev.get("sma_20", 0))
-    feat["bbw"] = ((bb_upper - bb_lower) / bb_mid * 100) if bb_mid > 0 else 0
-
-    # Confluence
-    feat["alt_rsi_avg"] = kx.get("alt_rsi_avg", 50)
-    feat["alt_rsi_1h_avg"] = kx.get("alt_rsi_1h_avg", 50)
-    feat["alt_momentum_align"] = kx.get("alt_momentum_align", 0)
-    feat["alt_distance_avg"] = kx.get("alt_distance_avg", 0)
-
-    # Regime features
-    feat["return_4h"] = kx.get("return_4h", 0)
-    feat["return_12h"] = kx.get("return_12h", 0)
-    feat["price_vs_sma_1h"] = kx.get("price_vs_sma_1h", 0)
-    feat["lower_lows_4h"] = kx.get("lower_lows_4h", 0)
-    feat["trend_strength"] = kx.get("trend_strength", 0)
-
-    # Interaction features
-    feat["pve_x_trend"] = feat["price_vs_ema"] * feat["trend_strength"]
-    feat["pve_x_return12h"] = feat["price_vs_ema"] * feat["return_12h"]
-    feat["slope_x_trend"] = feat.get("ema_slope", 0) * feat["trend_strength"]
-    feat["slope_x_return12h"] = feat.get("ema_slope", 0) * feat["return_12h"]
-    # RSI-centered × trend interactions
-    feat["rsi1h_x_r12h"] = (feat.get("rsi_1h", 50) - 50) * feat["return_12h"]
-    feat["rsi4h_x_r12h"] = (feat.get("rsi_4h", 50) - 50) * feat["return_12h"]
-    feat["rsi1h_x_r4h"] = (feat.get("rsi_1h", 50) - 50) * feat.get("return_4h", 0)
-    feat["dist_x_r12h"] = feat.get("distance_from_strike", 0) * feat["return_12h"]
-
-    if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
-        return None
-    return feat
+    # Backwards-compatible wrapper for callers and existing training imports.
+    return build_common_feature_vector(
+        prev,
+        df_1h,
+        df_4h,
+        ws_naive,
+        distance,
+        kalshi_extra=kalshi_extra,
+        atr_pctile_val=atr_pctile_val,
+    )
 
 
 def main():
@@ -201,8 +142,22 @@ def main():
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--threshold", type=int, default=0, help="Override M0 threshold (0=per-asset)")
     parser.add_argument("--m10-threshold", type=int, default=0, help="Override M10 threshold (0=per-asset)")
-    parser.add_argument("--exit-min", type=int, default=10)
-    parser.add_argument("--exit-max", type=int, default=25)
+    parser.add_argument(
+        "--m10-exit-mode",
+        choices=["floor", "bounds"],
+        default="bounds",
+        help="floor=always floor price on M10 exits; bounds=estimate bid and track floor bound",
+    )
+    parser.add_argument(
+        "--m10-est-spread",
+        type=int,
+        default=5,
+        help="Bid spread discount in cents for bounds-mode estimated M10 exits",
+    )
+    parser.add_argument("--m10-exit-floor", type=int, default=M10_EXIT_CENTS,
+                        help="Minimum M10 exit price floor in cents")
+    parser.add_argument("--daily-loss-cap", type=float, default=DEFAULT_DAILY_LOSS_CAP,
+                        help="Optional per-day loss cap (fraction, e.g. 0.2). 0 disables cap.")
     parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
 
@@ -219,7 +174,10 @@ def main():
     print("=" * 80)
     print(f"BACKTEST — Per-Asset Models ({args.days} days)")
     print(f"M0: per-asset with confluence | M10: per-asset with 5m intra-window")
-    print(f"Entry: {ENTRY_CENTS}c | Exit: random {args.exit_min}-{args.exit_max}c")
+    print(
+        f"Entry: {ENTRY_CENTS}c | M10 exit mode: {args.m10_exit_mode} "
+        f"(floor={args.m10_exit_floor}c, est_spread={args.m10_est_spread}c)"
+    )
     print("=" * 80)
 
     client = KalshiClient(api_key_id=KALSHI_API_KEY_ID, private_key_path=str(KALSHI_KEY_FILE))
@@ -301,6 +259,14 @@ def main():
     # Score
     print("\nScoring with per-asset models...")
     all_assets = list(SERIES.keys())
+    strike_by_time = {
+        asset: {
+            mk.get("close_time"): float(mk.get("floor_strike") or 0)
+            for mk in kalshi_markets[asset]
+            if mk.get("close_time")
+        }
+        for asset in all_assets
+    }
     signals = []
 
     for target in all_assets:
@@ -356,30 +322,19 @@ def main():
             pav = atr_p[atr_p.index < wsn]
             apv = float(pav.iloc[-1]) if len(pav) > 0 else 0.5
 
-            # Confluence
-            ar15, ar1h, amom, adist = [], [], [], []
-            for alt in alts:
-                a15 = ind_data[alt]["15m"]
-                a1h_df = ind_data[alt]["1h"]
-                a15f = a15[a15.index < wsn]
-                if len(a15f) >= 2:
-                    rv = float(a15f.iloc[-1].get("rsi", 50))
-                    ar15.append(rv); amom.append(1 if rv >= 50 else -1)
-                if a1h_df is not None:
-                    a1f = a1h_df[a1h_df.index <= wsn]
-                    if len(a1f) >= 2: ar1h.append(float(a1f.iloc[-1].get("rsi", 50)))
-                altpx = get_avg_price(five_m[alt]["coinbase"], five_m[alt]["bitstamp"], wsn, "open")
-                if altpx and len(a15f) >= 2:
-                    aa = float(a15f.iloc[-1].get("atr", 0))
-                    for amk in kalshi_markets[alt]:
-                        if amk.get("close_time") == ct:
-                            ast_v = float(amk.get("floor_strike") or 0)
-                            if ast_v and aa > 0: adist.append((altpx - ast_v) / aa)
-                            break
-            kx["alt_rsi_avg"] = sum(ar15) / len(ar15) if ar15 else 50
-            kx["alt_rsi_1h_avg"] = sum(ar1h) / len(ar1h) if ar1h else 50
-            kx["alt_momentum_align"] = sum(amom) if amom else 0
-            kx["alt_distance_avg"] = sum(adist) / len(adist) if adist else 0
+            # Confluence at minute-0 anchor (shared builder path).
+            kx.update(
+                compute_confluence_features(
+                    alt_keys=alts,
+                    ws_naive=wsn,
+                    get_15m_df=lambda alt: ind_data[alt]["15m"],
+                    get_1h_df=lambda alt: ind_data[alt]["1h"],
+                    get_anchor_price=lambda alt: get_avg_price(
+                        five_m[alt]["coinbase"], five_m[alt]["bitstamp"], wsn, "open"
+                    ),
+                    get_strike=lambda alt: strike_by_time.get(alt, {}).get(ct) or None,
+                )
+            )
 
             # Regime features
             if len(pc) >= 16:
@@ -409,7 +364,9 @@ def main():
             f0 = build_features(prev, df1h, df4h, wsn, (p0 - strike) / atr,
                                 kalshi_extra=kx, atr_pctile_val=apv)
             if not f0: continue
-            X0 = np.array([f0.get(f, 0) for f in m0f]).reshape(1, -1)
+            if any(f not in f0 for f in m0f):
+                continue
+            X0 = np.array([f0[f] for f in m0f], dtype=float).reshape(1, -1)
             # XGBoost: predict on raw features; LogReg: predict on scaled
             is_tree = hasattr(m0m, 'get_booster') or 'XGB' in type(m0m).__name__
             X0_pred = X0 if is_tree else m0s.transform(X0)
@@ -421,56 +378,93 @@ def main():
 
             # M10
             m10x = False
-            exit_price = random.randint(args.exit_min, args.exit_max)
+            exit_price = None
+            exit_price_floor = None
+            exit_price_est = None
+            m10_prob = None
+            m10_quality = None
             min10 = wsn + timedelta(minutes=10)
-            min5 = wsn + timedelta(minutes=5)
             p10 = get_avg_price(cb5, bs5, min10, "open")
-            if p10:
-                f10 = build_features(prev, df1h, df4h, wsn, (p10 - strike) / atr,
-                                     kalshi_extra=kx, atr_pctile_val=apv)
-                if f10:
-                    # 5m intra-window features
-                    c1p, c2p = [], []
-                    for df_5m in [cb5, bs5]:
-                        if df_5m.empty: continue
-                        m1 = (df_5m.index >= wsn) & (df_5m.index < min5)
-                        if m1.sum() > 0: c1p.append(df_5m[m1].iloc[0])
-                        m2 = (df_5m.index >= min5) & (df_5m.index < min10)
-                        if m2.sum() > 0: c2p.append(df_5m[m2].iloc[0])
-                    if c1p and c2p and atr > 0:
-                        c1o = sum(float(c["open"]) for c in c1p) / len(c1p)
-                        c1c = sum(float(c["close"]) for c in c1p) / len(c1p)
-                        c1h = sum(float(c["high"]) for c in c1p) / len(c1p)
-                        c1l = sum(float(c["low"]) for c in c1p) / len(c1p)
-                        c1v = sum(float(c["volume"]) for c in c1p) / len(c1p)
-                        c2c = sum(float(c["close"]) for c in c2p) / len(c2p)
-                        c2h = sum(float(c["high"]) for c in c2p) / len(c2p)
-                        c2l = sum(float(c["low"]) for c in c2p) / len(c2p)
-                        c2v = sum(float(c["volume"]) for c in c2p) / len(c2p)
-                        f10["price_move_atr"] = (c2c - c1o) / atr
-                        f10["candle1_range_atr"] = (c1h - c1l) / atr
-                        f10["candle2_range_atr"] = (c2h - c2l) / atr
-                        f10["momentum_shift"] = (c2c - c1c) / atr
-                        f10["volume_acceleration"] = c2v / c1v if c1v > 0 else 1.0
-                    else:
-                        for k in ["price_move_atr", "candle1_range_atr", "candle2_range_atr", "momentum_shift"]:
-                            f10[k] = 0
-                        f10["volume_acceleration"] = 1.0
+            if p10 is not None:
+                # Recompute confluence at minute-10 anchor for M10 parity.
+                kx_m10 = dict(kx)
+                kx_m10.update(
+                    compute_confluence_features(
+                        alt_keys=alts,
+                        ws_naive=wsn,
+                        get_15m_df=lambda alt: ind_data[alt]["15m"],
+                        get_1h_df=lambda alt: ind_data[alt]["1h"],
+                        get_anchor_price=lambda alt: get_avg_price(
+                            five_m[alt]["coinbase"], five_m[alt]["bitstamp"], min10, "open"
+                        ),
+                        get_strike=lambda alt: strike_by_time.get(alt, {}).get(ct) or None,
+                    )
+                )
 
-                    X10 = np.array([f10.get(f, 0) for f in m10f]).reshape(1, -1)
-                    is_tree_m10 = hasattr(m10m, 'get_booster') or 'XGB' in type(m10m).__name__
-                    X10_pred = X10 if is_tree_m10 else m10s.transform(X10)
-                    mp = float(m10m.predict_proba(X10_pred)[0][1])
-                    mpc = int(mp * 100)
-                    ms = "yes" if mpc >= m10_thresh else "no" if mpc <= (100 - m10_thresh) else "skip"
-                    if ms != "skip" and ms != side:
-                        m10x = True
+                f10 = build_features(
+                    prev,
+                    df1h,
+                    df4h,
+                    wsn,
+                    (p10 - strike) / atr,
+                    kalshi_extra=kx_m10,
+                    atr_pctile_val=apv,
+                )
+                if f10:
+                    intra = compute_m10_intra_from_exchange_dfs(cb5, bs5, wsn, atr)
+                    if intra is None:
+                        # Strict no-fallback: missing intra-window 5m features => no M10 action.
+                        f10 = None
+                    else:
+                        f10.update(intra)
+
+                    if f10 is not None:
+                        if any(f not in f10 for f in m10f):
+                            f10 = None
+                    if f10 is not None:
+                        X10 = np.array([f10[f] for f in m10f], dtype=float).reshape(1, -1)
+                        is_tree_m10 = hasattr(m10m, 'get_booster') or 'XGB' in type(m10m).__name__
+                        X10_pred = X10 if is_tree_m10 else m10s.transform(X10)
+                        mp = float(m10m.predict_proba(X10_pred)[0][1])
+                        m10_prob = mp
+                        mpc = int(mp * 100)
+                        ms = "yes" if mpc >= m10_thresh else "no" if mpc <= (100 - m10_thresh) else "skip"
+                        if ms != "skip" and ms != side:
+                            m10x = True
+                            exit_price_floor = get_m10_exit_price_cents(
+                                historical_bid_cents=None,
+                                floor_cents=args.m10_exit_floor,
+                            )
+                            exit_price_est = estimate_m10_bid_cents(
+                                side=side,
+                                m10_yes_prob=mp,
+                                floor_cents=args.m10_exit_floor,
+                                spread_cents=args.m10_est_spread,
+                            )
+                            exit_price = (
+                                exit_price_est if args.m10_exit_mode == "bounds"
+                                else exit_price_floor
+                            )
+                            m10_quality = "GOOD" if not ((side == "yes" and label == 1) or (side == "no" and label == 0)) else "BAD"
 
             won = (side == "yes" and label == 1) or (side == "no" and label == 0)
-            outcome = "PL" if m10x else ("WIN" if won else "LOSS")
+            if m10x:
+                pnl_per = (int(exit_price) - ENTRY_CENTS) if exit_price is not None else 0
+                if pnl_per > 0:
+                    outcome = "WIN_EXIT"
+                elif pnl_per < 0:
+                    outcome = "LOSS_EXIT"
+                else:
+                    outcome = "FLAT_EXIT"
+            else:
+                outcome = "WIN" if won else "LOSS"
             signals.append({
                 "ts": cdt, "asset": target, "side": side.upper(), "m0_prob": prob,
                 "m10_exit": m10x, "exit_price": exit_price,
+                "exit_price_floor": exit_price_floor,
+                "exit_price_est": exit_price_est,
+                "m10_prob": m10_prob,
+                "m10_quality": m10_quality,
                 "outcome": outcome, "won": won, "won_settlement": won,
             })
             ct_count += 1
@@ -482,11 +476,14 @@ def main():
         print("No signals generated"); return
 
     # Results
-    wins = (df_sig["outcome"] == "WIN").sum()
-    losses = (df_sig["outcome"] == "LOSS").sum()
-    pls = (df_sig["outcome"] == "PL").sum()
+    wins = df_sig["outcome"].isin(["WIN", "WIN_EXIT"]).sum()
+    losses = df_sig["outcome"].isin(["LOSS", "LOSS_EXIT"]).sum()
+    flats = (df_sig["outcome"] == "FLAT_EXIT").sum()
+    realized_wr = wins / (wins + losses) * 100 if (wins + losses) > 0 else 0
     entry_wr = df_sig["won_settlement"].mean() * 100
-    held_wr = wins / (wins + losses) * 100 if (wins + losses) > 0 else 0
+    held_wins = (df_sig["outcome"] == "WIN").sum()
+    held_losses = (df_sig["outcome"] == "LOSS").sum()
+    held_wr = held_wins / (held_wins + held_losses) * 100 if (held_wins + held_losses) > 0 else 0
 
     print(f"\n{'=' * 80}")
     print(f"ENTRY-ONLY (M0, no M10 exit)")
@@ -501,33 +498,50 @@ def main():
     print(f"\n{'=' * 80}")
     print(f"WITH M10 EXIT")
     print(f"{'=' * 80}")
-    print(f"  Held: {wins + losses} | Exits: {pls} | W:{wins} L:{losses} PL:{pls}")
+    print(f"  Realized outcomes: W:{wins} L:{losses} F:{flats} | Total: {wins + losses + flats}")
+    print(f"  Realized WR (W/(W+L)): {realized_wr:.1f}%")
     print(f"  Held WR: {held_wr:.1f}%")
-    if pls > 0:
+    if int(df_sig["m10_exit"].sum()) > 0:
         ex = df_sig[df_sig["m10_exit"]]
         good = (~ex["won_settlement"]).sum()
         bad = ex["won_settlement"].sum()
-        print(f"  M10: {good} good / {bad} bad ({good / (good + bad) * 100:.0f}% acc)" if (good + bad) > 0 else "")
+        exit_win = (ex["outcome"] == "WIN_EXIT").sum()
+        exit_loss = (ex["outcome"] == "LOSS_EXIT").sum()
+        exit_flat = (ex["outcome"] == "FLAT_EXIT").sum()
+        if (good + bad) > 0:
+            print(f"  M10 quality vs settlement: {good} good / {bad} bad ({good / (good + bad) * 100:.0f}% acc)")
+        print(f"  M10 realized exits: W:{exit_win} L:{exit_loss} F:{exit_flat}")
+        if args.m10_exit_mode == "bounds":
+            ex_floor = ex["exit_price_floor"].dropna().astype(float)
+            ex_est = ex["exit_price_est"].dropna().astype(float)
+            if len(ex_floor) > 0 and len(ex_est) > 0:
+                print(
+                    f"  M10 exit price bounds: floor avg={ex_floor.mean():.1f}c | "
+                    f"est avg={ex_est.mean():.1f}c"
+                )
 
     # P&L with daily loss cap
     balance = STARTING_BALANCE
     peak = balance
     max_dd = max_dd_dollars = max_dd_peak = max_dd_trough = 0
     bets_placed = bets_skipped = 0
-    pnl_wins = pnl_losses = pnl_exits = 0
+    pnl_wins = pnl_losses = pnl_exit_net = 0
     current_day = None
     day_start = balance
     day_halted = False
+    loss_cap = max(0.0, float(args.daily_loss_cap))
+    loss_cap_enabled = loss_cap > 0
 
     for _, group in df_sig.groupby(df_sig["ts"].dt.floor("15min")):
         window_bets = group.nlargest(MAX_PER_WINDOW, "m0_prob")
         for _, row in window_bets.iterrows():
-            bet_day = row["ts"].strftime("%m/%d")
-            if bet_day != current_day:
-                current_day = bet_day; day_start = balance; day_halted = False
-            if day_halted: bets_skipped += 1; continue
-            if day_start > 0 and (day_start - balance) / day_start >= DAILY_LOSS_CAP:
-                day_halted = True; bets_skipped += 1; continue
+            if loss_cap_enabled:
+                bet_day = row["ts"].strftime("%m/%d")
+                if bet_day != current_day:
+                    current_day = bet_day; day_start = balance; day_halted = False
+                if day_halted: bets_skipped += 1; continue
+                if day_start > 0 and (day_start - balance) / day_start >= loss_cap:
+                    day_halted = True; bets_skipped += 1; continue
 
             risk = balance * RISK_PCT
             contracts = max(1, min(int(risk / (ENTRY_CENTS / 100)), MAX_CONTRACTS))
@@ -539,12 +553,15 @@ def main():
                 p = contracts * ((100 - ENTRY_CENTS) / 100); balance += p; pnl_wins += p
             elif row["outcome"] == "LOSS":
                 balance -= cost; pnl_losses += cost
-            elif row["outcome"] == "PL":
-                ep = int(row.get("exit_price", M10_EXIT_CENTS))
+            elif row["m10_exit"]:
+                ep = row.get("exit_price")
+                if pd.isna(ep):
+                    raise RuntimeError("M10 exit signal missing exit_price")
+                ep = int(ep)
                 pnl_per = (ep - ENTRY_CENTS) / 100
                 exit_pnl = contracts * pnl_per
                 balance += exit_pnl
-                pnl_exits += abs(exit_pnl) if exit_pnl < 0 else -exit_pnl
+                pnl_exit_net += exit_pnl
 
             if balance > peak: peak = balance
             dd = (peak - balance) / peak * 100
@@ -552,42 +569,103 @@ def main():
             if dd > max_dd:
                 max_dd = dd; max_dd_dollars = dd_d; max_dd_peak = peak; max_dd_trough = balance
 
+    floor_balance = None
+    floor_net_pnl = None
+    if args.m10_exit_mode == "bounds":
+        floor_balance = STARTING_BALANCE
+        floor_pnl_wins = floor_pnl_losses = floor_pnl_exit = 0.0
+        floor_current_day = None
+        floor_day_start = floor_balance
+        floor_day_halted = False
+        for _, group in df_sig.groupby(df_sig["ts"].dt.floor("15min")):
+            window_bets = group.nlargest(MAX_PER_WINDOW, "m0_prob")
+            for _, row in window_bets.iterrows():
+                if loss_cap_enabled:
+                    bet_day = row["ts"].strftime("%m/%d")
+                    if bet_day != floor_current_day:
+                        floor_current_day = bet_day
+                        floor_day_start = floor_balance
+                        floor_day_halted = False
+                    if floor_day_halted:
+                        continue
+                    if floor_day_start > 0 and (floor_day_start - floor_balance) / floor_day_start >= loss_cap:
+                        floor_day_halted = True
+                        continue
+
+                risk = floor_balance * RISK_PCT
+                contracts = max(1, min(int(risk / (ENTRY_CENTS / 100)), MAX_CONTRACTS))
+                cost = contracts * (ENTRY_CENTS / 100)
+                if cost > floor_balance:
+                    continue
+
+                if row["outcome"] == "WIN":
+                    p = contracts * ((100 - ENTRY_CENTS) / 100)
+                    floor_balance += p
+                    floor_pnl_wins += p
+                elif row["outcome"] == "LOSS":
+                    floor_balance -= cost
+                    floor_pnl_losses += cost
+                elif row["m10_exit"]:
+                    ep_floor = row.get("exit_price_floor")
+                    ep = int(ep_floor) if not pd.isna(ep_floor) else int(row["exit_price"])
+                    exit_pnl = contracts * ((ep - ENTRY_CENTS) / 100)
+                    floor_balance += exit_pnl
+                    floor_pnl_exit += exit_pnl
+        floor_net_pnl = floor_pnl_wins - floor_pnl_losses + floor_pnl_exit
+
     ret = (balance - STARTING_BALANCE) / STARTING_BALANCE * 100
-    net_pnl = pnl_wins - pnl_losses - pnl_exits
+    net_pnl = pnl_wins - pnl_losses + pnl_exit_net
     print(f"\n{'=' * 80}")
     print(f"P&L: ${STARTING_BALANCE} start, {RISK_PCT*100:.0f}% risk, max {MAX_PER_WINDOW}/window")
     print(f"{'=' * 80}")
-    print(f"  Bets: {bets_placed} (skipped {bets_skipped} from daily cap)")
+    if loss_cap_enabled:
+        print(f"  Bets: {bets_placed} (skipped {bets_skipped} from daily cap @ {loss_cap:.0%})")
+    else:
+        print(f"  Bets: {bets_placed} (daily cap disabled)")
     print(f"  Gross won:   ${pnl_wins:+,.2f}")
     print(f"  Gross lost:  ${-pnl_losses:+,.2f}")
-    print(f"  Early exits: ${-pnl_exits:+,.2f}")
+    print(f"  Early exits: ${pnl_exit_net:+,.2f}")
     print(f"  Net P&L:     ${net_pnl:+,.2f}")
     print(f"  Start: ${STARTING_BALANCE:.0f} → End: ${balance:,.2f} ({ret:+,.1f}%)")
+    if floor_balance is not None and floor_net_pnl is not None:
+        floor_ret = (floor_balance - STARTING_BALANCE) / STARTING_BALANCE * 100
+        print(
+            f"  Bounds (floor vs est): End ${floor_balance:,.2f} ({floor_ret:+,.1f}%) "
+            f"→ ${balance:,.2f} ({ret:+,.1f}%)"
+        )
     print(f"  Max DD: {max_dd:.1f}% (${max_dd_dollars:,.2f} — ${max_dd_peak:,.2f} to ${max_dd_trough:,.2f})")
 
     # Daily
     def sig_pnl(row):
-        if row["outcome"] == "WIN": return (100 - ENTRY_CENTS) / 100
-        elif row["outcome"] == "LOSS": return -ENTRY_CENTS / 100
-        else: return (row.get("exit_price", M10_EXIT_CENTS) - ENTRY_CENTS) / 100
+        if row["outcome"] == "WIN":
+            return (100 - ENTRY_CENTS) / 100
+        if row["outcome"] == "LOSS":
+            return -ENTRY_CENTS / 100
+        ep = row.get("exit_price")
+        if pd.isna(ep):
+            raise RuntimeError("M10 exit signal missing exit_price in daily P&L")
+        return (float(ep) - ENTRY_CENTS) / 100
     df_sig["flat_pnl"] = df_sig.apply(sig_pnl, axis=1)
     df_sig["date"] = df_sig["ts"].apply(lambda t: t.strftime("%m/%d"))
     daily = df_sig.groupby("date").agg(
         bets=("outcome", "count"),
-        wins=("outcome", lambda x: (x == "WIN").sum()),
-        losses=("outcome", lambda x: (x == "LOSS").sum()),
-        exits=("outcome", lambda x: (x == "PL").sum()),
+        wins=("outcome", lambda x: x.isin(["WIN", "WIN_EXIT"]).sum()),
+        losses=("outcome", lambda x: x.isin(["LOSS", "LOSS_EXIT"]).sum()),
+        flats=("outcome", lambda x: (x == "FLAT_EXIT").sum()),
+        exits=("m10_exit", "sum"),
         pnl=("flat_pnl", "sum"),
     )
-    daily["wr"] = daily["wins"] / (daily["wins"] + daily["losses"]) * 100
+    daily["true_wr"] = daily["wins"] / (daily["wins"] + daily["losses"]) * 100
 
-    print(f"\n{'Date':<8} {'Bets':>5} {'W':>3} {'L':>3} {'PL':>3} {'WR':>6} {'P&L':>8}")
+    print(f"\n{'Date':<8} {'Bets':>5} {'W':>3} {'L':>3} {'F':>3} {'MX':>3} {'TWR':>6} {'P&L':>8}")
     print("-" * 42)
     for date, row in daily.iterrows():
-        held = int(row["wins"] + row["losses"])
-        wr_str = f"{row['wr']:.0f}%" if held > 0 else "  --"
-        print(f"{date:<8} {int(row['bets']):>5} {int(row['wins']):>3} {int(row['losses']):>3} "
-              f"{int(row['exits']):>3} {wr_str:>6} ${row['pnl']:>+6.1f}")
+        denom = int(row["wins"] + row["losses"])
+        wr_str = f"{row['true_wr']:.0f}%" if denom > 0 else "  --"
+        print(
+            f"{date:<8} {int(row['bets']):>5} {int(row['wins']):>3} {int(row['losses']):>3} "
+            f"{int(row['flats']):>3} {int(row['exits']):>3} {wr_str:>6} ${row['pnl']:>+6.1f}"
+        )
 
     wd = (daily["pnl"] > 0).sum()
     ld = (daily["pnl"] < 0).sum()
@@ -598,12 +676,19 @@ def main():
     for a in ["BTC", "ETH", "SOL", "XRP"]:
         ad = df_sig[df_sig["asset"] == a]
         if len(ad) == 0: continue
-        aw = (ad["outcome"] == "WIN").sum()
-        al = (ad["outcome"] == "LOSS").sum()
-        ap = (ad["outcome"] == "PL").sum()
+        aw = ad["outcome"].isin(["WIN", "WIN_EXIT"]).sum()
+        al = ad["outcome"].isin(["LOSS", "LOSS_EXIT"]).sum()
+        af = (ad["outcome"] == "FLAT_EXIT").sum()
+        amx = int(ad["m10_exit"].sum())
         awr = ad["won_settlement"].mean() * 100
         ahwr = aw / (aw + al) * 100 if (aw + al) > 0 else 0
-        print(f"    {a}: {len(ad)} sig, Entry:{awr:.0f}%, Held:{ahwr:.0f}%, W:{aw} L:{al} PL:{ap}")
+        held_w = (ad["outcome"] == "WIN").sum()
+        held_l = (ad["outcome"] == "LOSS").sum()
+        held_wr = held_w / (held_w + held_l) * 100 if (held_w + held_l) > 0 else 0
+        print(
+            f"    {a}: {len(ad)} sig, Entry:{awr:.0f}%, Real:{ahwr:.0f}%, "
+            f"Held:{held_wr:.0f}%, W:{aw} L:{al} F:{af} M10X:{amx}"
+        )
 
 
 if __name__ == "__main__":

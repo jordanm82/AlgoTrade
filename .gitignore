@@ -1,0 +1,29 @@
+# Credentials
+cdp_api_key.json
+KalshiPrimaryKey.txt
+.env
+*.pem
+*.key
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Data
+src/data/temp_data/
+*.csv
+data/store/*
+!data/store/backtest_final_results.csv
+
+# OS
+.DS_Store
+
+# Local tooling
+.claude/worktrees/
+
+# Local keys / credentials
+KalshiDemoKeys.txt

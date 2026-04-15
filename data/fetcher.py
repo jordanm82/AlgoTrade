@@ -1,8 +1,7 @@
 import ccxt
-import json
 import pandas as pd
 import time
-from config.settings import DEFAULT_CANDLE_LIMIT, CDP_KEY_FILE
+from config.settings import DEFAULT_CANDLE_LIMIT
 
 
 class DataFetcher:
@@ -13,11 +12,10 @@ class DataFetcher:
 
     def _get_exchange(self):
         if self._exchange is None:
-            with open(str(CDP_KEY_FILE)) as f:
-                keys = json.load(f)
+            # Public market-data client for candles.
+            # Candles do not require authenticated brokerage endpoints; using
+            # public mode avoids auth-induced 401s on transaction_summary.
             self._exchange = ccxt.coinbase({
-                "apiKey": keys.get("name", ""),
-                "secret": keys.get("privateKey", ""),
                 "enableRateLimit": True,
             })
         return self._exchange
@@ -40,7 +38,16 @@ class DataFetcher:
         if timeframe == "4h":
             return self._fetch_4h(cb_symbol, limit, since)
 
-        raw = exchange.fetch_ohlcv(cb_symbol, timeframe, since=since, limit=limit)
+        import time as _time
+        for attempt in range(3):
+            try:
+                raw = exchange.fetch_ohlcv(cb_symbol, timeframe, since=since, limit=limit)
+                break
+            except Exception:
+                if attempt < 2:
+                    _time.sleep(2 * (attempt + 1))
+                else:
+                    raise
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         df = df.set_index("timestamp")
@@ -49,8 +56,17 @@ class DataFetcher:
     def _fetch_4h(self, symbol: str, limit: int, since: int | None) -> pd.DataFrame:
         """Synthesize 4h candles from 1h data."""
         # Fetch 4x the 1h candles needed
+        import time as _time
         h_limit = min(limit * 4, 1000)
-        raw = self._get_exchange().fetch_ohlcv(symbol, "1h", since=since, limit=h_limit)
+        for attempt in range(3):
+            try:
+                raw = self._get_exchange().fetch_ohlcv(symbol, "1h", since=since, limit=h_limit)
+                break
+            except Exception:
+                if attempt < 2:
+                    _time.sleep(2 * (attempt + 1))
+                else:
+                    raise
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         df = df.set_index("timestamp")

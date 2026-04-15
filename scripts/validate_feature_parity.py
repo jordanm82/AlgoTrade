@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Validate that live predict_knn() produces identical features to training.
+"""Validate parity diagnostics for current per-asset M0/M10 feature sets.
 
-Fetches recent 15m/1h/4h data, then for each completed 15m candle:
-1. Extracts features using the TRAINING path (build_model.py logic)
-2. Extracts features using the LIVE path (predict_knn with snapshot)
-3. Compares them and reports any discrepancies
+What this validates:
+1) M0 live-vs-recomputed parity on recent feature_log windows, using each
+   asset model's exact `feature_names`.
+2) M10 feature-set coverage: for each asset model, verify every model feature
+   is produced and finite in the current reference feature builder.
 
 Usage:
     ./venv/bin/python scripts/validate_feature_parity.py
+    ./venv/bin/python scripts/validate_feature_parity.py --last 30 --tolerance 1e-4
 """
+
+import argparse
+import json
+import pickle
 import sys
-import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -20,16 +27,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.fetcher import DataFetcher
 from data.indicators import add_indicators
-from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3
+from scripts.backtest_kalshi_labels import build_features
 
-FEATURE_NAMES = [
-    "rsi_15m", "stochrsi_15m", "macd_15m", "norm_return",
-    "vol_ratio", "bb_position", "ema_slope", "adx", "roc_5",
-    "rsi_1h", "macd_1h", "rsi_4h",
-    "price_vs_ema", "hourly_return", "trend_direction",
-]
-
-ASSETS = {
+ASSETS_SYMS = {
     "BTC": "BTC/USD",
     "ETH": "ETH/USD",
     "SOL": "SOL/USD",
@@ -37,286 +37,486 @@ ASSETS = {
 }
 
 
-def fetch_candles(fetcher, symbol, timeframe, days):
-    all_frames = []
-    now_ms = int(time.time() * 1000)
-    since = now_ms - days * 86400 * 1000
-    batch_size = 300
-    tf_ms = {"5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000}
-    candle_ms = tf_ms.get(timeframe, 900000)
-    while since < now_ms:
-        try:
-            df = fetcher.ohlcv(symbol, timeframe, limit=batch_size, since=since)
-            if df is None or df.empty:
-                since += batch_size * candle_ms; time.sleep(0.3); continue
-            all_frames.append(df)
-            since = int(df.index[-1].timestamp() * 1000) + candle_ms
-            time.sleep(0.3)
-        except Exception as e:
-            since += batch_size * candle_ms; time.sleep(1)
-    if not all_frames:
-        return pd.DataFrame()
-    combined = pd.concat(all_frames)
-    return combined[~combined.index.duplicated(keep="first")].sort_index()
+def _safe_float(v, default=None):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    if np.isnan(x) or np.isinf(x):
+        return default
+    return x
 
 
-def extract_training_features(df_15m, df_1h, df_4h, row_idx):
-    """Extract features for a single row using TRAINING logic (build_model.py)."""
-    df = add_indicators(df_15m.copy())
-    df_1h_ind = add_indicators(df_1h.copy()) if df_1h is not None else None
-    df_4h_ind = add_indicators(df_4h.copy()) if df_4h is not None else None
+def _load_feature_names(prefix: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for asset in ASSETS_SYMS:
+        path = Path(f"models/{prefix}_{asset.lower()}.pkl")
+        if not path.exists():
+            continue
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        names = data.get("feature_names")
+        if isinstance(names, (list, tuple)) and names:
+            out[asset] = list(names)
+    return out
 
-    pct = df["close"].pct_change()
-    df["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
-    df["vol_ratio"] = df["volume"] / df["vol_sma_20"]
-    bb_range = df["bb_upper"] - df["bb_lower"]
-    df["bb_position"] = (df["close"] - df["bb_lower"]) / bb_range.replace(0, np.nan)
-    df["ema_slope"] = df["ema_12"].pct_change(3) * 100
-    df["price_vs_ema"] = (df["close"] - df["sma_20"]) / df["atr"].replace(0, np.nan)
-    df["hourly_return"] = df["close"].pct_change(4) * 100
 
-    i = row_idx
-    t = df.index[i]
-    r = df.iloc[i]
+def _infer_asset(entry: dict) -> str | None:
+    raw = str(entry.get("asset", "")).upper()
+    if raw in ASSETS_SYMS:
+        return raw
 
-    vals = [
-        float(r.get("rsi", np.nan)),
-        float(r.get("stochrsi_k", np.nan)),
-        float(r.get("macd_hist", np.nan)),
-        float(r.get("norm_return", np.nan)),
-        float(r.get("vol_ratio", np.nan)),
-        float(r.get("bb_position", np.nan)),
-        float(r.get("ema_slope", np.nan)),
-        float(r.get("adx", np.nan)),
-        float(r.get("roc_5", np.nan)),
-    ]
-    if any(pd.isna(v) or np.isinf(v) for v in vals):
+    close = _safe_float(entry.get("close"), None)
+    if close is None:
         return None
+    if close > 10000:
+        return "BTC"
+    if close > 500:
+        return "ETH"
+    if close > 10:
+        return "SOL"
+    if close > 0:
+        return "XRP"
+    return None
 
-    if df_1h_ind is not None:
-        mask = df_1h_ind.index <= t
-        if mask.sum() >= 20:
-            r1h = df_1h_ind.loc[mask].iloc[-1]
-            vals.append(float(r1h.get("rsi", 50)))
-            vals.append(float(r1h.get("macd_hist", 0)))
+
+def _floor_ws(ts: datetime) -> datetime:
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        ts = ts.replace(tzinfo=None)
+    return ts.replace(minute=ts.minute - (ts.minute % 15), second=0, microsecond=0)
+
+
+def _read_feature_log(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    if not path.exists():
+        return rows
+
+    with open(path) as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            ts_raw = row.get("ts")
+            if not ts_raw:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+            except ValueError:
+                continue
+
+            asset = _infer_asset(row)
+            if asset is None:
+                continue
+
+            row["_asset"] = asset
+            row["_ts"] = ts
+            row["_ws"] = _floor_ws(ts)
+            rows.append(row)
+
+    return rows
+
+
+def _prepare_indicators(fetcher: DataFetcher) -> dict[str, dict[str, pd.DataFrame | None]]:
+    out: dict[str, dict[str, pd.DataFrame | None]] = {}
+
+    for asset, symbol in ASSETS_SYMS.items():
+        df_15m = add_indicators(fetcher.ohlcv(symbol, "15m", limit=260))
+        raw_1h = fetcher.ohlcv(symbol, "1h", limit=160)
+        raw_4h = fetcher.ohlcv(symbol, "4h", limit=110)
+
+        df_1h = add_indicators(raw_1h.iloc[:-1]) if raw_1h is not None and len(raw_1h) > 1 else None
+        df_4h = add_indicators(raw_4h.iloc[:-1]) if raw_4h is not None and len(raw_4h) > 1 else None
+
+        pct = df_15m["close"].pct_change()
+        df_15m["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
+        df_15m["vol_ratio"] = df_15m["volume"] / df_15m["vol_sma_20"]
+        df_15m["ema_slope"] = df_15m["ema_12"].pct_change(3) * 100
+        df_15m["price_vs_ema"] = (df_15m["close"] - df_15m["sma_20"]) / df_15m["atr"].replace(0, np.nan)
+        df_15m["hourly_return"] = df_15m["close"].pct_change(4) * 100
+
+        out[asset] = {"15m": df_15m, "1h": df_1h, "4h": df_4h}
+
+    return out
+
+
+def _atr_percentile(df_15m: pd.DataFrame, ws: datetime) -> float:
+    atr_s = df_15m["atr"].dropna()
+    if atr_s.empty:
+        return 0.5
+    r20 = atr_s.rolling(20)
+    atr_p = ((atr_s - r20.min()) / (r20.max() - r20.min())).fillna(0.5)
+    hist = atr_p[atr_p.index < ws]
+    if len(hist) == 0:
+        return 0.5
+    return float(hist.iloc[-1])
+
+
+def _compute_regime(df_15m: pd.DataFrame, df_1h: pd.DataFrame | None,
+                    df_4h: pd.DataFrame | None, ws: datetime, atr: float) -> dict:
+    out: dict[str, float] = {}
+
+    prev_c = df_15m[df_15m.index < ws]
+    if len(prev_c) >= 16:
+        out["return_4h"] = (
+            (float(prev_c.iloc[-1]["close"]) - float(prev_c.iloc[-16]["close"]))
+            / float(prev_c.iloc[-16]["close"]) * 100
+        )
+    else:
+        out["return_4h"] = 0.0
+
+    if len(prev_c) >= 48:
+        out["return_12h"] = (
+            (float(prev_c.iloc[-1]["close"]) - float(prev_c.iloc[-48]["close"]))
+            / float(prev_c.iloc[-48]["close"]) * 100
+        )
+    else:
+        out["return_12h"] = 0.0
+
+    if df_1h is not None:
+        h1 = df_1h[df_1h.index < ws]
+        if len(h1) >= 20 and atr > 0:
+            out["price_vs_sma_1h"] = (
+                float(h1.iloc[-1]["close"]) - float(h1["close"].rolling(20).mean().iloc[-1])
+            ) / atr
         else:
-            return None
+            out["price_vs_sma_1h"] = 0.0
     else:
-        vals.extend([50.0, 0.0])
+        out["price_vs_sma_1h"] = 0.0
 
-    if df_4h_ind is not None:
-        mask = df_4h_ind.index <= t
-        if mask.sum() >= 10:
-            vals.append(float(df_4h_ind.loc[mask].iloc[-1].get("rsi", 50)))
+    if df_4h is not None:
+        h4 = df_4h[df_4h.index < ws]
+        if len(h4) >= 4:
+            out["lower_lows_4h"] = float(
+                sum(1 for i in range(-3, 0) if float(h4.iloc[i]["low"]) < float(h4.iloc[i - 1]["low"]))
+            )
         else:
-            return None
+            out["lower_lows_4h"] = 0.0
+        if len(h4) >= 10 and atr > 0:
+            out["trend_strength"] = (
+                float(h4.iloc[-1]["close"]) - float(h4["close"].rolling(10).mean().iloc[-1])
+            ) / atr
+        else:
+            out["trend_strength"] = 0.0
     else:
-        vals.append(50.0)
+        out["lower_lows_4h"] = 0.0
+        out["trend_strength"] = 0.0
 
-    pve = float(r.get("price_vs_ema", np.nan))
-    hr = float(r.get("hourly_return", np.nan))
-    adx_val = float(r.get("adx", 20))
-    close_val = float(r.get("close", 0))
-    sma_val = float(r.get("sma_20", 0))
-
-    if pd.isna(pve) or np.isinf(pve):
-        pve = 0
-    if pd.isna(hr) or np.isinf(hr):
-        hr = 0
-
-    if sma_val > 0:
-        trend_sign = 1 if close_val >= sma_val else -1
-    else:
-        trend_sign = 0
-    trend_dir = adx_val * trend_sign
-
-    vals.append(pve)
-    vals.append(hr)
-    vals.append(trend_dir)
-
-    if any(pd.isna(v) or np.isinf(v) for v in vals):
-        return None
-    return vals
+    return out
 
 
-def main():
-    print("=" * 70)
-    print("FEATURE PARITY + MODEL DISTRIBUTION VALIDATION")
-    print("=" * 70)
+def _compute_confluence(asset: str, ws: datetime, ind_data: dict[str, dict], entry: dict | None) -> dict:
+    alt_assets = [a for a in ASSETS_SYMS if a != asset]
+    alt_rsi_15m: list[float] = []
+    alt_rsi_1h: list[float] = []
+    alt_momentum: list[int] = []
 
-    fetcher = DataFetcher()
-    predictor = KalshiPredictorV3()
+    for alt in alt_assets:
+        alt_15m = ind_data[alt]["15m"]
+        alt_1h = ind_data[alt]["1h"]
 
-    if predictor._knn is None:
-        print("ERROR: No model loaded!")
-        return
+        alt_15m_f = alt_15m[alt_15m.index < ws]
+        if len(alt_15m_f) >= 2:
+            rsi_v = _safe_float(alt_15m_f.iloc[-1].get("rsi", 50), 50.0)
+            alt_rsi_15m.append(rsi_v)
+            alt_momentum.append(1 if rsi_v >= 50 else -1)
 
-    scaler = predictor._knn_scaler
-    model = predictor._knn
+        if alt_1h is not None:
+            alt_1h_f = alt_1h[alt_1h.index < ws]
+            if len(alt_1h_f) >= 2:
+                alt_rsi_1h.append(_safe_float(alt_1h_f.iloc[-1].get("rsi", 50), 50.0))
 
-    total_yes, total_no, total_skip = 0, 0, 0
-    total_match, total_mismatch = 0, 0
+    out = {
+        "alt_rsi_avg": sum(alt_rsi_15m) / len(alt_rsi_15m) if alt_rsi_15m else 50.0,
+        "alt_rsi_1h_avg": sum(alt_rsi_1h) / len(alt_rsi_1h) if alt_rsi_1h else 50.0,
+        "alt_momentum_align": float(sum(alt_momentum)) if alt_momentum else 0.0,
+        # Exact recompute requires Kalshi alt strikes; use logged if available, else 0.
+        "alt_distance_avg": _safe_float((entry or {}).get("alt_distance_avg"), 0.0),
+    }
+    return out
 
-    for asset_name, symbol in ASSETS.items():
-        print(f"\n{'─' * 70}")
-        print(f"  {asset_name} ({symbol})")
-        print(f"{'─' * 70}")
 
-        df_15m = fetch_candles(fetcher, symbol, "15m", 30)
-        df_1h = fetch_candles(fetcher, symbol, "1h", 30)
-        df_4h = fetch_candles(fetcher, symbol, "4h", 30)
+def _build_m0_features(entry: dict, ind_data: dict[str, dict]) -> tuple[dict | None, str | None]:
+    asset = entry["_asset"]
+    ws = entry["_ws"]
 
-        if df_15m.empty:
-            print(f"  No data!")
+    df_15m = ind_data[asset]["15m"]
+    df_1h = ind_data[asset]["1h"]
+    df_4h = ind_data[asset]["4h"]
+
+    prev_c = df_15m[df_15m.index < ws]
+    if len(prev_c) < 20:
+        return None, "not enough 15m history"
+
+    prev = prev_c.iloc[-1]
+    atr = _safe_float(prev.get("atr"), None)
+    if atr is None or atr <= 0:
+        return None, "invalid ATR"
+
+    distance = _safe_float(entry.get("distance_from_strike"), None)
+    if distance is None:
+        return None, "missing distance_from_strike"
+
+    kx = {
+        "strike_delta": _safe_float(entry.get("strike_delta"), 0.0),
+        "strike_trend_3": _safe_float(entry.get("strike_trend_3"), 0.0),
+    }
+    kx.update(_compute_confluence(asset, ws, ind_data, entry))
+    kx.update(_compute_regime(df_15m, df_1h, df_4h, ws, atr))
+
+    feat = build_features(
+        prev,
+        df_1h,
+        df_4h,
+        ws,
+        distance,
+        kalshi_extra=kx,
+        atr_pctile_val=_atr_percentile(df_15m, ws),
+    )
+    if not feat:
+        return None, "build_features returned None"
+
+    return feat, None
+
+
+def _build_m10_features(asset: str, ws: datetime, ind_data: dict[str, dict],
+                        fetcher: DataFetcher) -> tuple[dict | None, str | None]:
+    df_15m = ind_data[asset]["15m"]
+    df_1h = ind_data[asset]["1h"]
+    df_4h = ind_data[asset]["4h"]
+
+    prev_c = df_15m[df_15m.index < ws]
+    if len(prev_c) < 20:
+        return None, "not enough 15m history"
+
+    prev = prev_c.iloc[-1]
+    atr = _safe_float(prev.get("atr"), None)
+    if atr is None or atr <= 0:
+        return None, "invalid ATR"
+
+    kx = {
+        "strike_delta": 0.0,
+        "strike_trend_3": 0.0,
+        "alt_distance_avg": 0.0,
+    }
+    kx.update(_compute_confluence(asset, ws, ind_data, entry=None))
+    kx.update(_compute_regime(df_15m, df_1h, df_4h, ws, atr))
+
+    feat = build_features(
+        prev,
+        df_1h,
+        df_4h,
+        ws,
+        0.0,
+        kalshi_extra=kx,
+        atr_pctile_val=_atr_percentile(df_15m, ws),
+    )
+    if not feat:
+        return None, "build_features returned None"
+
+    # M10-only intra-window features
+    feat["price_move_atr"] = 0.0
+    feat["candle1_range_atr"] = 0.0
+    feat["candle2_range_atr"] = 0.0
+    feat["momentum_shift"] = 0.0
+    feat["volume_acceleration"] = 1.0
+
+    # Try to compute live-style intra-window values from 1m candles.
+    try:
+        df_1m = fetcher.ohlcv(ASSETS_SYMS[asset], "1m", limit=60)
+        if df_1m is not None and len(df_1m) >= 10:
+            min5 = ws + timedelta(minutes=5)
+            min10 = ws + timedelta(minutes=10)
+            c1 = df_1m[(df_1m.index >= ws) & (df_1m.index < min5)]
+            c2 = df_1m[(df_1m.index >= min5) & (df_1m.index < min10)]
+            if len(c1) >= 3 and len(c2) >= 3 and atr > 0:
+                c1_open = float(c1.iloc[0]["open"])
+                c1_close = float(c1.iloc[-1]["close"])
+                c1_high = float(c1["high"].max())
+                c1_low = float(c1["low"].min())
+                c1_vol = float(c1["volume"].sum())
+
+                c2_close = float(c2.iloc[-1]["close"])
+                c2_high = float(c2["high"].max())
+                c2_low = float(c2["low"].min())
+                c2_vol = float(c2["volume"].sum())
+
+                feat["price_move_atr"] = (c2_close - c1_open) / atr
+                feat["candle1_range_atr"] = (c1_high - c1_low) / atr
+                feat["candle2_range_atr"] = (c2_high - c2_low) / atr
+                feat["momentum_shift"] = (c2_close - c1_close) / atr
+                feat["volume_acceleration"] = c2_vol / c1_vol if c1_vol > 0 else 1.0
+    except Exception:
+        pass
+
+    return feat, None
+
+
+def _compare_feature_dict(live_entry: dict, recomputed: dict, features: list[str],
+                          tolerance: float) -> list[dict]:
+    diffs = []
+    for name in features:
+        lv = live_entry.get(name)
+        rv = recomputed.get(name)
+        lvf = _safe_float(lv, None)
+        rvf = _safe_float(rv, None)
+
+        if lvf is None or rvf is None:
+            diffs.append({
+                "feature": name,
+                "live": lv,
+                "recomputed": rv,
+                "diff": None,
+                "reason": "missing_or_non_numeric",
+            })
             continue
 
-        print(f"  {len(df_15m)} 15m candles")
+        diff = abs(lvf - rvf)
+        if diff > tolerance:
+            diffs.append({
+                "feature": name,
+                "live": lvf,
+                "recomputed": rvf,
+                "diff": diff,
+                "reason": "value_mismatch",
+            })
+    return diffs
 
-        df_15m_ind = add_indicators(df_15m.copy())
-        df_1h_ind = add_indicators(df_1h.copy()) if df_1h is not None else None
-        df_4h_ind = add_indicators(df_4h.copy()) if df_4h is not None else None
 
-        # Parity check (last 10 candles)
-        match_count, mismatch_count = 0, 0
-        for offset in range(10, 0, -1):
-            row_idx = len(df_15m_ind) - offset - 1
-            if row_idx < 210:
-                continue
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--last", type=int, default=20, help="Use last N deduped M0 predictions from feature_log")
+    parser.add_argument("--tolerance", type=float, default=1e-4, help="Absolute diff tolerance")
+    parser.add_argument("--show", type=int, default=10, help="Max mismatch lines to print per asset")
+    args = parser.parse_args()
 
-            train_feats = extract_training_features(df_15m, df_1h, df_4h, row_idx)
-            if train_feats is None:
-                continue
+    m0_features = _load_feature_names("m0")
+    m10_features = _load_feature_names("m10")
 
-            # Build live input
-            t = df_15m_ind.index[row_idx]
-            live_df = df_15m_ind.iloc[:row_idx + 1].copy()
-            synthetic = live_df.iloc[-1:].copy()
-            synthetic.index = synthetic.index + pd.Timedelta(minutes=15)
-            live_df = pd.concat([live_df, synthetic])
+    print("=" * 100)
+    print("FEATURE PARITY VALIDATION (per-asset M0/M10)")
+    print("=" * 100)
+    print(f"Loaded M0 models: {len(m0_features)} | Loaded M10 models: {len(m10_features)}")
+    for asset in ASSETS_SYMS:
+        m0n = len(m0_features.get(asset, []))
+        m10n = len(m10_features.get(asset, []))
+        print(f"  {asset}: M0={m0n:>2} features | M10={m10n:>2} features")
 
-            live_1h = df_1h_ind[df_1h_ind.index <= t] if df_1h_ind is not None else None
-            live_4h = df_4h_ind[df_4h_ind.index <= t] if df_4h_ind is not None else None
+    rows = _read_feature_log(Path("data/store/feature_log.jsonl"))
+    rows = [r for r in rows if r["_asset"] in m0_features]
 
-            # Extract live features (inline)
-            indicator_row = live_df.iloc[-2]
-            prev_close = float(indicator_row["close"])
-            vol_sma = float(indicator_row.get("vol_sma_20", 0))
-            bb_range_val = float(indicator_row.get("bb_upper", 0)) - float(indicator_row.get("bb_lower", 0))
+    dedup: dict[tuple[str, datetime], dict] = {}
+    for row in rows:
+        dedup[(row["_asset"], row["_ws"])] = row
+    selected = sorted(dedup.values(), key=lambda r: r["_ts"])[-args.last:]
 
-            pct = live_df["close"].iloc[:-1].pct_change()
-            norm_ret = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
+    fetcher = DataFetcher()
+    ind_data = _prepare_indicators(fetcher)
 
-            live_feats = [
-                float(indicator_row.get("rsi", 50)),
-                float(indicator_row.get("stochrsi_k", 50)),
-                float(indicator_row.get("macd_hist", 0)),
-                float(norm_ret.iloc[-1]) if pd.notna(norm_ret.iloc[-1]) else 0,
-                float(indicator_row.get("volume", 0)) / vol_sma if vol_sma > 0 else 1.0,
-                (prev_close - float(indicator_row.get("bb_lower", 0))) / bb_range_val if bb_range_val > 0 else 0.5,
-                float(live_df["ema_12"].iloc[:-1].pct_change(3).iloc[-1] * 100) if len(live_df) >= 5 and pd.notna(live_df["ema_12"].iloc[:-1].pct_change(3).iloc[-1]) else 0,
-                float(indicator_row.get("adx", 20)),
-                float(indicator_row.get("roc_5", 0)),
-            ]
-            if live_1h is not None and len(live_1h) >= 20:
-                r1h = live_1h.iloc[-1]
-                live_feats.extend([float(r1h.get("rsi", 50)), float(r1h.get("macd_hist", 0))])
+    print("\n" + "=" * 100)
+    print("M0 LIVE VS RECOMPUTED")
+    print("=" * 100)
+
+    total_checked = 0
+    total_skipped = 0
+    total_mismatch_entries = 0
+    per_asset_mismatches: dict[str, list[dict]] = defaultdict(list)
+
+    for row in selected:
+        asset = row["_asset"]
+        feats = m0_features.get(asset, [])
+        if not feats:
+            continue
+
+        rec, err = _build_m0_features(row, ind_data)
+        total_checked += 1
+        if rec is None:
+            total_skipped += 1
+            per_asset_mismatches[asset].append({
+                "feature": "<entry>",
+                "live": "n/a",
+                "recomputed": "n/a",
+                "diff": None,
+                "reason": err,
+            })
+            continue
+
+        diffs = _compare_feature_dict(row, rec, feats, args.tolerance)
+        if diffs:
+            total_mismatch_entries += 1
+            per_asset_mismatches[asset].extend(diffs)
+
+    print(f"Entries checked: {total_checked}")
+    print(f"Entries with mismatches: {total_mismatch_entries}")
+    print(f"Entries skipped: {total_skipped}")
+
+    for asset in ASSETS_SYMS:
+        diffs = per_asset_mismatches.get(asset, [])
+        if not diffs:
+            print(f"\n[{asset}] no mismatches above tolerance")
+            continue
+
+        print(f"\n[{asset}] mismatches: {len(diffs)}")
+        sorted_diffs = sorted(
+            diffs,
+            key=lambda d: d["diff"] if d["diff"] is not None else float("inf"),
+            reverse=True,
+        )
+        for d in sorted_diffs[: max(1, args.show)]:
+            if d["diff"] is None:
+                print(
+                    f"  {d['feature']:<24} live={d['live']} recomputed={d['recomputed']} diff=NA ({d['reason']})"
+                )
             else:
-                live_feats.extend([50.0, 0.0])
-            if live_4h is not None and len(live_4h) >= 10:
-                live_feats.append(float(live_4h.iloc[-1].get("rsi", 50)))
-            else:
-                live_feats.append(50.0)
-            sma_v = float(indicator_row.get("sma_20", prev_close))
-            atr_v = float(indicator_row.get("atr", 1))
-            adx_v = float(indicator_row.get("adx", 20))
-            live_feats.append((prev_close - sma_v) / atr_v if atr_v > 0 else 0)
-            if len(live_df) >= 6:
-                live_feats.append((prev_close - float(live_df.iloc[-6]["close"])) / float(live_df.iloc[-6]["close"]) * 100)
-            else:
-                live_feats.append(0)
-            ts = 1 if prev_close >= sma_v else -1
-            live_feats.append(adx_v * ts)
+                print(
+                    f"  {d['feature']:<24} live={d['live']:+.8f} recomputed={d['recomputed']:+.8f} diff={d['diff']:.8f}"
+                )
 
-            # Compare
-            all_ok = True
-            for j in range(len(FEATURE_NAMES)):
-                diff = abs(train_feats[j] - live_feats[j])
-                if diff >= 0.001:
-                    all_ok = False
-                    print(f"  MISMATCH candle {offset}: {FEATURE_NAMES[j]} train={train_feats[j]:.6f} live={live_feats[j]:.6f} diff={diff:.6f}")
-            if all_ok:
-                match_count += 1
-            else:
-                mismatch_count += 1
+    print("\n" + "=" * 100)
+    print("M10 FEATURE COVERAGE (model feature_names)")
+    print("=" * 100)
 
-        total_match += match_count
-        total_mismatch += mismatch_count
-        print(f"  Parity: {match_count}/{match_count + mismatch_count} match")
+    ws_now = _floor_ws(datetime.now(timezone.utc))
 
-        # Model distribution (last 100 candles)
-        yes_c, no_c, skip_c = 0, 0, 0
-        probs_list = []
-        for offset in range(100, 0, -1):
-            row_idx = len(df_15m_ind) - offset - 1
-            if row_idx < 210:
-                continue
+    for asset in ASSETS_SYMS:
+        feats = m10_features.get(asset, [])
+        if not feats:
+            print(f"[{asset}] no M10 model found")
+            continue
 
-            feats = extract_training_features(df_15m, df_1h, df_4h, row_idx)
-            if feats is None:
-                continue
+        rec, err = _build_m10_features(asset, ws_now, ind_data, fetcher)
+        if rec is None:
+            print(f"[{asset}] unable to build reference M10 features: {err}")
+            continue
 
-            X = np.array(feats).reshape(1, -1)
-            X_scaled = scaler.transform(X)
-            prob = float(model.predict_proba(X_scaled)[0][1])
-            probs_list.append(prob)
+        issues = []
+        for name in feats:
+            val = rec.get(name)
+            vf = _safe_float(val, None)
+            if vf is None:
+                issues.append({
+                    "feature": name,
+                    "live": "n/a",
+                    "recomputed": val,
+                    "diff": "n/a",
+                    "reason": "missing_or_non_numeric_reference",
+                })
 
-            if prob >= 0.55:
-                yes_c += 1
-            elif prob <= 0.45:
-                no_c += 1
-            else:
-                skip_c += 1
-
-        total = yes_c + no_c + skip_c
-        total_yes += yes_c
-        total_no += no_c
-        total_skip += skip_c
-
-        if total > 0:
-            probs_arr = np.array(probs_list)
-            print(f"  Predictions (last {total}): {yes_c}Y ({yes_c/total*100:.0f}%) / {no_c}N ({no_c/total*100:.0f}%) / {skip_c}SKIP ({skip_c/total*100:.0f}%)")
-            print(f"  Prob stats: mean={probs_arr.mean():.3f} std={probs_arr.std():.3f} min={probs_arr.min():.3f} max={probs_arr.max():.3f}")
-
-    # Summary
-    grand_total = total_yes + total_no + total_skip
-    print(f"\n{'=' * 70}")
-    print(f"SUMMARY")
-    print(f"{'=' * 70}")
-    print(f"  Parity: {total_match}/{total_match + total_mismatch} candles match")
-    if grand_total > 0:
-        print(f"  Overall predictions: {total_yes}Y ({total_yes/grand_total*100:.0f}%) / {total_no}N ({total_no/grand_total*100:.0f}%) / {total_skip}SKIP ({total_skip/grand_total*100:.0f}%)")
-
-    # What the backtest expects
-    print(f"\n  Walk-forward backtest reference: ~48% YES / ~49% NO / ~3% SKIP")
-    if grand_total > 0:
-        bias = total_yes / grand_total * 100
-        if bias > 70:
-            print(f"  ⚠ WARNING: Current data is heavily YES-biased ({bias:.0f}%)")
-            print(f"    This may be genuine market regime (bullish) or model issue.")
-            print(f"    Compare with actual candle outcomes to determine:")
-            # Check actual outcomes
-            print(f"\n  Actual candle outcomes (last 100 per asset, close >= open = UP):")
-            for asset_name, symbol in ASSETS.items():
-                df_15m = fetch_candles(fetcher, symbol, "15m", 10)  # just last 10 days
-                if df_15m.empty:
-                    continue
-                last_100 = df_15m.tail(100)
-                up_count = (last_100["close"] >= last_100["open"]).sum()
-                print(f"    {asset_name}: {up_count}/100 UP ({up_count}%)")
-        elif bias < 30:
-            print(f"  ⚠ WARNING: Current data is heavily NO-biased ({bias:.0f}%)")
+        if not issues:
+            print(f"[{asset}] OK ({len(feats)} / {len(feats)} model features available and finite)")
         else:
-            print(f"  ✓ Model predictions are reasonably balanced")
+            print(f"[{asset}] FAIL ({len(issues)} problematic features)")
+            for issue in issues[: max(1, args.show)]:
+                print(
+                    f"  {issue['feature']:<24} live={issue['live']} recomputed={issue['recomputed']} "
+                    f"diff={issue['diff']} ({issue['reason']})"
+                )
 
 
 if __name__ == "__main__":

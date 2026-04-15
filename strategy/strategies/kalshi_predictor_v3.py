@@ -262,29 +262,71 @@ class KalshiPredictorV3:
             # 1h/4h: filter by window time from kalshi_extra, matching backtest
             kx = kalshi_extra or {}
             ws_naive = kx.get("window_start_naive")  # set by daemon at eval time
+            strict_confluence_mode = self._model_type in ("strike_relative", "per_asset_confluence")
+            if strict_confluence_mode:
+                required_kx = [
+                    "asset",
+                    "strike_delta",
+                    "strike_trend_3",
+                    "hour",
+                    "atr_percentile",
+                    "alt_rsi_avg",
+                    "alt_rsi_1h_avg",
+                    "alt_momentum_align",
+                    "alt_distance_avg",
+                    "prev_result",
+                    "prev_3_yes_pct",
+                    "streak_length",
+                    "prev_result_consensus",
+                    "return_4h",
+                    "return_12h",
+                    "price_vs_sma_1h",
+                    "lower_lows_4h",
+                    "trend_strength",
+                ]
+                if ws_naive is None:
+                    print("  [PARITY ERR] Missing kalshi_extra.window_start_naive — skipping prediction")
+                    return None
+                missing_kx = [f for f in required_kx if f not in kx]
+                if missing_kx:
+                    print(f"  [PARITY ERR] Missing kalshi_extra fields: {missing_kx} — skipping prediction")
+                    return None
 
             rsi_1h, macd_1h = 50.0, 0.0
+            if strict_confluence_mode and (df_1h is None or len(df_1h) < 20):
+                print("  [PARITY ERR] Missing/insufficient 1h dataframe — skipping prediction")
+                return None
             if df_1h is not None and len(df_1h) >= 20:
                 if ws_naive is not None:
-                    m1h = df_1h[df_1h.index <= ws_naive]
-                    if len(m1h) >= 20:
-                        r1h = m1h.iloc[-1]
-                        rsi_1h = float(r1h.get("rsi", 50))
-                        macd_1h = float(r1h.get("macd_hist", 0))
+                    # '<' drops the in-progress 1h candle at ws_naive.
+                    m1h = df_1h[df_1h.index < ws_naive]
                 else:
-                    # Fallback: use iloc[-2] (last completed)
-                    r1h = df_1h.iloc[-2] if len(df_1h) >= 21 else df_1h.iloc[-1]
+                    # Legacy fallback path for non-strict modes only.
+                    m1h = df_1h.iloc[:-1]
+                if len(m1h) < 20 and strict_confluence_mode:
+                    print("  [PARITY ERR] Insufficient filtered 1h rows — skipping prediction")
+                    return None
+                if len(m1h) >= 20:
+                    r1h = m1h.iloc[-1]
                     rsi_1h = float(r1h.get("rsi", 50))
                     macd_1h = float(r1h.get("macd_hist", 0))
 
             rsi_4h = 50.0
+            if strict_confluence_mode and (df_4h is None or len(df_4h) < 10):
+                print("  [PARITY ERR] Missing/insufficient 4h dataframe — skipping prediction")
+                return None
             if df_4h is not None and len(df_4h) >= 10:
                 if ws_naive is not None:
-                    m4h = df_4h[df_4h.index <= ws_naive]
-                    if len(m4h) >= 10:
-                        rsi_4h = float(m4h.iloc[-1].get("rsi", 50))
+                    # '<' drops the in-progress 4h candle at ws_naive.
+                    m4h = df_4h[df_4h.index < ws_naive]
                 else:
-                    rsi_4h = float(df_4h.iloc[-2].get("rsi", 50)) if len(df_4h) >= 11 else float(df_4h.iloc[-1].get("rsi", 50))
+                    # Legacy fallback path for non-strict modes only.
+                    m4h = df_4h.iloc[:-1]
+                if len(m4h) < 10 and strict_confluence_mode:
+                    print("  [PARITY ERR] Insufficient filtered 4h rows — skipping prediction")
+                    return None
+                if len(m4h) >= 10:
+                    rsi_4h = float(m4h.iloc[-1].get("rsi", 50))
 
             all_features = {
                 "rsi_15m": float(indicator_row.get("rsi", 50)),
@@ -315,10 +357,10 @@ class KalshiPredictorV3:
                 all_features["distance_from_strike"] = distance_from_strike
 
                 # Kalshi-specific + time features
-                all_features["strike_delta"] = kx.get("strike_delta", 0.0)
-                all_features["strike_trend_3"] = kx.get("strike_trend_3", 0.0)
+                all_features["strike_delta"] = kx["strike_delta"]
+                all_features["strike_trend_3"] = kx["strike_trend_3"]
 
-                hour = kx.get("hour", 12)
+                hour = kx["hour"]
                 all_features["hour_sin"] = float(np.sin(2 * np.pi * hour / 24))
                 all_features["hour_cos"] = float(np.cos(2 * np.pi * hour / 24))
 
@@ -326,7 +368,7 @@ class KalshiPredictorV3:
                     (1 if rsi_1h >= 50 else -1) *
                     (1 if rsi_4h >= 50 else -1)
                 )
-                all_features["atr_percentile"] = kx.get("atr_percentile", 0.5)
+                all_features["atr_percentile"] = kx["atr_percentile"]
 
                 # Bollinger Band Width
                 bb_up = float(indicator_row.get("bb_upper", 0))
@@ -335,23 +377,23 @@ class KalshiPredictorV3:
                 all_features["bbw"] = ((bb_up - bb_lo) / bb_m * 100) if bb_m > 0 else 0
 
                 # Cross-asset confluence features
-                all_features["alt_rsi_avg"] = kx.get("alt_rsi_avg", 50)
-                all_features["alt_rsi_1h_avg"] = kx.get("alt_rsi_1h_avg", 50)
-                all_features["alt_momentum_align"] = kx.get("alt_momentum_align", 0)
-                all_features["alt_distance_avg"] = kx.get("alt_distance_avg", 0)
+                all_features["alt_rsi_avg"] = kx["alt_rsi_avg"]
+                all_features["alt_rsi_1h_avg"] = kx["alt_rsi_1h_avg"]
+                all_features["alt_momentum_align"] = kx["alt_momentum_align"]
+                all_features["alt_distance_avg"] = kx["alt_distance_avg"]
 
                 # Backwards-looking features (may not be in model but included for compatibility)
-                all_features["prev_result"] = kx.get("prev_result", 0.5)
-                all_features["prev_3_yes_pct"] = kx.get("prev_3_yes_pct", 0.5)
-                all_features["streak_length"] = kx.get("streak_length", 0)
-                all_features["prev_result_consensus"] = kx.get("prev_result_consensus", 0.5)
+                all_features["prev_result"] = kx["prev_result"]
+                all_features["prev_3_yes_pct"] = kx["prev_3_yes_pct"]
+                all_features["streak_length"] = kx["streak_length"]
+                all_features["prev_result_consensus"] = kx["prev_result_consensus"]
 
                 # Regime features — multi-hour trend context
-                all_features["return_4h"] = kx.get("return_4h", 0)
-                all_features["return_12h"] = kx.get("return_12h", 0)
-                all_features["price_vs_sma_1h"] = kx.get("price_vs_sma_1h", 0)
-                all_features["lower_lows_4h"] = kx.get("lower_lows_4h", 0)
-                all_features["trend_strength"] = kx.get("trend_strength", 0)
+                all_features["return_4h"] = kx["return_4h"]
+                all_features["return_12h"] = kx["return_12h"]
+                all_features["price_vs_sma_1h"] = kx["price_vs_sma_1h"]
+                all_features["lower_lows_4h"] = kx["lower_lows_4h"]
+                all_features["trend_strength"] = kx["trend_strength"]
 
                 # Interaction features — XGBoost uses these for conditional relationships
                 _pve = all_features.get("price_vs_ema", 0)
@@ -362,12 +404,25 @@ class KalshiPredictorV3:
                 all_features["pve_x_return12h"] = _pve * _r12
                 all_features["slope_x_trend"] = _es * _ts
                 all_features["slope_x_return12h"] = _es * _r12
+                # RSI-centered × trend interactions — learns continuation vs reversion
+                _rsi1h_c = all_features.get("rsi_1h", 50) - 50
+                _rsi4h_c = all_features.get("rsi_4h", 50) - 50
+                _r4 = all_features.get("return_4h", 0)
+                _dist = all_features.get("distance_from_strike", 0)
+                all_features["rsi1h_x_r12h"] = _rsi1h_c * _r12
+                all_features["rsi4h_x_r12h"] = _rsi4h_c * _r12
+                all_features["rsi1h_x_r4h"] = _rsi1h_c * _r4
+                all_features["dist_x_r12h"] = _dist * _r12
 
                 # Select per-asset model or fall back to unified
                 asset = kx.get("asset", "")
                 if asset in self._per_asset_models:
                     pa_model, pa_scaler, pa_features = self._per_asset_models[asset]
-                    vals = [all_features.get(f, 0) for f in pa_features]
+                    missing_pa = [f for f in pa_features if f not in all_features]
+                    if missing_pa:
+                        print(f"  [PARITY ERR] Missing model features for {asset}: {missing_pa} — skipping prediction")
+                        return None
+                    vals = [all_features[f] for f in pa_features]
                     X = np.array(vals).reshape(1, -1)
                     # XGBoost: predict on raw features (trained on raw)
                     # LogReg: predict on scaled features (trained on scaled)

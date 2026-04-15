@@ -68,41 +68,60 @@ class KalshiClient:
     def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
         for attempt in range(3):
-            headers = self._headers("GET", path)
-            resp = requests.get(url, headers=headers, params=params, timeout=10)
-            if resp.status_code == 500 and attempt < 2:
-                time.sleep(0.5)
-                continue
-            resp.raise_for_status()
-            return resp.json()
+            try:
+                headers = self._headers("GET", path)
+                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                if resp.status_code == 500 and attempt < 2:
+                    time.sleep(1)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))  # 2s, 4s backoff
+                    continue
+                raise  # re-raise on final attempt
 
     def _post(self, path: str, data: dict) -> dict:
         url = f"{self.base_url}{path}"
         for attempt in range(3):
-            headers = self._headers("POST", path)
-            resp = requests.post(url, headers=headers, json=data, timeout=10)
-            if resp.status_code == 500 and attempt < 2:
-                time.sleep(0.5)
-                continue
-            if resp.status_code in (400, 409):
-                # Include response body in error for debugging
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = resp.text
-                raise requests.HTTPError(
-                    f"{resp.status_code} {resp.reason}: {body} (data={data})",
-                    response=resp,
-                )
-            resp.raise_for_status()
-            return resp.json()
+            try:
+                headers = self._headers("POST", path)
+                resp = requests.post(url, headers=headers, json=data, timeout=10)
+                if resp.status_code == 500 and attempt < 2:
+                    time.sleep(1)
+                    continue
+                if resp.status_code in (400, 409):
+                    # Include response body in error for debugging
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = resp.text
+                    raise requests.HTTPError(
+                        f"{resp.status_code} {resp.reason}: {body} (data={data})",
+                        response=resp,
+                    )
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise
 
     def _delete(self, path: str) -> dict:
         url = f"{self.base_url}{path}"
-        headers = self._headers("DELETE", path)
-        resp = requests.delete(url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                headers = self._headers("DELETE", path)
+                resp = requests.delete(url, headers=headers, timeout=10)
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise
 
     # --- Market Discovery ---
 
@@ -134,6 +153,10 @@ class KalshiClient:
             params["series_ticker"] = series_ticker
         resp = self._get("/trade-api/v2/markets", params)
         return resp.get("markets", [])
+
+    def get_event(self, event_ticker: str) -> dict:
+        """Get a single event's details."""
+        return self._get(f"/trade-api/v2/events/{event_ticker}")
 
     def get_market(self, ticker: str) -> dict:
         """Get a single market's details."""

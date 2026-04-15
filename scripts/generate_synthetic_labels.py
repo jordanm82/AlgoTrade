@@ -2,8 +2,8 @@
 """Generate synthetic K15 training labels from historical Coinbase data.
 
 For any 15-minute window going back 2+ years:
-  - Strike = 5m candle OPEN at window start (Coinbase+Bitstamp averaged)
-  - Label = did price close above strike at minute 15? (YES=1, NO=0)
+  - Strike = previous window's CLOSE (simulates Kalshi floor_strike ≠ current price)
+  - Label = did price close above strike at THIS window's minute-15 close? (YES=1, NO=0)
   - All indicator features from Coinbase 15m/1h/4h candles
 
 This gives us training data from bear markets, consolidation, and bull runs
@@ -78,7 +78,7 @@ def main():
 
     print("=" * 80)
     print(f"GENERATING SYNTHETIC K15 LABELS ({args.months} months)")
-    print("Strike = 5m open at window start | Label = close above strike at min 15")
+    print("Strike = prev window close | Label = close above strike at min 15")
     print("=" * 80)
 
     # Fetch extended history
@@ -119,7 +119,7 @@ def main():
             ws = df_15m.index[i]  # window start = this candle's timestamp
             ws_naive = ws
 
-            # Strike = average of Coinbase + Bitstamp 5m open at window start
+            # Price at minute 0 = average of Coinbase + Bitstamp 5m open
             prices = []
             for df_5m in [cb_5m, bs_5m]:
                 if df_5m.empty:
@@ -127,12 +127,20 @@ def main():
                 mask = (df_5m.index >= ws_naive) & (df_5m.index < ws_naive + timedelta(minutes=5))
                 if mask.sum() > 0:
                     prices.append(float(df_5m[mask].iloc[0]["open"]))
-            if not prices:
+            # Strict parity: require both Coinbase + Bitstamp prices.
+            if len(prices) != 2:
                 continue
-            strike = sum(prices) / len(prices)
+            price_at_min0 = sum(prices) / len(prices)
 
-            # Settlement price = close of the NEXT 15m candle
-            settle_price = float(df_15m.iloc[i + 1]["close"])
+            # Strike = previous window's CLOSE (simulates Kalshi floor_strike).
+            # Kalshi sets the strike near the previous settlement, NOT at
+            # the current price. This creates realistic non-zero distance.
+            # Use the candle BEFORE as strike source (like Kalshi uses prev settlement)
+            strike = float(df_15m.iloc[i - 1]["close"])
+
+            # Settlement price = close of THIS 15m candle window.
+            # Previous versions used i+1 (next window), which introduces horizon mismatch.
+            settle_price = float(df_15m.iloc[i]["close"])
 
             # Label: did price close above strike?
             label = 1 if settle_price > strike else 0
@@ -143,9 +151,8 @@ def main():
             if pd.isna(atr) or atr <= 0:
                 continue
 
-            # Distance from strike
-            price_at_min0 = sum(prices) / len(prices)
-            distance = (price_at_min0 - strike) / atr  # will be ~0 since price_at_min0 ≈ strike
+            # Distance from strike — now meaningful since strike ≠ price
+            distance = (price_at_min0 - strike) / atr
 
             samples.append({
                 "ts": ws,
@@ -156,7 +163,6 @@ def main():
                 "price_at_min0": price_at_min0,
                 "distance_from_strike": distance,
                 "atr": atr,
-                # Store index for feature extraction later
                 "_15m_idx": i - 1,
             })
 
