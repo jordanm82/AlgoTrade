@@ -31,7 +31,10 @@ from data.indicators import add_indicators
 from exchange.kalshi import KalshiClient
 from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
 from scripts.backtest_kalshi_labels import build_features
-from strategy.m10_feature_builder import filter_completed_candles
+from strategy.m10_feature_builder import (
+    compute_confluence_features,
+    filter_completed_candles,
+)
 from scripts.train_per_asset_models import (
     SERIES, ASSETS_SYMS, BASE_FEATURES, CONFLUENCE_FEATURES,
     REGIME_FEATURES, INTERACTION_FEATURES, ALL_FEATURES,
@@ -382,6 +385,22 @@ def main():
             r = mk.get("result", "")
             if ct and r: settlement_by_time[asset][ct] = 1 if r == "yes" else 0
 
+    # Strike lookup by close_time — required for computing alt_distance_avg
+    # from real alt strikes during cross-asset confluence. Matches the live
+    # daemon, which queries Kalshi floor_strike for each alt market.
+    # Previously alt_distance_avg was hardcoded to 0 in M0 training, which
+    # trained the model on a degenerate distribution while live fed real
+    # values in ±3 ATR range. Same pattern as the documented 50/0 confluence
+    # parity disaster that previously capped live WR.
+    strike_by_time_real = {
+        a: {
+            mk.get("close_time"): float(mk.get("floor_strike") or 0)
+            for mk in kalshi_markets[a]
+            if mk.get("close_time") and mk.get("floor_strike")
+        }
+        for a in selected_assets
+    }
+
     print("\n[2/4] Fetching 5m candles...")
     five_m = {}
     for asset in selected_assets:
@@ -501,23 +520,21 @@ def main():
                 else: kx["trend_strength"] = 0
             else: kx["lower_lows_4h"] = 0; kx["trend_strength"] = 0
 
-            # Confluence
-            ar15, ar1h, amom = [], [], []
-            for alt in alt_assets:
-                a15 = ind_data[alt]["15m"]
-                a1h = ind_data[alt]["1h"]
-                a15f = a15[a15.index < ws_n]
-                if len(a15f) >= 2:
-                    rv = float(a15f.iloc[-1].get("rsi", 50))
-                    ar15.append(rv); amom.append(1 if rv >= 50 else -1)
-                if a1h is not None:
-                    # '<' drops the in-progress 1h candle at ws_n.
-                    a1f = filter_completed_candles(a1h, ws_n, "1h")
-                    if len(a1f) >= 2: ar1h.append(float(a1f.iloc[-1].get("rsi", 50)))
-            kx["alt_rsi_avg"] = sum(ar15)/len(ar15) if ar15 else 50
-            kx["alt_rsi_1h_avg"] = sum(ar1h)/len(ar1h) if ar1h else 50
-            kx["alt_momentum_align"] = sum(amom) if amom else 0
-            kx["alt_distance_avg"] = 0
+            # Confluence — shared helper (parity with daemon + M10 training).
+            # Computes alt_rsi_avg, alt_rsi_1h_avg, alt_momentum_align, and
+            # alt_distance_avg from real alt Kalshi strikes + Coinbase+Bitstamp
+            # 5m opens. Previously alt_distance_avg was hardcoded to 0 —
+            # critical parity bug fixed here.
+            kx.update(compute_confluence_features(
+                alt_keys=alt_assets,
+                ws_naive=ws_n,
+                get_15m_df=lambda a: ind_data[a]["15m"],
+                get_1h_df=lambda a: ind_data[a]["1h"],
+                get_anchor_price=lambda a: get_avg_price(
+                    five_m[a]["coinbase"], five_m[a]["bitstamp"], ws_n, "open"
+                ),
+                get_strike=lambda a: strike_by_time_real.get(a, {}).get(ct) or None,
+            ))
 
             feat = build_features(prev, df_1h, df_4h, ws_n, (price - strike) / atr,
                                   kalshi_extra=kx, atr_pctile_val=apv)
@@ -554,6 +571,30 @@ def main():
                     syn_atr_s = syn_15m["atr"].dropna()
                     syn_ar20 = syn_atr_s.rolling(20)
                     syn_atr_p = ((syn_atr_s - syn_ar20.min()) / (syn_ar20.max() - syn_ar20.min())).fillna(0.5)
+
+                    # Alt strike + price lookups by window-start timestamp —
+                    # required for synthetic alt_distance_avg parity with real.
+                    # Synthetic data is generated on aligned 15m timestamps
+                    # across all assets (verified: 100% ts alignment), so
+                    # sample['ts'] == ws_syn == syn_15m.index[idx + 1].
+                    syn_strike_by_ts = {
+                        alt: {
+                            sam["ts"]: float(sam.get("strike", 0))
+                            for sam in syn_data[alt]["samples"]
+                            if sam.get("strike")
+                        }
+                        for alt in alt_assets
+                        if alt in syn_data
+                    }
+                    syn_price_by_ts = {
+                        alt: {
+                            sam["ts"]: float(sam.get("price_at_min0", 0))
+                            for sam in syn_data[alt]["samples"]
+                            if sam.get("price_at_min0")
+                        }
+                        for alt in alt_assets
+                        if alt in syn_data
+                    }
 
                     syn_count = 0
                     for s in syn_asset["samples"]:
@@ -593,26 +634,19 @@ def main():
                             else: kx_syn["trend_strength"] = 0
                         else: kx_syn["lower_lows_4h"] = 0; kx_syn["trend_strength"] = 0
 
-                        # Real confluence from synthetic data
-                        syn_alt_rsi, syn_alt_rsi_1h, syn_alt_mom = [], [], []
-                        for alt_asset in alt_assets:
-                            if alt_asset in syn_data:
-                                alt_syn_15m = syn_data[alt_asset]["15m"]
-                                alt_syn_1h = syn_data[alt_asset]["1h"]
-                                alt_filt = alt_syn_15m[alt_syn_15m.index < ws_syn]
-                                if len(alt_filt) >= 2:
-                                    rv = float(alt_filt.iloc[-1].get("rsi", 50))
-                                    syn_alt_rsi.append(rv)
-                                    syn_alt_mom.append(1 if rv >= 50 else -1)
-                                if alt_syn_1h is not None:
-                                    # '<' drops the in-progress 1h candle at ws_syn.
-                                    alt_1h_f = filter_completed_candles(alt_syn_1h, ws_syn, "1h")
-                                    if len(alt_1h_f) >= 2:
-                                        syn_alt_rsi_1h.append(float(alt_1h_f.iloc[-1].get("rsi", 50)))
-                        kx_syn["alt_rsi_avg"] = sum(syn_alt_rsi)/len(syn_alt_rsi) if syn_alt_rsi else 50
-                        kx_syn["alt_rsi_1h_avg"] = sum(syn_alt_rsi_1h)/len(syn_alt_rsi_1h) if syn_alt_rsi_1h else 50
-                        kx_syn["alt_momentum_align"] = sum(syn_alt_mom) if syn_alt_mom else 0
-                        kx_syn["alt_distance_avg"] = 0
+                        # Confluence — shared helper. Synthetic alt strikes
+                        # + prices come from the synthetic samples' own
+                        # strike/price_at_min0 fields, matched by ts.
+                        # alt_distance_avg now varies on synthetic data too,
+                        # closing the final parity gap vs live.
+                        kx_syn.update(compute_confluence_features(
+                            alt_keys=alt_assets,
+                            ws_naive=ws_syn,
+                            get_15m_df=lambda a: syn_data[a]["15m"] if a in syn_data else None,
+                            get_1h_df=lambda a: syn_data[a]["1h"] if a in syn_data else None,
+                            get_anchor_price=lambda a: syn_price_by_ts.get(a, {}).get(ws_syn),
+                            get_strike=lambda a: syn_strike_by_ts.get(a, {}).get(ws_syn),
+                        ))
 
                         feat_syn = build_features(prev, syn_1h, syn_4h, ws_syn,
                                                   s["distance_from_strike"],
