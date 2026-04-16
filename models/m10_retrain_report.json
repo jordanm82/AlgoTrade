@@ -1,0 +1,283 @@
+{
+  "created_at": "2026-04-16T21:35:25.037859+00:00",
+  "settings": {
+    "assets": [
+      "BTC",
+      "ETH",
+      "SOL",
+      "XRP"
+    ],
+    "continuation_weight": 1.0,
+    "continuation_dist": 0.8,
+    "continuation_ret12": 0.5,
+    "monotone_distance": false,
+    "eval_threshold": 90,
+    "history_days": 100
+  },
+  "assets": {
+    "BTC": {
+      "samples": 6086,
+      "train": 4260,
+      "val": 897,
+      "test": 913,
+      "best_iteration": 255,
+      "guardrails_t90": {
+        "threshold": 90,
+        "bets": 432,
+        "wins": 419,
+        "losses": 13,
+        "true_wr": 96.99074074074075,
+        "pnl": 159.8,
+        "yes_bets": 232,
+        "no_bets": 200,
+        "yes_wr": 96.98275862068965,
+        "no_wr": 97.0,
+        "bull_bucket_n": 30,
+        "bear_bucket_n": 13,
+        "bull_no_rate": 0.0,
+        "bear_yes_rate": 0.0,
+        "bull_false_no_rate": 0.0
+      },
+      "top_features": [
+        {
+          "name": "distance_from_strike",
+          "importance": 0.20128720998764038
+        },
+        {
+          "name": "price_move_atr",
+          "importance": 0.17641957104206085
+        },
+        {
+          "name": "alt_distance_avg",
+          "importance": 0.06783850491046906
+        },
+        {
+          "name": "momentum_shift",
+          "importance": 0.022623462602496147
+        },
+        {
+          "name": "return_12h",
+          "importance": 0.018216107040643692
+        },
+        {
+          "name": "alt_momentum_align",
+          "importance": 0.017526188865303993
+        },
+        {
+          "name": "ema_slope",
+          "importance": 0.016985565423965454
+        },
+        {
+          "name": "lower_lows_4h",
+          "importance": 0.0158529132604599
+        },
+        {
+          "name": "hourly_return",
+          "importance": 0.015779612585902214
+        },
+        {
+          "name": "macd_1h",
+          "importance": 0.015477480366826057
+        }
+      ]
+    },
+    "ETH": {
+      "samples": 6088,
+      "train": 4261,
+      "val": 897,
+      "test": 914,
+      "best_iteration": 185,
+      "guardrails_t90": {
+        "threshold": 90,
+        "bets": 478,
+        "wins": 459,
+        "losses": 19,
+        "true_wr": 96.02510460251045,
+        "pnl": 172.20000000000002,
+        "yes_bets": 269,
+        "no_bets": 209,
+        "yes_wr": 95.16728624535315,
+        "no_wr": 97.1291866028708,
+        "bull_bucket_n": 31,
+        "bear_bucket_n": 21,
+        "bull_no_rate": 0.0,
+        "bear_yes_rate": 0.0,
+        "bull_false_no_rate": 0.0
+      },
+      "top_features": [
+        {
+          "name": "distance_from_strike",
+          "importance": 0.21406573057174683
+        },
+        {
+          "name": "price_move_atr",
+          "importance": 0.14399266242980957
+        },
+        {
+          "name": "alt_distance_avg",
+          "importance": 0.08863847702741623
+        },
+        {
+          "name": "momentum_shift",
+          "importance": 0.0268079936504364
+        },
+        {
+          "name": "rsi_1h",
+          "importance": 0.018609309569001198
+        },
+        {
+          "name": "candle2_range_atr",
+          "importance": 0.01818661019206047
+        },
+        {
+          "name": "macd_15m",
+          "importance": 0.018178120255470276
+        },
+        {
+          "name": "alt_rsi_1h_avg",
+          "importance": 0.01740352250635624
+        },
+        {
+          "name": "price_vs_sma_1h",
+          "importance": 0.017266564071178436
+        },
+        {
+          "name": "atr_percentile",
+          "importance": 0.01681623049080372
+        }
+      ]
+    },
+    "SOL": {
+      "samples": 6088,
+      "train": 4261,
+      "val": 897,
+      "test": 914,
+      "best_iteration": 234,
+      "guardrails_t90": {
+        "threshold": 90,
+        "bets": 434,
+        "wins": 417,
+        "losses": 17,
+        "true_wr": 96.08294930875576,
+        "pnl": 156.60000000000002,
+        "yes_bets": 244,
+        "no_bets": 190,
+        "yes_wr": 95.90163934426229,
+        "no_wr": 96.3157894736842,
+        "bull_bucket_n": 38,
+        "bear_bucket_n": 26,
+        "bull_no_rate": 0.0,
+        "bear_yes_rate": 0.0,
+        "bull_false_no_rate": 0.0
+      },
+      "top_features": [
+        {
+          "name": "distance_from_strike",
+          "importance": 0.2027251124382019
+        },
+        {
+          "name": "price_move_atr",
+          "importance": 0.16208133101463318
+        },
+        {
+          "name": "alt_distance_avg",
+          "importance": 0.07654230296611786
+        },
+        {
+          "name": "momentum_shift",
+          "importance": 0.025564657524228096
+        },
+        {
+          "name": "rsi_alignment",
+          "importance": 0.01931624859571457
+        },
+        {
+          "name": "rsi_1h",
+          "importance": 0.01767807826399803
+        },
+        {
+          "name": "hourly_return",
+          "importance": 0.016218671575188637
+        },
+        {
+          "name": "atr_percentile",
+          "importance": 0.01621764339506626
+        },
+        {
+          "name": "strike_delta",
+          "importance": 0.01579698920249939
+        },
+        {
+          "name": "norm_return",
+          "importance": 0.015747860074043274
+        }
+      ]
+    },
+    "XRP": {
+      "samples": 6067,
+      "train": 4246,
+      "val": 894,
+      "test": 911,
+      "best_iteration": 262,
+      "guardrails_t90": {
+        "threshold": 90,
+        "bets": 511,
+        "wins": 488,
+        "losses": 23,
+        "true_wr": 95.49902152641879,
+        "pnl": 181.4,
+        "yes_bets": 258,
+        "no_bets": 253,
+        "yes_wr": 96.51162790697676,
+        "no_wr": 94.46640316205533,
+        "bull_bucket_n": 36,
+        "bear_bucket_n": 20,
+        "bull_no_rate": 0.0,
+        "bear_yes_rate": 0.0,
+        "bull_false_no_rate": 0.0
+      },
+      "top_features": [
+        {
+          "name": "distance_from_strike",
+          "importance": 0.2029019147157669
+        },
+        {
+          "name": "price_move_atr",
+          "importance": 0.18754348158836365
+        },
+        {
+          "name": "alt_distance_avg",
+          "importance": 0.08498392254114151
+        },
+        {
+          "name": "momentum_shift",
+          "importance": 0.026516243815422058
+        },
+        {
+          "name": "rsi_15m",
+          "importance": 0.01943804882466793
+        },
+        {
+          "name": "atr_percentile",
+          "importance": 0.016805047169327736
+        },
+        {
+          "name": "roc_5",
+          "importance": 0.01620107889175415
+        },
+        {
+          "name": "strike_delta",
+          "importance": 0.015887856483459473
+        },
+        {
+          "name": "bbw",
+          "importance": 0.01573808304965496
+        },
+        {
+          "name": "strike_trend_3",
+          "importance": 0.015543539077043533
+        }
+      ]
+    }
+  }
+}
