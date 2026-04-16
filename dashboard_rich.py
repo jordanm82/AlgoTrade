@@ -293,6 +293,10 @@ class RichDashboard:
                     kp.get("total_traded_fp") or kp.get("yes_count_fp") or
                     kp.get("no_count_fp") or 0
                 ))
+                # Kalshi returns these fields as cents-scaled integers despite
+                # the `_dollars` suffix — `total_traded_dollars` is legacy naming.
+                # A 2-contract position filled at 20c each shows cost≈40, not 0.40.
+                # Don't multiply by 100 when converting to per-contract cents.
                 cost = float(kp.get("total_traded_dollars") or kp.get("market_exposure") or 0)
                 if count <= 0:
                     continue
@@ -308,7 +312,7 @@ class RichDashboard:
 
                 # Determine side from our pending bets or default to YES
                 side = "YES"
-                entry = int(cost / count * 100) if count > 0 else 0
+                entry = int(cost / count) if count > 0 else 0
                 for bet in getattr(self.daemon, '_pending_bets', []):
                     if bet.get("asset") == asset and bet.get("count", 0) > 0:
                         side = bet.get("side", "yes").upper()
