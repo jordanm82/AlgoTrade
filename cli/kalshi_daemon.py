@@ -2259,20 +2259,49 @@ class KalshiDaemon:
                 ))
             if self.kalshi_ws:
                 self._ws_subscribe_current_markets()
-        elif minute_in_window == 1:
-            # Optional one-time minute-1 higher-TF refresh (handles exchange lag at top of hour).
-            # Guarded to avoid re-fetching on every 2s entry eval tick.
-            minute1_refresh_key = f"_minute1_htf_refreshed_{current_window_start}"
-            if not self._kalshi_cached_dataframes.get(minute1_refresh_key):
-                self._refresh_higher_timeframes()
-                self._kalshi_cached_dataframes[minute1_refresh_key] = True
-
-        # Also refresh 1h/4h every 15 minutes, but don't duplicate immediately after
-        # boundary refresh inside the same eval tick.
-        refresh_key = f"_1h_refreshed_{now_utc.hour}_{now_utc.minute // 15}"
-        if minute_in_window > 1 and not boundary_refreshed and not self._kalshi_cached_dataframes.get(refresh_key):
+        # Higher-timeframe (1h/4h) cache refresh — epoch-aligned to actual candle
+        # completions, not fixed time buckets.
+        #
+        # Empirical finding: cached RSI/MACD diverge from a training-style fresh
+        # fetch by up to 12 RSI points near HTF boundaries. Root cause is timing:
+        # the daemon's cached 1h/4h df is missing candles that completed AFTER
+        # the cache was loaded. Direct test confirms add_indicators is
+        # deterministic — daemon-style and parity-style fetches at the SAME
+        # moment produce identical RSI to 6 decimal places.
+        #
+        # Fix: key the refresh on the last-completed 1h and 4h candle OPEN times.
+        # As soon as a new candle completes, the key changes and the next eval
+        # triggers a refresh. The boundary_refreshed guard prevents stacking
+        # this on top of the minute-0 15m-only boundary refresh in the same
+        # eval tick, so M0 critical path stays lean (HTF fetch runs on the
+        # SECOND eval of the new window, usually within a couple seconds).
+        last_complete_1h_open = (
+            now_utc.replace(minute=0, second=0, microsecond=0)
+            - timedelta(hours=1)
+        )
+        last_complete_4h_open = (
+            now_utc.replace(
+                hour=(now_utc.hour // 4) * 4, minute=0, second=0, microsecond=0
+            )
+            - timedelta(hours=4)
+        )
+        htf_epoch_key = (
+            f"_htf_epoch_"
+            f"{last_complete_1h_open.isoformat()}_"
+            f"{last_complete_4h_open.isoformat()}"
+        )
+        if (
+            not boundary_refreshed
+            and not self._kalshi_cached_dataframes.get(htf_epoch_key)
+        ):
+            # First eval after a 1h/4h candle completed. Fire even at minute 0
+            # of hour-aligned windows — M0 scoring needs the just-completed
+            # 1h candle to be present in the cache. The minute-0 15m-only
+            # boundary refresh already ran in an earlier eval tick of this
+            # window (boundary_refreshed guard above), so this adds one HTF
+            # fetch per epoch rollover without blocking the 15m critical path.
             self._refresh_higher_timeframes()
-            self._kalshi_cached_dataframes[refresh_key] = True
+            self._kalshi_cached_dataframes[htf_epoch_key] = True
 
         # Prune active bets — clear at window boundary so new window can bet immediately
         now_ts = time.time()
