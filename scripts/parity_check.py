@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.fetcher import DataFetcher
 from data.indicators import add_indicators
 from scripts.backtest_kalshi_labels import build_features
+from strategy.m10_feature_builder import filter_completed_candles
 
 ASSETS_SYMS = {
     "BTC": "BTC/USD",
@@ -125,14 +126,17 @@ def _read_feature_log(path: Path) -> list[dict]:
 
 def _prepare_indicators(fetcher: DataFetcher) -> dict[str, dict[str, pd.DataFrame | None]]:
     out: dict[str, dict[str, pd.DataFrame | None]] = {}
+    limit_15m = 300
+    limit_1h = 200
+    limit_4h = 120
 
     for asset, symbol in ASSETS_SYMS.items():
-        df_15m = add_indicators(fetcher.ohlcv(symbol, "15m", limit=240))
-        raw_1h = fetcher.ohlcv(symbol, "1h", limit=140)
-        raw_4h = fetcher.ohlcv(symbol, "4h", limit=100)
+        df_15m = add_indicators(fetcher.ohlcv(symbol, "15m", limit=limit_15m))
+        raw_1h = fetcher.ohlcv(symbol, "1h", limit=limit_1h)
+        raw_4h = fetcher.ohlcv(symbol, "4h", limit=limit_4h)
 
-        df_1h = add_indicators(raw_1h.iloc[:-1]) if raw_1h is not None and len(raw_1h) > 1 else None
-        df_4h = add_indicators(raw_4h.iloc[:-1]) if raw_4h is not None and len(raw_4h) > 1 else None
+        df_1h = add_indicators(raw_1h) if raw_1h is not None and len(raw_1h) > 0 else None
+        df_4h = add_indicators(raw_4h) if raw_4h is not None and len(raw_4h) > 0 else None
 
         pct = df_15m["close"].pct_change()
         df_15m["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
@@ -180,7 +184,7 @@ def _compute_regime(df_15m: pd.DataFrame, df_1h: pd.DataFrame | None,
         out["return_12h"] = 0.0
 
     if df_1h is not None:
-        h1 = df_1h[df_1h.index < ws]
+        h1 = filter_completed_candles(df_1h, ws, "1h")
         if len(h1) >= 20 and atr > 0:
             out["price_vs_sma_1h"] = (
                 float(h1.iloc[-1]["close"]) - float(h1["close"].rolling(20).mean().iloc[-1])
@@ -191,7 +195,7 @@ def _compute_regime(df_15m: pd.DataFrame, df_1h: pd.DataFrame | None,
         out["price_vs_sma_1h"] = 0.0
 
     if df_4h is not None:
-        h4 = df_4h[df_4h.index < ws]
+        h4 = filter_completed_candles(df_4h, ws, "4h")
         if len(h4) >= 4:
             out["lower_lows_4h"] = float(
                 sum(1 for i in range(-3, 0) if float(h4.iloc[i]["low"]) < float(h4.iloc[i - 1]["low"]))
@@ -228,7 +232,7 @@ def _compute_confluence(asset: str, ws: datetime, ind_data: dict[str, dict], ent
             alt_momentum.append(1 if rsi_v >= 50 else -1)
 
         if alt_1h is not None:
-            alt_1h_f = alt_1h[alt_1h.index < ws]
+            alt_1h_f = filter_completed_candles(alt_1h, ws, "1h")
             if len(alt_1h_f) >= 2:
                 alt_rsi_1h.append(_safe_float(alt_1h_f.iloc[-1].get("rsi", 50), 50.0))
 

@@ -34,6 +34,7 @@ from strategy.m10_feature_builder import (
     build_common_feature_vector,
     compute_confluence_features,
     compute_m10_intra_from_exchange_dfs,
+    filter_completed_candles,
     get_avg_price_5m,
 )
 
@@ -324,7 +325,7 @@ def build_asset_dataset(
             kx["return_12h"] = 0
 
         if df_1h is not None:
-            h1f = df_1h[df_1h.index < ws_n]
+            h1f = filter_completed_candles(df_1h, ws_n, "1h")
             if len(h1f) >= 20 and atr > 0:
                 kx["price_vs_sma_1h"] = (
                     (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1]))
@@ -336,7 +337,7 @@ def build_asset_dataset(
             kx["price_vs_sma_1h"] = 0
 
         if df_4h is not None:
-            h4f = df_4h[df_4h.index < ws_n]
+            h4f = filter_completed_candles(df_4h, ws_n, "4h")
             if len(h4f) >= 4:
                 kx["lower_lows_4h"] = sum(
                     1

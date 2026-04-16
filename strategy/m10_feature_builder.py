@@ -11,6 +11,32 @@ import numpy as np
 import pandas as pd
 
 
+def _timeframe_delta(timeframe: str) -> timedelta:
+    tf = timeframe.lower().strip()
+    if tf == "15m":
+        return timedelta(minutes=15)
+    if tf == "1h":
+        return timedelta(hours=1)
+    if tf == "4h":
+        return timedelta(hours=4)
+    raise ValueError(f"unsupported timeframe: {timeframe}")
+
+
+def filter_completed_candles(df: pd.DataFrame | None, ws_naive, timeframe: str) -> pd.DataFrame | None:
+    """Return candles fully completed by ws_naive.
+
+    CCXT candle timestamps are candle OPEN times. A candle is complete only when:
+        open_time + timeframe <= ws_naive
+    """
+    if df is None:
+        return None
+    if df.empty:
+        return df
+    ws_ts = pd.Timestamp(ws_naive).tz_localize(None)
+    cutoff = ws_ts - _timeframe_delta(timeframe)
+    return df[df.index <= cutoff]
+
+
 def get_avg_price_5m(
     first_5m: pd.DataFrame,
     second_5m: pd.DataFrame,
@@ -62,7 +88,7 @@ def compute_confluence_features(
 
         alt_1h = get_1h_df(key)
         if alt_1h is not None:
-            alt_1h_filt = alt_1h[alt_1h.index < ws_naive]
+            alt_1h_filt = filter_completed_candles(alt_1h, ws_naive, "1h")
             if len(alt_1h_filt) >= 2:
                 alt_rsi_1h.append(float(alt_1h_filt.iloc[-1].get("rsi", 50)))
 
@@ -122,12 +148,12 @@ def build_common_feature_vector(
         "distance_from_strike": distance,
     }
     if df_1h is not None:
-        m1h = df_1h[df_1h.index < ws_naive]
+        m1h = filter_completed_candles(df_1h, ws_naive, "1h")
         if len(m1h) >= 20:
             feat["rsi_1h"] = float(m1h.iloc[-1].get("rsi", 50))
             feat["macd_1h"] = float(m1h.iloc[-1].get("macd_hist", 0))
     if df_4h is not None:
-        m4h = df_4h[df_4h.index < ws_naive]
+        m4h = filter_completed_candles(df_4h, ws_naive, "4h")
         if len(m4h) >= 10:
             feat["rsi_4h"] = float(m4h.iloc[-1].get("rsi", 50))
 
@@ -247,4 +273,3 @@ def compute_m10_intra_from_window_candles(c1: dict, c2: dict, atr: float) -> dic
         )
     except Exception:
         return None
-

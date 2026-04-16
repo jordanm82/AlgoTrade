@@ -26,11 +26,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.fetcher import DataFetcher
 from data.indicators import add_indicators
 from exchange.kalshi import KalshiClient
+from config.production import MAX_CONCURRENT_KALSHI_BETS, KALSHI_RISK_PER_BET_PCT
 from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
 from strategy.m10_feature_builder import (
     build_common_feature_vector,
     compute_confluence_features,
     compute_m10_intra_from_exchange_dfs,
+    filter_completed_candles,
     get_avg_price_5m,
 )
 
@@ -38,16 +40,16 @@ SERIES = {"BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M", "XRP": "KXXRP
 ASSETS_SYMS = {"BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD", "XRP": "XRP/USD"}
 
 STARTING_BALANCE = 100.0
-RISK_PCT = 0.05
+RISK_PCT = KALSHI_RISK_PER_BET_PCT
 MAX_CONTRACTS = 100
 ENTRY_CENTS = 60
-MAX_PER_WINDOW = 3
+DEFAULT_MAX_PER_WINDOW = MAX_CONCURRENT_KALSHI_BETS
 M10_EXIT_CENTS = 10
 DEFAULT_DAILY_LOSS_CAP = 0.0
 
 # Per-asset thresholds (must match daemon)
-M0_THRESHOLDS = {"BTC": 65, "ETH": 65, "SOL": 65, "XRP": 65}
-M10_THRESHOLDS = {"BTC": 90, "ETH": 90, "SOL": 90, "XRP": 90}
+M0_THRESHOLDS = {"BTC": 60, "ETH": 60, "SOL": 60, "XRP": 60}
+M10_THRESHOLDS = {"BTC": 85, "ETH": 85, "SOL": 85, "XRP": 85}
 
 CACHE_DIR = Path("data/store/backtest_cache")
 
@@ -156,10 +158,20 @@ def main():
     )
     parser.add_argument("--m10-exit-floor", type=int, default=M10_EXIT_CENTS,
                         help="Minimum M10 exit price floor in cents")
+    parser.add_argument(
+        "--max-per-window",
+        type=int,
+        default=DEFAULT_MAX_PER_WINDOW,
+        help=(
+            "Max bets per 15m window. "
+            f"Default matches live MAX_CONCURRENT_KALSHI_BETS ({DEFAULT_MAX_PER_WINDOW})."
+        ),
+    )
     parser.add_argument("--daily-loss-cap", type=float, default=DEFAULT_DAILY_LOSS_CAP,
                         help="Optional per-day loss cap (fraction, e.g. 0.2). 0 disables cap.")
     parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
+    max_per_window = max(1, int(args.max_per_window))
 
     # Load per-asset models
     m0_models, m10_models = {}, {}
@@ -175,7 +187,8 @@ def main():
     print(f"BACKTEST — Per-Asset Models ({args.days} days)")
     print(f"M0: per-asset with confluence | M10: per-asset with 5m intra-window")
     print(
-        f"Entry: {ENTRY_CENTS}c | M10 exit mode: {args.m10_exit_mode} "
+        f"Entry: {ENTRY_CENTS}c (assumed fill) | Max/window: {max_per_window} | "
+        f"M10 exit mode: {args.m10_exit_mode} "
         f"(floor={args.m10_exit_floor}c, est_spread={args.m10_est_spread}c)"
     )
     print("=" * 80)
@@ -344,14 +357,13 @@ def main():
                 kx["return_12h"] = (float(pc.iloc[-1]["close"]) - float(pc.iloc[-48]["close"])) / float(pc.iloc[-48]["close"]) * 100
             else: kx["return_12h"] = 0
             if df1h is not None:
-                # '<' drops the in-progress candle at wsn (see build_features)
-                h1f = df1h[df1h.index < wsn]
+                h1f = filter_completed_candles(df1h, wsn, "1h")
                 if len(h1f) >= 20 and atr > 0:
                     kx["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr
                 else: kx["price_vs_sma_1h"] = 0
             else: kx["price_vs_sma_1h"] = 0
             if df4h is not None:
-                h4f = df4h[df4h.index < wsn]
+                h4f = filter_completed_candles(df4h, wsn, "4h")
                 if len(h4f) >= 4:
                     kx["lower_lows_4h"] = sum(1 for i in range(-3,0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
                 else: kx["lower_lows_4h"] = 0
@@ -526,6 +538,7 @@ def main():
     max_dd = max_dd_dollars = max_dd_peak = max_dd_trough = 0
     bets_placed = bets_skipped = 0
     pnl_wins = pnl_losses = pnl_exit_net = 0
+    executed_rows: list[dict] = []
     current_day = None
     day_start = balance
     day_halted = False
@@ -533,7 +546,7 @@ def main():
     loss_cap_enabled = loss_cap > 0
 
     for _, group in df_sig.groupby(df_sig["ts"].dt.floor("15min")):
-        window_bets = group.nlargest(MAX_PER_WINDOW, "m0_prob")
+        window_bets = group.nlargest(max_per_window, "m0_prob")
         for _, row in window_bets.iterrows():
             if loss_cap_enabled:
                 bet_day = row["ts"].strftime("%m/%d")
@@ -548,6 +561,7 @@ def main():
             cost = contracts * (ENTRY_CENTS / 100)
             if cost > balance: continue
             bets_placed += 1
+            executed_rows.append(row.to_dict())
 
             if row["outcome"] == "WIN":
                 p = contracts * ((100 - ENTRY_CENTS) / 100); balance += p; pnl_wins += p
@@ -578,7 +592,7 @@ def main():
         floor_day_start = floor_balance
         floor_day_halted = False
         for _, group in df_sig.groupby(df_sig["ts"].dt.floor("15min")):
-            window_bets = group.nlargest(MAX_PER_WINDOW, "m0_prob")
+            window_bets = group.nlargest(max_per_window, "m0_prob")
             for _, row in window_bets.iterrows():
                 if loss_cap_enabled:
                     bet_day = row["ts"].strftime("%m/%d")
@@ -616,7 +630,7 @@ def main():
     ret = (balance - STARTING_BALANCE) / STARTING_BALANCE * 100
     net_pnl = pnl_wins - pnl_losses + pnl_exit_net
     print(f"\n{'=' * 80}")
-    print(f"P&L: ${STARTING_BALANCE} start, {RISK_PCT*100:.0f}% risk, max {MAX_PER_WINDOW}/window")
+    print(f"P&L: ${STARTING_BALANCE} start, {RISK_PCT*100:.0f}% risk, max {max_per_window}/window")
     print(f"{'=' * 80}")
     if loss_cap_enabled:
         print(f"  Bets: {bets_placed} (skipped {bets_skipped} from daily cap @ {loss_cap:.0%})")
@@ -635,7 +649,12 @@ def main():
         )
     print(f"  Max DD: {max_dd:.1f}% (${max_dd_dollars:,.2f} — ${max_dd_peak:,.2f} to ${max_dd_trough:,.2f})")
 
-    # Daily
+    df_exec = pd.DataFrame(executed_rows)
+    if df_exec.empty:
+        print("\nNo executed bets after window-cap/daily-cap filters.")
+        return
+
+    # Daily (executed bets only)
     def sig_pnl(row):
         if row["outcome"] == "WIN":
             return (100 - ENTRY_CENTS) / 100
@@ -645,9 +664,9 @@ def main():
         if pd.isna(ep):
             raise RuntimeError("M10 exit signal missing exit_price in daily P&L")
         return (float(ep) - ENTRY_CENTS) / 100
-    df_sig["flat_pnl"] = df_sig.apply(sig_pnl, axis=1)
-    df_sig["date"] = df_sig["ts"].apply(lambda t: t.strftime("%m/%d"))
-    daily = df_sig.groupby("date").agg(
+    df_exec["flat_pnl"] = df_exec.apply(sig_pnl, axis=1)
+    df_exec["date"] = df_exec["ts"].apply(lambda t: t.strftime("%m/%d"))
+    daily = df_exec.groupby("date").agg(
         bets=("outcome", "count"),
         wins=("outcome", lambda x: x.isin(["WIN", "WIN_EXIT"]).sum()),
         losses=("outcome", lambda x: x.isin(["LOSS", "LOSS_EXIT"]).sum()),
@@ -674,7 +693,7 @@ def main():
     # Per-asset
     print(f"\n  Per-asset:")
     for a in ["BTC", "ETH", "SOL", "XRP"]:
-        ad = df_sig[df_sig["asset"] == a]
+        ad = df_exec[df_exec["asset"] == a]
         if len(ad) == 0: continue
         aw = ad["outcome"].isin(["WIN", "WIN_EXIT"]).sum()
         al = ad["outcome"].isin(["LOSS", "LOSS_EXIT"]).sum()

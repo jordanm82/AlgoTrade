@@ -18,13 +18,14 @@ import numpy as np
 import pandas as pd
 from termcolor import colored
 
-from config.production import MAX_CONCURRENT_KALSHI_BETS
+from config.production import MAX_CONCURRENT_KALSHI_BETS, KALSHI_RISK_PER_BET_PCT
 from config.settings import CDP_KEY_FILE, DATA_DIR
 from data.fetcher import DataFetcher
 from data.indicators import add_indicators
 from strategy.m10_feature_builder import (
     build_common_feature_vector,
     compute_m10_intra_from_window_candles,
+    filter_completed_candles,
 )
 from strategy.strategies.kalshi_predictor_v3 import KalshiPredictorV3, KalshiV3Signal, MAX_BET_PRICE
 from strategy.snapshot import build_minute3_snapshot, compute_btc_confluence
@@ -51,19 +52,18 @@ class KalshiDaemon:
 
     # Per-asset M0 entry thresholds (33 features, no rsi_15m)
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 65,
-        "ETH/USDT": 65,
-        "SOL/USDT": 65,
-        "XRP/USDT": 65,
+        "BTC/USDT": 60,
+        "ETH/USDT": 60,
+        "SOL/USDT": 60,
+        "XRP/USDT": 60,
     }
 
     # Per-asset M10 exit thresholds (39 features, with rsi_15m + 5m intra-window)
-    # Backtest: t=90 gives best P&L ($66.6K) with 94% exit accuracy
     KALSHI_M10_THRESHOLDS = {
-        "BTC/USDT": 90,
-        "ETH/USDT": 90,
-        "SOL/USDT": 90,
-        "XRP/USDT": 90,
+        "BTC/USDT": 85,
+        "ETH/USDT": 85,
+        "SOL/USDT": 85,
+        "XRP/USDT": 85,
     }
 
     # Coinbase symbol mapping for live price (matches BRTI settlement source)
@@ -73,6 +73,11 @@ class KalshiDaemon:
         "SOL/USDT": "SOL-USD",
         "XRP/USDT": "XRP-USD",
     }
+
+    # Live indicator warmup depth (must be sufficiently deep to match backtest/training indicators).
+    CANDLE_LIMIT_15M = 300
+    CANDLE_LIMIT_1H = 200
+    CANDLE_LIMIT_4H = 120
 
     def __init__(self, dry_run: bool = True, predictor_version: str = "v3", demo: bool = False,
                  max_bets: int = 0, max_size_pct: float = 0):
@@ -114,8 +119,17 @@ class KalshiDaemon:
         self._coinbase_auth_hint_shown = False
         self._parity_warn_window_token: str | None = None
         self._parity_warn_once_keys: set[str] = set()
+        self._perf_idle_window_token: str | None = None
+        self._window_heartbeat_token: str | None = None
+        self._resting_eow_cancel_token: str | None = None
+        self._price_skip_log_state: dict[str, dict[str, float | int]] = {}
         self._kalshi_market_strike_cache: dict[str, float] = {}
         self._kalshi_event_target_cache: dict[str, float | None] = {}
+        self._kalshi_prefetch_window_token: str | None = None
+        self._m0_anchor_window_token: str | None = None
+        self._m0_anchor_prices: dict[str, float] = {}
+        self._kx_extra_window_token: str | None = None
+        self._kx_extra_cache: dict[tuple[str, float, str], dict] = {}
 
         # Bet tracking — records ALL bets (live + dry-run) and checks settlement
         self._pending_bets: list[dict] = []
@@ -281,6 +295,36 @@ class KalshiDaemon:
             "red",
         ))
 
+    def _log_price_skip_throttled(self, asset: str, side: str, ask_cents: int, max_cents: int) -> None:
+        """Log high-ask skip at most once per asset/window/ask (or every 10s if unchanged)."""
+        pending = self._kalshi_pending_signals.get(asset, {})
+        ws = pending.get("window_start")
+        if isinstance(ws, datetime):
+            if ws.tzinfo is None:
+                ws = ws.replace(tzinfo=timezone.utc)
+            else:
+                ws = ws.astimezone(timezone.utc)
+            ws_token = ws.strftime("%Y-%m-%dT%H:%MZ")
+        else:
+            ws_token = "unknown"
+
+        key = f"{asset}:{side}:{ws_token}:{max_cents}"
+        now_ts = time.time()
+        state = self._price_skip_log_state.get(key)
+        should_log = (
+            state is None
+            or int(state.get("ask", -1)) != int(ask_cents)
+            or (now_ts - float(state.get("ts", 0))) >= 10
+        )
+        if not should_log:
+            return
+
+        self._price_skip_log_state[key] = {"ask": int(ask_cents), "ts": now_ts}
+        print(colored(
+            f"  [KALSHI REST] {asset} {side.upper()} ask {ask_cents}c > {max_cents}c — skipping (no fill)",
+            "yellow",
+        ))
+
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
@@ -377,17 +421,19 @@ class KalshiDaemon:
 
         # Compute 'since' timestamps to guarantee fresh data
         now_ms = int(_time.time() * 1000)
-        since_15m = now_ms - 200 * 900_000      # 200 × 15m candles
-        since_1h = now_ms - 100 * 3_600_000      # 100 × 1h candles
-        since_4h = now_ms - 50 * 14_400_000      # 50 × 4h candles
+        since_15m = now_ms - self.CANDLE_LIMIT_15M * 900_000
+        since_1h = now_ms - self.CANDLE_LIMIT_1H * 3_600_000
+        since_4h = now_ms - self.CANDLE_LIMIT_4H * 14_400_000
 
         def _fetch_symbol(symbol):
             """Fetch all timeframes for one symbol."""
             results = {}
             try:
-                df = self.fetcher.ohlcv(symbol, timeframe="15m", limit=200, since=since_15m)
+                df = self.fetcher.ohlcv(
+                    symbol, timeframe="15m", limit=self.CANDLE_LIMIT_15M, since=since_15m
+                )
                 if df is None or df.empty:
-                    df = self.fetcher.ohlcv(symbol, timeframe="15m", limit=200)
+                    df = self.fetcher.ohlcv(symbol, timeframe="15m", limit=self.CANDLE_LIMIT_15M)
                 df = add_indicators(df)
                 pct = df["close"].pct_change()
                 df["norm_return"] = (pct - pct.rolling(20).mean()) / pct.rolling(20).std()
@@ -401,23 +447,19 @@ class KalshiDaemon:
                 print(colored(f"  [WARN] 15m fetch failed for {symbol}: {e}", "yellow"))
             if include_higher_timeframes:
                 try:
-                    df_1h = self.fetcher.ohlcv(symbol, "1h", limit=100, since=since_1h)
+                    df_1h = self.fetcher.ohlcv(symbol, "1h", limit=self.CANDLE_LIMIT_1H, since=since_1h)
                     if df_1h is None or df_1h.empty:
-                        df_1h = self.fetcher.ohlcv(symbol, "1h", limit=100)
+                        df_1h = self.fetcher.ohlcv(symbol, "1h", limit=self.CANDLE_LIMIT_1H)
                     if df_1h is not None and not df_1h.empty:
-                        # Drop last row — CCXT returns the in-progress candle which
-                        # has incomplete RSI/MACD. Backtest only uses completed candles.
-                        df_1h = df_1h.iloc[:-1]
                         results["1h"] = add_indicators(df_1h)
                 except Exception as e:
                     self._maybe_log_coinbase_auth_hint(e)
                     print(colored(f"  [FETCH] {symbol} 1h failed: {e}", "yellow"))
                 try:
-                    df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50, since=since_4h)
+                    df_4h = self.fetcher.ohlcv(symbol, "4h", limit=self.CANDLE_LIMIT_4H, since=since_4h)
                     if df_4h is None or df_4h.empty:
-                        df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
+                        df_4h = self.fetcher.ohlcv(symbol, "4h", limit=self.CANDLE_LIMIT_4H)
                     if df_4h is not None and not df_4h.empty:
-                        df_4h = df_4h.iloc[:-1]  # drop in-progress candle
                         results["4h"] = add_indicators(df_4h)
                 except Exception as e:
                     self._maybe_log_coinbase_auth_hint(e)
@@ -437,23 +479,25 @@ class KalshiDaemon:
                 self._kalshi_cached_dataframes[f"{symbol}_4h"] = results["4h"]
 
     def _refresh_higher_timeframes(self):
-        """Lightweight refresh of 1h/4h candles to get latest completed candles."""
+        """Lightweight refresh of 1h/4h candles.
+
+        Keep raw rows (including in-progress). Selection of completed rows is
+        done at scoring time via `filter_completed_candles(...)` for parity.
+        """
         from concurrent.futures import ThreadPoolExecutor
 
         def _fetch_ht(symbol):
             results = {}
             try:
-                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=100)
-                if df_1h is not None and len(df_1h) > 1:
-                    df_1h = df_1h.iloc[:-1]  # drop in-progress candle
+                df_1h = self.fetcher.ohlcv(symbol, "1h", limit=self.CANDLE_LIMIT_1H)
+                if df_1h is not None and len(df_1h) > 0:
                     results["1h"] = add_indicators(df_1h)
             except Exception as e:
                 self._maybe_log_coinbase_auth_hint(e)
                 print(colored(f"  [REFRESH] {symbol} 1h failed: {e}", "yellow"))
             try:
-                df_4h = self.fetcher.ohlcv(symbol, "4h", limit=50)
-                if df_4h is not None and len(df_4h) > 1:
-                    df_4h = df_4h.iloc[:-1]  # drop in-progress candle
+                df_4h = self.fetcher.ohlcv(symbol, "4h", limit=self.CANDLE_LIMIT_4H)
+                if df_4h is not None and len(df_4h) > 0:
                     results["4h"] = add_indicators(df_4h)
             except Exception as e:
                 self._maybe_log_coinbase_auth_hint(e)
@@ -573,11 +617,18 @@ class KalshiDaemon:
             "atr_pct_1h_mkt": _mean(all_1h_atr),
         }
 
-    def _prefetch_kalshi_markets(self):
+    def _prefetch_kalshi_markets(self, *, force: bool = False):
         """Batch-fetch all K15 open + settled markets in 2 API calls.
 
         Caches results so per-asset strike/extra queries don't need individual API calls.
         """
+        now_utc = datetime.now(timezone.utc)
+        minute_in_window = now_utc.minute % 15
+        window_start = now_utc.replace(minute=now_utc.minute - minute_in_window, second=0, microsecond=0)
+        window_token = window_start.strftime("%Y-%m-%dT%H:%MZ")
+        if not force and self._kalshi_prefetch_window_token == window_token:
+            return
+
         self._init_kalshi_client()
         if not self.kalshi_client:
             return
@@ -589,27 +640,36 @@ class KalshiDaemon:
             # Parallelize per-series open+settled calls to reduce boundary latency.
             from concurrent.futures import ThreadPoolExecutor
 
+            def _get_markets(series: str, status: str) -> list:
+                fast_getter = getattr(self.kalshi_client, "get_markets_fast", None)
+                if callable(fast_getter):
+                    return fast_getter(series_ticker=series, status=status, timeout=1.5)
+                return self.kalshi_client.get_markets(series_ticker=series, status=status)
+
             def _fetch_series(series: str):
-                open_m = self.kalshi_client.get_markets(series_ticker=series, status="open")
-                settled_m = self.kalshi_client.get_markets(series_ticker=series, status="settled")
-                return series, open_m, settled_m
+                errors = []
+                open_m = None
+                settled_m = None
+                try:
+                    open_m = _get_markets(series, "open")
+                except Exception as e:
+                    errors.append(f"{series} open: {e}")
+                try:
+                    settled_m = _get_markets(series, "settled")
+                except Exception as e:
+                    errors.append(f"{series} settled: {e}")
+                return series, open_m, settled_m, errors
 
             series_list = list(self.KALSHI_PAIRS.values())
             with ThreadPoolExecutor(max_workers=min(4, len(series_list) or 1)) as pool:
-                for series, open_m, settled_m in pool.map(_fetch_series, series_list):
-                    open_list = open_m or []
-                    settled_list = settled_m or []
-                    self._kalshi_open_markets_cache[series] = open_list
-                    self._kalshi_settled_markets_cache[series] = settled_list
-
-                    # Warm event-target strike cache once per window so entry path
-                    # doesn't pay per-market event API calls.
-                    symbol = next((sym for sym, s in self.KALSHI_PAIRS.items() if s == series), None)
-                    if symbol:
-                        for mk in open_list[:2]:
-                            self._extract_market_strike(symbol, mk)
-                        for mk in settled_list[:6]:
-                            self._extract_market_strike(symbol, mk)
+                for series, open_m, settled_m, errors in pool.map(_fetch_series, series_list):
+                    if open_m is not None:
+                        self._kalshi_open_markets_cache[series] = open_m or []
+                    if settled_m is not None:
+                        self._kalshi_settled_markets_cache[series] = settled_m or []
+                    for err in errors:
+                        self._log_parity_warn_once("_prefetch_kalshi_markets", err)
+            self._kalshi_prefetch_window_token = window_token
         except Exception as e:
             print(colored(f"  [WARN] Kalshi market prefetch failed: {e}", "yellow"))
 
@@ -624,7 +684,8 @@ class KalshiDaemon:
         strike: float,
         *,
         ws_override: datetime | None = None,
-        alt_price_mode: str = "spot",
+        alt_price_mode: str = "m0_open",
+        anchor_prices: dict[str, float] | None = None,
     ) -> dict | None:
         """Compute Kalshi-specific + cross-asset confluence + regime detection features.
 
@@ -655,13 +716,21 @@ class KalshiDaemon:
         def _fetch_markets(series_ticker: str, status: str) -> list:
             cache_attr = "_kalshi_settled_markets_cache" if status == "settled" else "_kalshi_open_markets_cache"
             cache_obj = getattr(self, cache_attr, None)
-            if isinstance(cache_obj, dict) and cache_obj.get(series_ticker):
-                return cache_obj[series_ticker]
+            if isinstance(cache_obj, dict):
+                cached = cache_obj.get(series_ticker)
+                # Empty lists should NOT be treated as authoritative; retry live.
+                if cached:
+                    return cached
             if self.kalshi_client is None:
                 self._init_kalshi_client()
             if self.kalshi_client is None:
                 raise ValueError(f"Kalshi client unavailable ({status}:{series_ticker})")
-            markets = self.kalshi_client.get_markets(series_ticker=series_ticker, status=status)
+            fast_getter = getattr(self.kalshi_client, "get_markets_fast", None)
+            if callable(fast_getter):
+                markets = fast_getter(series_ticker=series_ticker, status=status, timeout=1.5)
+            else:
+                markets = self.kalshi_client.get_markets(series_ticker=series_ticker, status=status)
+            markets = markets or []
             if isinstance(cache_obj, dict):
                 cache_obj[series_ticker] = markets
             return markets
@@ -754,7 +823,7 @@ class KalshiDaemon:
                 alt_1h = self._kalshi_cached_dataframes.get(f"{alt_sym}_1h")
                 if alt_1h is None or len(alt_1h) < 2:
                     raise ValueError(f"missing 1h cache for {alt_sym}")
-                alt_1h_filt = alt_1h[alt_1h.index < pd.Timestamp(ws_kx)]
+                alt_1h_filt = filter_completed_candles(alt_1h, ws_kx, "1h")
                 if len(alt_1h_filt) < 2:
                     raise ValueError(f"insufficient filtered 1h rows for {alt_sym}")
                 alt_rsi_1h_val = float(alt_1h_filt.iloc[-1].get("rsi", np.nan))
@@ -784,8 +853,15 @@ class KalshiDaemon:
                     alt_window = self._brti_proxy.get_5m_window_candles(usd_sym, ws_kx_utc)
                     if alt_window and alt_window.get("minute_10") is not None:
                         alt_price = float(alt_window["minute_10"]["open"])
-                else:
+                elif alt_price_mode == "m0_open":
+                    if anchor_prices:
+                        alt_price = anchor_prices.get(alt_sym)
+                    if alt_price is None:
+                        alt_price = self._brti_proxy.get_5m_open_at(usd_sym, ws_kx_utc)
+                elif alt_price_mode == "spot":
                     alt_price = self._brti_proxy.get_price(usd_sym)
+                else:
+                    raise ValueError(f"unsupported alt_price_mode={alt_price_mode}")
                 if alt_price is None:
                     # Training path tolerates missing alt anchor for distance confluence.
                     # Keep strict behavior for required fields, but skip this optional term.
@@ -832,7 +908,7 @@ class KalshiDaemon:
             alt_1h_self = self._kalshi_cached_dataframes.get(f"{symbol}_1h")
             if alt_1h_self is None:
                 raise ValueError(f"missing 1h cache for {symbol}")
-            h1f = alt_1h_self[alt_1h_self.index < pd.Timestamp(ws_kx)]
+            h1f = filter_completed_candles(alt_1h_self, ws_kx, "1h")
             if len(h1f) < 20:
                 raise ValueError(f"insufficient filtered 1h rows for {symbol}")
             atr_val = float(filt.iloc[-1].get("atr", np.nan))
@@ -844,7 +920,7 @@ class KalshiDaemon:
             alt_4h_self = self._kalshi_cached_dataframes.get(f"{symbol}_4h")
             if alt_4h_self is None:
                 raise ValueError(f"missing 4h cache for {symbol}")
-            h4f = alt_4h_self[alt_4h_self.index < pd.Timestamp(ws_kx)]
+            h4f = filter_completed_candles(alt_4h_self, ws_kx, "4h")
             if len(h4f) < 10:
                 raise ValueError(f"insufficient filtered 4h rows for {symbol}")
             extra["lower_lows_4h"] = sum(
@@ -872,6 +948,12 @@ class KalshiDaemon:
             return None, None, None
 
         try:
+            def _fetch_open_markets_live() -> list:
+                fast_getter = getattr(self.kalshi_client, "get_markets_fast", None)
+                if callable(fast_getter):
+                    return fast_getter(series_ticker=series_ticker, status="open", timeout=1.5)
+                return self.kalshi_client.get_markets(series_ticker=series_ticker, status="open")
+
             def _is_future_candidate(mk: dict, now_chk: datetime) -> bool:
                 ct = mk.get("close_time", "")
                 if not (ct and "T" in ct):
@@ -915,14 +997,14 @@ class KalshiDaemon:
                 # Cache can be momentarily stale/incomplete right after window rollover.
                 # If no usable future strike exists, force a live refresh now.
                 if not _has_future_strike(markets):
-                    markets = self.kalshi_client.get_markets(series_ticker=series_ticker, status="open")
+                    markets = _fetch_open_markets_live()
                     if hasattr(self, '_kalshi_open_markets_cache'):
-                        self._kalshi_open_markets_cache[series_ticker] = markets
+                        self._kalshi_open_markets_cache[series_ticker] = markets or []
             else:
-                markets = self.kalshi_client.get_markets(series_ticker=series_ticker, status="open")
+                markets = _fetch_open_markets_live()
                 # Update cache with fresh results
-                if hasattr(self, '_kalshi_open_markets_cache') and markets:
-                    self._kalshi_open_markets_cache[series_ticker] = markets
+                if hasattr(self, '_kalshi_open_markets_cache'):
+                    self._kalshi_open_markets_cache[series_ticker] = markets or []
             if not markets:
                 return None, None, None
 
@@ -1567,14 +1649,14 @@ class KalshiDaemon:
             df_4h = self._kalshi_cached_dataframes.get(f"{symbol}_4h")
             ws_naive = pd.Timestamp.now()
             if df_1h is not None:
-                m1h = df_1h.index < ws_naive
-                if m1h.sum() >= 20:
-                    feat["rsi_1h"] = float(df_1h.loc[m1h].iloc[-1].get("rsi", 50))
-                    feat["macd_1h"] = float(df_1h.loc[m1h].iloc[-1].get("macd_hist", 0))
+                m1h = filter_completed_candles(df_1h, ws_naive, "1h")
+                if len(m1h) >= 20:
+                    feat["rsi_1h"] = float(m1h.iloc[-1].get("rsi", 50))
+                    feat["macd_1h"] = float(m1h.iloc[-1].get("macd_hist", 0))
             if df_4h is not None:
-                m4h = df_4h.index < ws_naive
-                if m4h.sum() >= 10:
-                    feat["rsi_4h"] = float(df_4h.loc[m4h].iloc[-1].get("rsi", 50))
+                m4h = filter_completed_candles(df_4h, ws_naive, "4h")
+                if len(m4h) >= 10:
+                    feat["rsi_4h"] = float(m4h.iloc[-1].get("rsi", 50))
 
             if any(pd.isna(v) or np.isinf(v) for v in feat.values()):
                 continue
@@ -2138,11 +2220,27 @@ class KalshiDaemon:
         current_window_start = now_utc.replace(minute=window_minute, second=0, microsecond=0)
         # Pandas-compatible timestamp for DataFrame index comparisons
         current_window_start_pd = pd.Timestamp(current_window_start.replace(tzinfo=None))
+        window_token = current_window_start.strftime("%Y-%m-%dT%H:%MZ")
+        if window_token != self._window_heartbeat_token:
+            self._window_heartbeat_token = window_token
+            print(colored(
+                f"  [WINDOW] {current_window_start.strftime('%H:%M')} UTC window started",
+                "cyan",
+            ))
+
+        # End-of-window safety: cancel any resting orders before rollover.
+        # Runs once per window in live/demo at minute 14+.
+        if (not self.dry_run or self.demo) and minute_in_window >= 14:
+            if self._resting_eow_cancel_token != window_token:
+                self._resting_eow_cancel_token = window_token
+                self._cancel_all_resting_orders("end of window")
 
         # At window boundary: cancel stale resting orders, refresh data once, re-subscribe WS
         boundary_refreshed = False
         if minute_in_window <= 1 and not self._kalshi_cached_dataframes.get("_refreshed_" + str(current_window_start)):
-            if self._resting_orders and (not self.dry_run or self.demo):
+            if not self.dry_run or self.demo:
+                # Always hard-reset resting orders at window rollover in live/demo,
+                # including untracked exchange-side orders (e.g., 10c resting sells).
                 self._cancel_all_resting_orders("window boundary")
             refresh_15m_started = time.perf_counter()
             # Keep minute-0 path lightweight: refresh 15m cache only.
@@ -2211,34 +2309,80 @@ class KalshiDaemon:
         predictions = []
         actionable_signals = []
 
-        # Pre-fetch pricing and candle data
-        _prefetched_1m = {}
-        _prefetched_prices = {}  # Coinbase+Bitstamp average (matches training data)
+        if self._kx_extra_window_token != window_token:
+            self._kx_extra_window_token = window_token
+            self._kx_extra_cache = {}
 
-        # Multi-exchange price ALWAYS needed (minute 0 AND later)
+        # Pre-fetch pricing data
+        _prefetched_prices = {}  # minute-0 5m OPEN (Coinbase+Bitstamp), matches training M0 anchor
+
+        # Multi-exchange anchor prices for M0: exact 5m candle OPEN at window start.
         if self._brti_proxy is None:
             from data.brti_proxy import BRTIProxy
             self._brti_proxy = BRTIProxy()
-        brti_prices = self._brti_proxy.get_prices_batch(
-            [s.replace("/USDT", "/USD") for s in self.KALSHI_PAIRS]
-        )
-        for sym in self.KALSHI_PAIRS:
-            usd_sym = sym.replace("/USDT", "/USD")
-            if usd_sym in brti_prices:
-                _prefetched_prices[sym] = brti_prices[usd_sym]
+        from concurrent.futures import ThreadPoolExecutor
 
-        # 1m candles only needed at minute 1+ (for snapshot building)
-        if minute_in_window >= 1:
-            from concurrent.futures import ThreadPoolExecutor
-            def _fetch_1m(sym):
+        anchor_cache_reset = self._m0_anchor_window_token != window_token
+        if anchor_cache_reset:
+            self._m0_anchor_window_token = window_token
+            self._m0_anchor_prices = {}
+
+        def _fetch_m0_anchor_open(sym):
+            try:
+                usd_sym = sym.replace("/USDT", "/USD")
+                px = self._brti_proxy.get_5m_open_at(usd_sym, current_window_start)
+                return sym, px
+            except Exception:
+                return sym, None
+
+        # Fetch M0 anchors once per window; retry missing symbols during entry minute.
+        missing_anchors = [
+            sym for sym in self.KALSHI_PAIRS
+            if anchor_cache_reset or sym not in self._m0_anchor_prices
+        ]
+        if minute_in_window > 1 and not anchor_cache_reset:
+            missing_anchors = []
+        if missing_anchors:
+            with ThreadPoolExecutor(max_workers=min(4, len(missing_anchors))) as pool:
+                for sym, px in pool.map(_fetch_m0_anchor_open, missing_anchors):
+                    if px is not None:
+                        self._m0_anchor_prices[sym] = px
+        _prefetched_prices = dict(self._m0_anchor_prices)
+
+        # Strike discovery is latency-critical at minute 0-1. Fetch all series in parallel first
+        # so one slow asset doesn't delay readiness detection for the rest.
+        strike_snapshot: dict[str, tuple[float | None, datetime | None, str | None]] = {}
+        if minute_in_window <= 1:
+            def _fetch_strike_snapshot(item):
+                sym, series = item
                 try:
-                    return sym, self.fetcher.ohlcv(sym, "1m", limit=10)
+                    return sym, self._get_kalshi_strike(series)
                 except Exception:
-                    return sym, None
+                    return sym, (None, None, None)
+
             with ThreadPoolExecutor(max_workers=4) as pool:
-                for sym, df in pool.map(lambda s: _fetch_1m(s), self.KALSHI_PAIRS):
-                    if df is not None and not df.empty:
-                        _prefetched_1m[sym] = df
+                for sym, strike_tuple in pool.map(_fetch_strike_snapshot, self.KALSHI_PAIRS.items()):
+                    strike_snapshot[sym] = strike_tuple
+
+        def _get_cached_m0_extra(asset_name: str, sym: str, strike_val: float):
+            kx_key = (asset_name, float(strike_val), "m0_open")
+            cached = self._kx_extra_cache.get(kx_key)
+            if cached is None:
+                fresh = self._get_kalshi_extra(
+                    asset_name,
+                    sym,
+                    float(strike_val),
+                    ws_override=current_window_start,
+                    alt_price_mode="m0_open",
+                    anchor_prices=_prefetched_prices,
+                )
+                if not fresh:
+                    return None
+                self._kx_extra_cache[kx_key] = fresh
+                cached = fresh
+            out = dict(cached)
+            out["window_start_naive"] = current_window_start_pd
+            return out
 
         for symbol, series_ticker in self.KALSHI_PAIRS.items():
             asset = symbol.split("/")[0]
@@ -2246,9 +2390,10 @@ class KalshiDaemon:
             # Check if pending signal belongs to current window
             pending = self._kalshi_pending_signals.get(asset)
             if pending and pending.get("window_start") != current_window_start:
-                # New window — clear old signal and cached data
+                # New window — clear old signal only.
+                # Do NOT evict symbol candle caches here: confluence for other assets
+                # depends on all symbol caches being present in the same eval cycle.
                 self._kalshi_pending_signals.pop(asset, None)
-                self._kalshi_cached_dataframes.pop(symbol, None)
                 pending = None
 
             # Skip if already holding a position on this asset (any window)
@@ -2344,7 +2489,12 @@ class KalshiDaemon:
 
                 if self.kalshi_predictor_version == "v3":
                     # V3: query Kalshi for strike price + time remaining
-                    strike, close_time_dt, market_ticker = self._get_kalshi_strike(series_ticker)
+                    strike, close_time_dt, market_ticker = strike_snapshot.get(
+                        symbol,
+                        (None, None, None),
+                    )
+                    if not strike:
+                        strike, close_time_dt, market_ticker = self._get_kalshi_strike(series_ticker)
 
                     # Use pre-filtered 15m data (last completed candle = backtest parity)
                     # Strict parity price path: Coinbase+Bitstamp only (no source substitution).
@@ -2365,7 +2515,7 @@ class KalshiDaemon:
                     if strike and close_time_dt:
                         # Compute Kalshi-specific features for per-asset model.
                         # Strict mode: if extras fail, skip this scoring attempt.
-                        kx = self._get_kalshi_extra(asset, symbol, float(strike))
+                        kx = _get_cached_m0_extra(asset, symbol, float(strike))
                         if not kx:
                             predictions.append({
                                 "symbol": symbol, "asset": asset,
@@ -2377,7 +2527,6 @@ class KalshiDaemon:
                                 "ob": 0, "flow": 0, "state": state,
                             })
                             continue
-                        kx["window_start_naive"] = current_window_start_pd
                         try:
                             # Filter to candles BEFORE window start (matches backtest exactly)
                             df_15m_filtered = df_15m[df_15m.index < current_window_start_pd]
@@ -2494,7 +2643,7 @@ class KalshiDaemon:
                 # If no cache (late start), run full fetch with derived features
                 if df_15m is None or len(df_15m) < 50:
                     try:
-                        raw = self.fetcher.ohlcv(symbol, "15m", limit=200)
+                        raw = self.fetcher.ohlcv(symbol, "15m", limit=self.CANDLE_LIMIT_15M)
                         if raw is not None and not raw.empty:
                             df_15m = add_indicators(raw)
                             pct = df_15m["close"].pct_change()
@@ -2548,7 +2697,12 @@ class KalshiDaemon:
                     signal_ticker = pending.get("_signal_ticker") if pending else None
                     if not strike:
                         # No SETUP ran — query Kalshi for strike
-                        strike, close_time_dt, signal_ticker = self._get_kalshi_strike(series_ticker)
+                        strike, close_time_dt, signal_ticker = strike_snapshot.get(
+                            symbol,
+                            (None, None, None),
+                        )
+                        if not strike:
+                            strike, close_time_dt, signal_ticker = self._get_kalshi_strike(series_ticker)
 
                     if not strike and state == "CONFIRMED":
                         # Log once per asset per window
@@ -2578,7 +2732,7 @@ class KalshiDaemon:
                                 ))
                             self._kalshi_cached_dataframes[ready_key] = True
                         mins_left = max(0, (close_time_dt - now_utc).total_seconds() / 60)
-                        kx = self._get_kalshi_extra(asset, symbol, float(strike))
+                        kx = _get_cached_m0_extra(asset, symbol, float(strike))
                         if not kx:
                             predictions.append({
                                 "symbol": symbol, "asset": asset,
@@ -2588,7 +2742,6 @@ class KalshiDaemon:
                                 "ob": ob_imb, "flow": net_flow, "state": state,
                             })
                             continue
-                        kx["window_start_naive"] = current_window_start_pd
                         signal = self.kalshi_predictor.predict(
                             df_15m, strike_price=float(strike),
                             minutes_remaining=mins_left,
@@ -2833,10 +2986,28 @@ class KalshiDaemon:
 
         self.kalshi_predictions = predictions
         eval_ms = (time.perf_counter() - eval_started) * 1000
-        if eval_ms > 1500:
+        # PERF logging relevance filter:
+        # - always log severe slow evals
+        # - log moderate slowness only when there was actual entry activity
+        # - emit at most one idle sample per 15m window (keeps observability without spam)
+        severe_slow = eval_ms > 6000
+        moderate_slow = eval_ms > 1500
+        has_entry_activity = (len(actionable_signals) > 0) or (actual_fills_this_eval > 0)
+        now_perf_utc = datetime.now(timezone.utc)
+        perf_window = now_perf_utc.replace(
+            minute=now_perf_utc.minute - (now_perf_utc.minute % 15), second=0, microsecond=0
+        )
+        perf_window_token = perf_window.strftime("%Y-%m-%dT%H:%MZ")
+        idle_sample = False
+        if moderate_slow and not has_entry_activity and perf_window_token != self._perf_idle_window_token:
+            idle_sample = True
+            self._perf_idle_window_token = perf_window_token
+
+        if severe_slow or (moderate_slow and has_entry_activity) or idle_sample:
+            suffix = " [idle sample]" if idle_sample else ""
             print(colored(
                 f"  [PERF] _kalshi_eval took {eval_ms:.0f}ms "
-                f"(signals={len(actionable_signals)}, preds={len(predictions)})",
+                f"(signals={len(actionable_signals)}, preds={len(predictions)}){suffix}",
                 "yellow",
             ))
 
@@ -2878,7 +3049,7 @@ class KalshiDaemon:
             "ob": ob_imb, "flow": net_flow, "reason": "",
         }
 
-        RISK_PER_BET_PCT = 0.05
+        RISK_PER_BET_PCT = KALSHI_RISK_PER_BET_PCT
 
         pred["reason"] = f"would bet {side.upper()} (conf={conf_display})"
 
@@ -2888,6 +3059,7 @@ class KalshiDaemon:
             settle_time = None
             contract_price = 0
             ticker = ""
+            price_lookup_error = None
 
             if isinstance(signal, KalshiV3Signal):
                 strike = signal.strike_price
@@ -2922,10 +3094,10 @@ class KalshiDaemon:
                             if asks and len(asks) > 0:
                                 best_ask = asks[0][0] if isinstance(asks[0], list) else asks[0]
                                 contract_price = int(best_ask)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as e:
+                            price_lookup_error = f"orderbook lookup failed: {e}"
+                except Exception as e:
+                    price_lookup_error = str(e)
 
             # Log dry-run market selection (same schema as live, plus chop_metrics)
             self._log_trade_debug(
@@ -2944,12 +3116,20 @@ class KalshiDaemon:
                 }
             )
 
+            # Strict no-fallback: never simulate fills with missing/invalid ask price.
+            if contract_price <= 0:
+                err_hint = f" ({price_lookup_error})" if price_lookup_error else ""
+                print(colored(
+                    f"  [KALSHI DRY] {asset} {side.upper()} missing ask price{err_hint} — skipping",
+                    "yellow",
+                ))
+                pred["reason"] = "missing ask price"
+                return pred
+
             # If ask > max, DON'T fill — match live behavior exactly
             # Live would place a resting order that may never fill
             if contract_price > MAX_ENTRY_CENTS:
-                print(colored(
-                    f"  [KALSHI REST] {asset} {side.upper()} ask {contract_price}c > {MAX_ENTRY_CENTS}c — skipping (no fill)",
-                    "yellow"))
+                self._log_price_skip_throttled(asset, side, contract_price, MAX_ENTRY_CENTS)
                 pred["reason"] = f"price too high ({contract_price}c > {MAX_ENTRY_CENTS}c)"
                 return pred
 
@@ -3070,9 +3250,7 @@ class KalshiDaemon:
             # systematically losers (price dropped TO our limit = market turned
             # against us). Dry-run skips these, so must live.
             if fill_price > MAX_ENTRY_CENTS:
-                print(colored(
-                    f"  [KALSHI SKIP] {asset} {side.upper()} ask {fill_price}c > {MAX_ENTRY_CENTS}c — skipping",
-                    "yellow"))
+                self._log_price_skip_throttled(asset, side, fill_price, MAX_ENTRY_CENTS)
                 pred["reason"] = f"ask too high ({fill_price}c > {MAX_ENTRY_CENTS}c)"
                 return pred
 
@@ -3401,7 +3579,8 @@ class KalshiDaemon:
 
     def _cancel_all_resting_orders(self, reason: str = "shutdown"):
         """Cancel ALL resting orders on Kalshi. Called on shutdown and window boundary."""
-        if not self._resting_orders and not (self.kalshi_client and not self.dry_run):
+        # Dry-run does not place real orders on Kalshi.
+        if self.dry_run and not self.demo:
             return
 
         self._init_kalshi_client()
@@ -3409,6 +3588,7 @@ class KalshiDaemon:
             return
 
         cancelled = 0
+        known_ids = set()
 
         # Cancel orders we're tracking in memory
         for order in list(self._resting_orders):
@@ -3416,6 +3596,7 @@ class KalshiDaemon:
             asset = order.get("asset", "?")
             if not order_id:
                 continue
+            known_ids.add(order_id)
             try:
                 result = self.kalshi_client.cancel_order_safe(order_id)
                 if result.get("status") == "filled":
@@ -3431,7 +3612,6 @@ class KalshiDaemon:
         # Also query exchange for any resting orders we might not be tracking
         try:
             exchange_resting = self.kalshi_client.get_orders(status="resting")
-            known_ids = {o.get("order_id") for o in self._resting_orders}
             for order in exchange_resting:
                 oid = order.get("order_id", "")
                 if oid and oid not in known_ids:

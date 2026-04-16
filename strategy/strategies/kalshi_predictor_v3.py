@@ -11,6 +11,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from strategy.m10_feature_builder import filter_completed_candles
+
 DISTANCE_BINS = [-3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
 TIME_BINS = [14, 12, 10, 8, 6, 4, 2]
 
@@ -298,8 +300,7 @@ class KalshiPredictorV3:
                 return None
             if df_1h is not None and len(df_1h) >= 20:
                 if ws_naive is not None:
-                    # '<' drops the in-progress 1h candle at ws_naive.
-                    m1h = df_1h[df_1h.index < ws_naive]
+                    m1h = filter_completed_candles(df_1h, ws_naive, "1h")
                 else:
                     # Legacy fallback path for non-strict modes only.
                     m1h = df_1h.iloc[:-1]
@@ -317,8 +318,7 @@ class KalshiPredictorV3:
                 return None
             if df_4h is not None and len(df_4h) >= 10:
                 if ws_naive is not None:
-                    # '<' drops the in-progress 4h candle at ws_naive.
-                    m4h = df_4h[df_4h.index < ws_naive]
+                    m4h = filter_completed_candles(df_4h, ws_naive, "4h")
                 else:
                     # Legacy fallback path for non-strict modes only.
                     m4h = df_4h.iloc[:-1]

@@ -32,6 +32,7 @@ from data.fetcher import DataFetcher
 from data.indicators import add_indicators
 from exchange.kalshi import KalshiClient
 from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
+from strategy.m10_feature_builder import filter_completed_candles
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -288,16 +289,15 @@ def main():
             }
 
             if df_1h is not None:
-                # '<' drops the in-progress candle at ws_naive — live/backtest parity
-                m1h = df_1h.index < ws_naive
-                if m1h.sum() >= 20:
-                    r1h = df_1h.loc[m1h].iloc[-1]
+                m1h = filter_completed_candles(df_1h, ws_naive, "1h")
+                if len(m1h) >= 20:
+                    r1h = m1h.iloc[-1]
                     feat["rsi_1h"] = float(r1h.get("rsi", 50))
                     feat["macd_1h"] = float(r1h.get("macd_hist", 0))
             if df_4h is not None:
-                m4h = df_4h.index < ws_naive
-                if m4h.sum() >= 10:
-                    feat["rsi_4h"] = float(df_4h.loc[m4h].iloc[-1].get("rsi", 50))
+                m4h = filter_completed_candles(df_4h, ws_naive, "4h")
+                if len(m4h) >= 10:
+                    feat["rsi_4h"] = float(m4h.iloc[-1].get("rsi", 50))
 
             # --- Kalshi-specific features ---
             # Previous settlement outcomes (lookback within sorted markets)

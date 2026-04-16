@@ -31,6 +31,7 @@ from data.indicators import add_indicators
 from exchange.kalshi import KalshiClient
 from config.settings import KALSHI_KEY_FILE, KALSHI_API_KEY_ID
 from scripts.backtest_kalshi_labels import build_features
+from strategy.m10_feature_builder import filter_completed_candles
 from scripts.train_per_asset_models import (
     SERIES, ASSETS_SYMS, BASE_FEATURES, CONFLUENCE_FEATURES,
     REGIME_FEATURES, INTERACTION_FEATURES, ALL_FEATURES,
@@ -297,6 +298,15 @@ def train_with_features(df_all, feature_list, label="", *,
     return model, results, best_iter
 
 
+def _selector_eval(results: dict, threshold: int) -> dict:
+    """Re-evaluate a trained result payload at a selector threshold."""
+    probs = results.get("probs")
+    y_test = results.get("y_test")
+    if probs is None or y_test is None:
+        return {"w": 0, "l": 0, "tot": 0, "wr": 0.0, "pnl": 0.0}
+    return evaluate_threshold(np.asarray(probs), np.asarray(y_test), int(threshold))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--synthetic", action="store_true",
@@ -321,6 +331,10 @@ def main():
                         help="Max pagination loops for settled markets fetch")
     parser.add_argument("--report-json", type=str, default="",
                         help="Optional path to write per-asset training/eval report JSON")
+    parser.add_argument("--selector-threshold", type=int, default=60,
+                        help="Threshold used for feature-group selection robustness checks")
+    parser.add_argument("--selector-min-bets", type=int, default=30,
+                        help="Minimum decided bets required at selector threshold for group comparison")
     args = parser.parse_args()
     if args.synthetic and args.synthetic_mode == "none":
         args.synthetic_mode = "raw"
@@ -472,13 +486,13 @@ def main():
             else: kx["return_12h"] = 0
             if df_1h is not None:
                 # '<' drops the in-progress candle at ws_n — matches live path
-                h1f = df_1h[df_1h.index < ws_n]
+                h1f = filter_completed_candles(df_1h, ws_n, "1h")
                 if len(h1f) >= 20 and atr > 0:
                     kx["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr
                 else: kx["price_vs_sma_1h"] = 0
             else: kx["price_vs_sma_1h"] = 0
             if df_4h is not None:
-                h4f = df_4h[df_4h.index < ws_n]
+                h4f = filter_completed_candles(df_4h, ws_n, "4h")
                 if len(h4f) >= 4:
                     kx["lower_lows_4h"] = sum(1 for i in range(-3,0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
                 else: kx["lower_lows_4h"] = 0
@@ -498,7 +512,7 @@ def main():
                     ar15.append(rv); amom.append(1 if rv >= 50 else -1)
                 if a1h is not None:
                     # '<' drops the in-progress 1h candle at ws_n.
-                    a1f = a1h[a1h.index < ws_n]
+                    a1f = filter_completed_candles(a1h, ws_n, "1h")
                     if len(a1f) >= 2: ar1h.append(float(a1f.iloc[-1].get("rsi", 50)))
             kx["alt_rsi_avg"] = sum(ar15)/len(ar15) if ar15 else 50
             kx["alt_rsi_1h_avg"] = sum(ar1h)/len(ar1h) if ar1h else 50
@@ -564,13 +578,13 @@ def main():
                         else: kx_syn["return_12h"] = 0
                         if syn_1h is not None:
                             # '<' drops in-progress candle — live/backtest parity
-                            h1f = syn_1h[syn_1h.index < ws_syn]
+                            h1f = filter_completed_candles(syn_1h, ws_syn, "1h")
                             if len(h1f) >= 20 and atr_syn > 0:
                                 kx_syn["price_vs_sma_1h"] = (float(h1f.iloc[-1]["close"]) - float(h1f["close"].rolling(20).mean().iloc[-1])) / atr_syn
                             else: kx_syn["price_vs_sma_1h"] = 0
                         else: kx_syn["price_vs_sma_1h"] = 0
                         if syn_4h is not None:
-                            h4f = syn_4h[syn_4h.index < ws_syn]
+                            h4f = filter_completed_candles(syn_4h, ws_syn, "4h")
                             if len(h4f) >= 4:
                                 kx_syn["lower_lows_4h"] = sum(1 for i in range(-3,0) if float(h4f.iloc[i]["low"]) < float(h4f.iloc[i-1]["low"]))
                             else: kx_syn["lower_lows_4h"] = 0
@@ -592,7 +606,7 @@ def main():
                                     syn_alt_mom.append(1 if rv >= 50 else -1)
                                 if alt_syn_1h is not None:
                                     # '<' drops the in-progress 1h candle at ws_syn.
-                                    alt_1h_f = alt_syn_1h[alt_syn_1h.index < ws_syn]
+                                    alt_1h_f = filter_completed_candles(alt_syn_1h, ws_syn, "1h")
                                     if len(alt_1h_f) >= 2:
                                         syn_alt_rsi_1h.append(float(alt_1h_f.iloc[-1].get("rsi", 50)))
                         kx_syn["alt_rsi_avg"] = sum(syn_alt_rsi)/len(syn_alt_rsi) if syn_alt_rsi else 50
@@ -643,14 +657,16 @@ def main():
         df_all = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
         print(f"  Total: {len(df_all)} | Real: {real_count} | Syn: {len(syn_rows)} | YES: {df_all['label'].mean():.1%}")
 
+        all_feature_pool = list(dict.fromkeys(ALL_FEATURES + FEATURE_GROUPS["interaction_rsi"]))
         if args.all_features:
             # Skip incremental testing — just train with all features
-            print(f"\n  Training with ALL {len(ALL_FEATURES)} features...")
-            best_features = ALL_FEATURES
+            print(f"\n  Training with ALL {len(all_feature_pool)} features...")
+            best_features = all_feature_pool
         else:
             # === INCREMENTAL FEATURE GROUP TESTING ===
             print(f"\n  --- Incremental Feature Group Testing ---")
             print(f"  Starting with {len(CORE_13)} core features")
+            print(f"  Selector: t={args.selector_threshold} min_bets={args.selector_min_bets}")
 
             # Train baseline with core 13
             _, core_results, _ = train_with_features(
@@ -660,43 +676,64 @@ def main():
                 continuation_ret12=args.continuation_ret12,
                 monotone_distance=args.monotone_distance,
             )
-            if core_results is None or core_results["tot"] < 10:
-                print(f"  ERROR: Not enough test samples for {target_asset}")
+            if core_results is None:
+                print(f"  ERROR: core training failed for {target_asset}")
                 continue
+            core_sel = _selector_eval(core_results, args.selector_threshold)
+            if core_sel["tot"] < args.selector_min_bets:
+                print(
+                    f"  WARN: Core selector sample too small ({core_sel['tot']} bets @t={args.selector_threshold}); "
+                    "falling back to full feature pool."
+                )
+                best_features = all_feature_pool
+                best_wr = core_results["wr"]
+                # Skip incremental comparison when selector sample is too sparse.
+                core_results = None
+            else:
+                print(f"  Core@{args.selector_threshold}: {core_sel['tot']:>4} bets, {core_sel['wr']:>5.1f}% WR, ${core_sel['pnl']:>+.1f} P&L")
+                print(f"  Core 13 @65: {core_results['tot']:>4} bets, {core_results['wr']:>5.1f}% WR, ${core_results['pnl']:>+.1f} P&L (iter {core_results['best_iter']})")
 
-            print(f"  Core 13:  {core_results['tot']:>4} bets, {core_results['wr']:>5.1f}% WR, ${core_results['pnl']:>+.1f} P&L (iter {core_results['best_iter']})")
-
-            best_wr = core_results["wr"]
-            best_features = list(CORE_13)
+                best_wr = core_sel["wr"]
+                best_features = list(CORE_13)
 
             # Test each group incrementally
-            for group_name, group_feats in FEATURE_GROUPS.items():
-                candidate = best_features + group_feats
-                _, group_results, _ = train_with_features(
-                    df_all, candidate, group_name,
-                    continuation_weight=args.continuation_weight,
-                    continuation_dist=args.continuation_dist,
-                    continuation_ret12=args.continuation_ret12,
-                    monotone_distance=args.monotone_distance,
-                )
-                if group_results is None or group_results["tot"] < 10:
-                    print(f"  + {group_name:15}: SKIP (insufficient data)")
-                    if group_name in FORCE_KEEP_GROUPS:
-                        # Still force-keep the features even without measurable eval
+            if core_results is not None:
+                for group_name, group_feats in FEATURE_GROUPS.items():
+                    candidate = list(dict.fromkeys(best_features + group_feats))
+                    _, group_results, _ = train_with_features(
+                        df_all, candidate, group_name,
+                        continuation_weight=args.continuation_weight,
+                        continuation_dist=args.continuation_dist,
+                        continuation_ret12=args.continuation_ret12,
+                        monotone_distance=args.monotone_distance,
+                    )
+                    forced = group_name in FORCE_KEEP_GROUPS
+                    if group_results is None:
+                        print(f"  + {group_name:15}: SKIP (train failed)")
+                        if forced:
+                            best_features = candidate
+                        continue
+
+                    group_sel = _selector_eval(group_results, args.selector_threshold)
+                    if group_sel["tot"] < args.selector_min_bets:
+                        print(f"  + {group_name:15}: SKIP ({group_sel['tot']} bets @t={args.selector_threshold})")
+                        if forced:
+                            best_features = candidate
+                        continue
+
+                    delta_wr = group_sel["wr"] - best_wr
+                    if forced:
+                        marker = "FORCE-KEEP"
+                    else:
+                        marker = "KEEP" if delta_wr > 0.5 else "DROP"
+                    print(
+                        f"  + {group_name:15}: {group_sel['tot']:>4} bets, "
+                        f"{group_sel['wr']:>5.1f}% WR ({delta_wr:>+.1f}%), ${group_sel['pnl']:>+.1f} — {marker}"
+                    )
+
+                    if forced or delta_wr > 0.5:
                         best_features = candidate
-                    continue
-
-                delta_wr = group_results["wr"] - best_wr
-                forced = group_name in FORCE_KEEP_GROUPS
-                if forced:
-                    marker = "FORCE-KEEP"
-                else:
-                    marker = "KEEP" if delta_wr > 0.5 else "DROP"
-                print(f"  + {group_name:15}: {group_results['tot']:>4} bets, {group_results['wr']:>5.1f}% WR ({delta_wr:>+.1f}%), ${group_results['pnl']:>+.1f} — {marker}")
-
-                if forced or delta_wr > 0.5:
-                    best_features = candidate
-                    best_wr = group_results["wr"]
+                        best_wr = group_sel["wr"]
 
             print(f"\n  Final feature set: {len(best_features)} features")
             print(f"  Best WR: {best_wr:.1f}%")

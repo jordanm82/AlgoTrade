@@ -107,6 +107,40 @@ class BRTIProxy:
             return None
         return sum(opens) / len(opens)
 
+    def get_5m_open_at(self, symbol: str, candle_start: datetime) -> float | None:
+        """Get the OPEN price for a specific 5m candle timestamp.
+
+        Strict parity path:
+        - Requires BOTH Coinbase and Bitstamp candle opens at `candle_start`
+        - Returns None if either exchange is missing that exact 5m candle
+        """
+        sym = symbol.replace("/USDT", "/USD")
+        anchor = candle_start if candle_start.tzinfo else candle_start.replace(tzinfo=timezone.utc)
+        anchor_ms = int(anchor.timestamp() * 1000)
+
+        def _fetch_open(name: str):
+            try:
+                ex = self._get_exchange(name)
+                if ex is None:
+                    return None
+                candles = ex.fetch_ohlcv(sym, "5m", limit=12)
+                if not candles:
+                    return None
+                by_ms = {int(c[0]): c for c in candles}
+                c = by_ms.get(anchor_ms)
+                if c is None:
+                    return None
+                return float(c[1])  # open
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            cb_open, bs_open = list(pool.map(_fetch_open, ["coinbase", "bitstamp"]))
+
+        if cb_open is None or bs_open is None:
+            return None
+        return (cb_open + bs_open) / 2.0
+
     def get_5m_window_candles(self, symbol: str, window_start: datetime) -> dict[str, dict[str, float]] | None:
         """Return averaged 5m candles for minute-0/minute-5/minute-10 in a 15m window.
 

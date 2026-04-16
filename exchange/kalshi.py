@@ -154,6 +154,30 @@ class KalshiClient:
         resp = self._get("/trade-api/v2/markets", params)
         return resp.get("markets", [])
 
+    def get_markets_fast(
+        self,
+        event_ticker: str = None,
+        series_ticker: str = None,
+        status: str = "open",
+        timeout: float = 1.5,
+    ) -> list[dict]:
+        """Fast-fail market lookup for latency-sensitive entry paths.
+
+        Uses a single GET attempt (no retry backoff) so one transient network
+        issue doesn't stall the whole eval cycle for several seconds.
+        """
+        params = {"status": status, "limit": 200}
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        path = "/trade-api/v2/markets"
+        url = f"{self.base_url}{path}"
+        headers = self._headers("GET", path)
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json().get("markets", [])
+
     def get_event(self, event_ticker: str) -> dict:
         """Get a single event's details."""
         return self._get(f"/trade-api/v2/events/{event_ticker}")
