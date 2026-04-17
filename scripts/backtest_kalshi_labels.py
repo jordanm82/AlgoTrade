@@ -48,7 +48,7 @@ M10_EXIT_CENTS = 10
 DEFAULT_DAILY_LOSS_CAP = 0.0
 
 # Per-asset thresholds (must match daemon)
-M0_THRESHOLDS = {"BTC": 60, "ETH": 60, "SOL": 60, "XRP": 60}
+M0_THRESHOLDS = {"BTC": 57, "ETH": 57, "SOL": 57, "XRP": 57}
 M10_THRESHOLDS = {"BTC": 85, "ETH": 85, "SOL": 85, "XRP": 85}
 
 CACHE_DIR = Path("data/store/backtest_cache")

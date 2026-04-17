@@ -61,7 +61,7 @@ Predicts the actual Kalshi question: "Will price close above strike?" Separate X
 - **Indicators:** Coinbase 15m/1h/4h candles (previous completed candle; in-progress candle dropped)
 - **Training data:** 12 months synthetic data (~160K samples) + Kalshi settlements
 - **Training script:** `./venv/bin/python scripts/retrain_kalshi_labels.py`
-- **Backtest script:** `./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 60 --m10-threshold 85 --max-per-window 3`
+- **Backtest script:** `./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 57 --m10-threshold 85 --max-per-window 3`
 - Auto-triggered on daemon startup when model > 7 days old
 
 **M0 entry model — 33 features (XGBoost, no rsi_15m):**
@@ -162,7 +162,7 @@ Separate per-asset XGBoost model trained on minute-10 data. Decides hold or exit
 
 ### Betting Rules
 
-- **Entry threshold:** 60% confidence (model prob >= 60 for YES, <= 40 for NO) — all assets
+- **Entry threshold:** 57% confidence (model prob >= 57 for YES, <= 43 for NO) — all assets. Lowered from 60 on 2026-04-17 based on 60-day backtest sweep showing +36% P&L vs t=60 with 2× volume; drawdown rose from 15.2% to 22.6% (survivable at 5% risk/bet).
 - **Max entry price:** 60c — if ask > 60c, skip entirely (NO resting orders)
 - **M10 exit threshold:** 85/15 — only exit when per-asset M10 disagrees at 85%+ confidence
 - **Position sizing:** flat 5% of balance per bet by default (`KALSHI_RISK_PER_BET_PCT = 0.05`; CLI override: `--maxsize=N`)
@@ -202,8 +202,8 @@ python dashboard_rich.py --live --maxbets=3 --maxsize=5
 # Demo (Kalshi demo exchange — tests order plumbing only, NOT model)
 python dashboard_rich.py --demo
 
-# Backtest (60 days, M0 threshold 60, M10 threshold 85, max 3 bets/window)
-./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 60 --m10-threshold 85 --max-per-window 3
+# Backtest (60 days, M0 threshold 57, M10 threshold 85, max 3 bets/window)
+./venv/bin/python scripts/backtest_kalshi_labels.py --days 60 --threshold 57 --m10-threshold 85 --max-per-window 3
 ```
 
 **WARNING:** Demo exchange has no real liquidity and prices don't track live. Only useful for testing order lifecycle, NOT for validating predictions.
@@ -240,7 +240,7 @@ python dashboard_rich.py --demo
 - **Entry window.** Only enter at minute 0-1. Re-evaluating at minutes 2-4 with stale indicators + drifting price generates bad signals.
 - **Kalshi market transitions take seconds.** At window boundary, query for future markets only (close_time > now) to avoid betting on the just-settled window.
 - **Demo exchange can't validate predictions.** Same strikes/settlements as production, but no real liquidity. Only tests order plumbing.
-- **Losing days are NO-heavy choppy days.** The model's NO side underperforms on sideways markets near the strike. Threshold tuning is regime-dependent; current default M0 threshold is 60 after retraining.
+- **Losing days are NO-heavy choppy days.** The model's NO side underperforms on sideways markets near the strike. Threshold tuning is regime-dependent; current default M0 threshold is 57 after retraining + parity fixes (lowered from 60 on 2026-04-17 based on the backtest sweep above).
 - **In-progress candle leaks future data.** CCXT returns the current (incomplete) candle as the last row in 1h/4h data. Must drop it before computing indicators, or the model sees partial future data that training never had.
 - **Per-asset models outperform unified.** Each asset has different volatility regimes and RSI behavior. Per-asset models with cross-asset confluence capture both asset-specific patterns and market-wide signals.
 - **rsi_15m is NOT available at minute 0.** The 15m candle hasn't closed yet, so rsi_15m is from the prior candle and stale. M0 excludes it (33-feature M0 set); M10 includes it (candle nearly complete at minute 10).

@@ -51,11 +51,14 @@ class KalshiDaemon:
     }
 
     # Per-asset M0 entry thresholds (33 features, no rsi_15m)
+    # 60 → 57 on 2026-04-17 based on backtest sweep: 60d P&L $42,738 vs $58,006
+    # at t=57 (+36%) with 66.6% realized WR. Volume roughly doubles; drawdown
+    # rises from 15.2% to 22.6% — survivable at 5% risk per bet.
     KALSHI_THRESHOLDS = {
-        "BTC/USDT": 60,
-        "ETH/USDT": 60,
-        "SOL/USDT": 60,
-        "XRP/USDT": 60,
+        "BTC/USDT": 57,
+        "ETH/USDT": 57,
+        "SOL/USDT": 57,
+        "XRP/USDT": 57,
     }
 
     # Per-asset M10 exit thresholds (39 features, with rsi_15m + 5m intra-window)
